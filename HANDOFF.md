@@ -26,9 +26,10 @@ The feature supports repository-visible SHA-256, SHA-384, and SHA-512 identities
 - Pre-Story 8 HEAD: `294089883c859342c8e7470c94a346bee5b2adad`
 - Pre-Story 8 subject: `NO-ISSUE: docs(registry): compact configurable-digest handoff`
 - Story 7 implementation: `b59c747e7482f174dee81508dd3aca363ef7d7e6`
-- Story 8 is committed with subject `NO-ISSUE: feat(registry): discover registered OCI referrers`. Its hash cannot be embedded in its own Git preimage; use `git rev-parse HEAD` and verify the subject.
-- Expected target status after the Story 8 commit: clean, with no staged, unstaged, or untracked files.
-- The planning repository had unrelated modified and untracked files before Story 8. Only the existing `TODO.md` Story 7 and Story 8 status cells were changed by this session. The planning repository was not committed.
+- Story 8 implementation: `bc21299727b875af15fa67a689677e69b9f688ff`
+- The external-registry deferral is committed with subject `NO-ISSUE: docs(registry): defer external-registry digest work`. Its hash cannot be embedded in its own Git preimage; use `git rev-parse HEAD` and verify the subject.
+- Expected target status after the deferral commit: clean, with no staged, unstaged, or untracked files.
+- The planning repository had unrelated modified and untracked files before this update. This deferral update changed only the `Deferred` status definition, the Story 9, Story 11, and Story 12 status cells, and the external-registry scope note in `TODO.md`. The planning repository was not committed.
 
 ## Delivery status
 
@@ -40,7 +41,8 @@ The feature supports repository-visible SHA-256, SHA-384, and SHA-512 identities
 - Story 6: **Done**.
 - Story 7: **Done**.
 - Story 8: **Done**.
-- Recommended next work: **Story 9, pull alternative-digest images through proxy cache**.
+- Story 9: **Deferred** by delivery-scope decision; no Story 9 code is present.
+- Recommended next work: **Story 10, limited to copies between repositories managed by this Quay deployment**.
 
 Do not change Story 1 or Story 2 merely because later stories depend on their behavior.
 
@@ -224,8 +226,10 @@ The first live attempt failed because the temporary script supplied an invalid O
 
 ## Active limitations and deferred work
 
-- Story 9 proxy-cache ingestion and alternative referrer propagation are not implemented by Story 8.
-- Mirroring, complete-image copy, imports, builds, Clair, UI, deletion, garbage collection, conformance, and operational tooling remain later stories.
+- Proxy cache, repository mirroring, organization mirroring, external image import, and all related external-registry or live interoperability validation are explicitly deferred until reassigned.
+- Story 9 remains unimplemented. A partial Story 9 attempt was fully reverted before this handoff update.
+- Complete-image copy is limited to repositories managed by the same Quay deployment while the external-registry deferral is active.
+- Builds, Clair, UI, deletion, garbage collection, conformance, and operational tooling remain later stories.
 - Full blob unlink, upload expiration, repository or namespace deletion, registration cleanup, and physical orphan cleanup remain lifecycle work.
 - PostgreSQL registration races passed in earlier sessions; MySQL concurrency remains unrun.
 - SHA-384 resumable hashing passed on local macOS arm64 and an existing Linux aarch64 image. Clean Linux builds, Linux x86_64 packaging, and cross-architecture resume remain unproven.
@@ -235,15 +239,6 @@ The first live attempt failed because the temporary script supplied an invalid O
 
 ## Recommended next story
 
-Proceed with **Story 9: pull alternative-digest images through proxy cache**.
+Proceed with **Story 10: preserve digest identities when copying content between repositories**, limited to source and destination repositories managed by the same Quay deployment.
 
-Start with:
-
-- `data/registry_model/registry_proxy_model.py`
-- `proxy/__init__.py`
-- `workers/proxycacheblobworker.py`
-- `endpoints/v2/test/test_manifest_pullthru.py`
-- `data/registry_model/test/test_registry_proxy_model.py`
-- `workers/test/test_proxycacheblobworker.py`
-
-Keep Story 9 limited to proxy-cache ingestion and serving of registered SHA-256, SHA-384, and SHA-512 image, index, artifact, subject, and referrer identities. Preserve Story 8 cache, alias, fallback, authorization, and hidden-canonical contracts. Do not expand into mirroring, complete-image copy, imports, builds, Clair, UI, deletion, garbage collection, conformance, or operational tooling unless proxy correctness requires a narrow supporting change.
+Do not include proxy cache, external-registry copy, repository mirroring, organization mirroring, external image import, or live external-registry validation. Those surfaces remain deferred until explicitly reassigned. Preserve Story 8 alias resolution, fallback discovery, cache invalidation, authorization, repository isolation, deterministic descriptor selection, and hidden-canonical behavior.
