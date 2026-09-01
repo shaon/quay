@@ -1,21 +1,18 @@
 import logging
 import time
 
-from peewee import JOIN
-
 import features
 from app import app, proxy_cache_blob_queue, storage
 from data.database import (
     ImageStorage,
-    ImageStoragePlacement,
     IndexStatus,
     Manifest,
     ManifestBlob,
     ManifestSecurityStatus,
     db_transaction,
 )
-from data.model import repository, user
-from data.model.storage import get_image_location_for_id, get_layer_path
+from data.model import oci, repository, user
+from data.model.storage import StorageContentStatus, get_storage_content_status
 from data.registry_model.datatypes import RepositoryReference
 from data.registry_model.registry_proxy_model import ProxyModel
 from util.locking import GlobalLock
@@ -38,41 +35,36 @@ RESERVATION_SECONDS = 60 * 20
 
 class ProxyCacheBlobWorker(QueueWorker):
     def _all_blobs_downloaded_for_manifest(self, manifest_id, repo_id):
-        """
-        Check if all blobs associated with a manifest have ImageStoragePlacement.
-        Returns True if all blobs are downloaded, False otherwise.
-        """
-        # LEFT JOIN to ImageStoragePlacement and check for any blobs missing a placement.
-        missing_placement = (
-            ManifestBlob.select()
-            .join(ImageStorage, on=(ManifestBlob.blob == ImageStorage.id))
-            .join(
-                ImageStoragePlacement,
-                JOIN.LEFT_OUTER,
-                on=(ImageStoragePlacement.storage == ImageStorage.id),
-            )
+        """Return whether every repository manifest blob is placed and physically readable."""
+        blobs = (
+            ImageStorage.select()
+            .join(ManifestBlob, on=(ManifestBlob.blob == ImageStorage.id))
             .where(
                 ManifestBlob.manifest == manifest_id,
                 ManifestBlob.repository == repo_id,
-                ImageStoragePlacement.id.is_null(),
             )
         )
-
-        return not missing_placement.exists()
+        return all(
+            get_storage_content_status(blob, storage) == StorageContentStatus.READABLE
+            for blob in blobs
+        )
 
     def _reset_security_status_if_complete(self, blob_digest, repo_id):
         """
         Check if the downloaded blob completes all blobs for any manifest.
         If so, reset the security status to allow Clair scanning.
         """
-        # Find all manifests that include this blob
+        blob = oci.blob.lookup_repository_blob_by_digest(repo_id, blob_digest)
+        if blob is None:
+            return
+
+        # Find all manifests that include the resolved canonical blob in this repository.
         manifests = (
             Manifest.select(Manifest.id)
             .join(ManifestBlob)
-            .join(ImageStorage)
             .where(
                 ManifestBlob.repository_id == repo_id,
-                ImageStorage.content_checksum == blob_digest,
+                ManifestBlob.blob == blob.id,
             )
             .distinct()
         )
@@ -142,45 +134,20 @@ class ProxyCacheBlobWorker(QueueWorker):
         return
 
     def _should_download_blob(self, digest, repo_id, registry_proxy_model):
-        blob = registry_proxy_model._get_shared_storage(digest)
+        blob = oci.blob.lookup_repository_blob_by_digest(repo_id, digest)
         if blob is None:
-            try:
-                blob = (
-                    ImageStorage.select()
-                    .join(ManifestBlob)
-                    .where(
-                        ManifestBlob.repository_id == repo_id,
-                        ImageStorage.content_checksum == digest,
-                    )
-                    .get()
-                )
-            except ImageStorage.DoesNotExist:
-                # There should be placeholder blobs after manifest requests
-                return False
+            # There should be a repository-scoped placeholder or registration after manifest
+            # ingestion. Never resolve an alternative digest through another repository.
+            return False
 
-        try:
-            placement = (
-                ImageStoragePlacement.select().where(ImageStoragePlacement.storage == blob).get()
-            )
-        except ImageStoragePlacement.DoesNotExist:
-            return True
-
-        try:
-            layer_path = get_layer_path(blob)
-            location_name = get_image_location_for_id(placement.location_id).name
-            if not storage.exists([location_name], layer_path):
-                logger.warning(
-                    "Blob %s has placements in DB but is missing from storage, will re-download",
-                    digest,
-                )
-                return True
-        except (IOError, OSError):
-            logger.exception(
-                "Failed to verify blob %s existence in storage",
+        content_status = get_storage_content_status(blob, storage)
+        if content_status != StorageContentStatus.READABLE:
+            logger.warning(
+                "Proxy blob %s requires promotion or repair: %s",
                 digest,
+                content_status.value,
             )
             return True
-
         return False
 
 

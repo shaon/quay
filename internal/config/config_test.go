@@ -71,8 +71,12 @@ func TestParseAllowedHashAlgorithmsUsesExplicitListExactly(t *testing.T) {
 		expected   HashAlgorithms
 	}{
 		{name: "sha256 only", algorithms: "[sha256]", expected: HashAlgorithms{"sha256"}},
+		{name: "sha384 only", algorithms: "[sha384]", expected: HashAlgorithms{"sha384"}},
 		{name: "sha512 only", algorithms: "[sha512]", expected: HashAlgorithms{"sha512"}},
+		{name: "sha256 and sha384", algorithms: "[sha256, sha384]", expected: HashAlgorithms{"sha256", "sha384"}},
 		{name: "sha256 and sha512", algorithms: "[sha256, sha512]", expected: HashAlgorithms{"sha256", "sha512"}},
+		{name: "sha384 and sha512", algorithms: "[sha384, sha512]", expected: HashAlgorithms{"sha384", "sha512"}},
+		{name: "all supported", algorithms: "[sha256, sha384, sha512]", expected: HashAlgorithms{"sha256", "sha384", "sha512"}},
 	}
 
 	for _, tt := range tests {

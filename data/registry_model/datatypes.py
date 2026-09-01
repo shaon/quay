@@ -309,7 +309,7 @@ class Manifest(
     """
 
     @classmethod
-    def for_manifest(cls, manifest, legacy_id_handler, legacy_image_row=None):
+    def for_manifest(cls, manifest, legacy_id_handler, legacy_image_row=None, digest=None):
         if manifest is None:
             return None
 
@@ -321,7 +321,7 @@ class Manifest(
         )
         return Manifest(
             db_id=manifest.id,
-            digest=manifest.digest,
+            digest=digest or manifest.digest,
             internal_manifest_bytes=manifest_bytes,
             media_type=ManifestTable.media_type.get_name(manifest.media_type_id),
             _layers_compressed_size=manifest.layers_compressed_size,
@@ -470,7 +470,7 @@ class ManifestIndex(Manifest):
     """
 
     @classmethod
-    def for_manifest_index(cls, manifest, legacy_id_handler, legacy_image_row=None):
+    def for_manifest_index(cls, manifest, legacy_id_handler, legacy_image_row=None, digest=None):
         if manifest is None:
             return None
 
@@ -482,7 +482,7 @@ class ManifestIndex(Manifest):
         )
         return ManifestIndex(
             db_id=manifest.id,
-            digest=manifest.digest,
+            digest=digest or manifest.digest,
             internal_manifest_bytes=manifest_bytes,
             media_type=ManifestTable.media_type.get_name(manifest.media_type_id),
             _layers_compressed_size=manifest.layers_compressed_size,
@@ -503,10 +503,12 @@ class ManifestIndex(Manifest):
         manifests = parsed.manifest_dict[INDEX_MANIFESTS_KEY]
 
         ret = [
-            Manifest.for_manifest(m, legacy_id_handler)
-            for m in [
-                retriever.get_manifest_with_digest(m_obj[INDEX_DIGEST_KEY]) for m_obj in manifests
-            ]
+            Manifest.for_manifest(
+                retriever.get_manifest_with_digest(manifest_descriptor[INDEX_DIGEST_KEY]),
+                legacy_id_handler,
+                digest=manifest_descriptor[INDEX_DIGEST_KEY],
+            )
+            for manifest_descriptor in manifests
         ]
         return ret
 
@@ -691,6 +693,7 @@ class BlobUpload(
         "BlobUpload",
         [
             "upload_id",
+            "repository_id",
             "byte_count",
             "uncompressed_byte_count",
             "chunk_count",
@@ -699,6 +702,8 @@ class BlobUpload(
             "storage_metadata",
             "piece_sha_state",
             "piece_hashes",
+            "requested_digest_algorithm",
+            "requested_digest_state",
         ],
     )
 ):
@@ -711,6 +716,7 @@ class BlobUpload(
         return BlobUpload(
             db_id=blob_upload.id,
             upload_id=blob_upload.uuid,
+            repository_id=blob_upload.repository_id,
             byte_count=blob_upload.byte_count,
             uncompressed_byte_count=blob_upload.uncompressed_byte_count,
             chunk_count=blob_upload.chunk_count,
@@ -719,6 +725,8 @@ class BlobUpload(
             storage_metadata=blob_upload.storage_metadata,
             piece_sha_state=blob_upload.piece_sha_state,
             piece_hashes=blob_upload.piece_hashes,
+            requested_digest_algorithm=blob_upload.requested_digest_algorithm,
+            requested_digest_state=blob_upload.requested_digest_state,
         )
 
 

@@ -291,6 +291,31 @@ class TestProxy(unittest.TestCase):
                 proxy.get_manifest(image_ref=TAG_404)
         self.assertIn("404", str(excinfo.value))
 
+    def test_get_manifest_rejects_oversized_response_while_streaming(self):
+        proxy = Proxy(self.config, "library/postgres")
+        response_mock = mock.MagicMock()
+        response_mock.headers = {"content-type": "application/json"}
+        response_mock.iter_content.return_value = [b"1234", b"5"]
+
+        with mock.patch.object(proxy, "get", return_value=response_mock):
+            with pytest.raises(UpstreamRegistryError, match="exceeds.*byte limit"):
+                proxy.get_manifest(image_ref=TAG, max_bytes=4)
+
+        response_mock.close.assert_called_once_with()
+
+    def test_get_manifest_accepts_response_at_streaming_limit(self):
+        proxy = Proxy(self.config, "library/postgres")
+        response_mock = mock.MagicMock()
+        response_mock.headers = {"content-type": "application/json"}
+        response_mock.iter_content.return_value = [b"12", b"34"]
+
+        with mock.patch.object(proxy, "get", return_value=response_mock):
+            raw_manifest, content_type = proxy.get_manifest(image_ref=TAG, max_bytes=4)
+
+        assert raw_manifest == b"1234"
+        assert content_type == "application/json"
+        response_mock.close.assert_called_once_with()
+
     def test_session_request_wrapper_retries_request_on_failed_auth(self):
         with HTTMock(docker_registry_mock):
             proxy = Proxy(self.config, "library/postgres")

@@ -1,6 +1,5 @@
 import time
 
-from data.database import Manifest
 from data.model.oci.blob import get_repository_blob_by_digest
 from data.model.storage import get_layer_path
 from image.shared.interfaces import ContentRetriever
@@ -25,30 +24,24 @@ class RepositoryContentRetriever(ContentRetriever):
         return RepositoryContentRetriever(repository_id, storage)
 
     def get_manifest_with_digest(self, digest):
-        query = (
-            Manifest.select()
-            .where(Manifest.repository == self.repository_id)
-            .where(Manifest.digest == digest)
+        # Import locally to avoid a cycle: manifest creation constructs this retriever.
+        from data.model.oci.manifest import lookup_manifest
+
+        return lookup_manifest(
+            self.repository_id,
+            digest,
+            allow_dead=True,
+            allow_hidden=True,
         )
-        try:
-            return query.get()
-        except Manifest.DoesNotExist:
-            return None
 
     def get_manifest_bytes_with_digest(self, digest):
         """
         Returns the bytes of the manifest with the given digest or None if none found.
         """
-        query = (
-            Manifest.select()
-            .where(Manifest.repository == self.repository_id)
-            .where(Manifest.digest == digest)
-        )
-
-        try:
-            return Bytes.for_string_or_unicode(query.get().manifest_bytes).as_encoded_str()
-        except Manifest.DoesNotExist:
+        manifest = self.get_manifest_with_digest(digest)
+        if manifest is None:
             return None
+        return Bytes.for_string_or_unicode(manifest.manifest_bytes).as_encoded_str()
 
     def get_blob_bytes_with_digest(self, digest):
         """

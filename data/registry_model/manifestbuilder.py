@@ -224,7 +224,11 @@ class _ManifestBuilder(object):
 
         # Target the tag at the manifest.
         manifest, tag = registry_model.create_manifest_and_retarget_tag(
-            self._repository_ref, manifest_instance, tag_name, self._storage
+            self._repository_ref,
+            manifest_instance,
+            tag_name,
+            self._storage,
+            requested_digest=manifest_instance.digest,
         )
         if tag is None:
             return None

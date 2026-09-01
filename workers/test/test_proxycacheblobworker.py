@@ -48,6 +48,35 @@ def test_proxy_cache_blob_download(proxy_cache_blob_worker, registry_proxy_model
     )
 
 
+def test_should_download_repository_placeholder(
+    proxy_cache_blob_worker, registry_proxy_model, initialized_db
+):
+    from data.database import (
+        ImageStorage,
+        Manifest,
+        ManifestBlob,
+        MediaType,
+        Repository,
+    )
+
+    repo = Repository.get(Repository.name == "simple")
+    content = b"worker repository placeholder"
+    digest = str(sha256_digest(content))
+    blob = ImageStorage.create(content_checksum=digest, image_size=len(content))
+    media_type, _ = MediaType.get_or_create(
+        name="application/vnd.docker.distribution.manifest.v2+json"
+    )
+    manifest = Manifest.create(
+        digest=str(sha256_digest(b"worker placeholder owner")),
+        manifest_bytes='{"test": "manifest"}',
+        media_type=media_type,
+        repository=repo,
+    )
+    ManifestBlob.create(manifest=manifest, blob=blob, repository=repo)
+
+    assert proxy_cache_blob_worker._should_download_blob(digest, repo.id, registry_proxy_model)
+
+
 def test_process_queue_item_with_none_username(proxy_cache_blob_worker, initialized_db):
     """Test that worker handles None username for public repositories (PROJQUAY-9346)"""
 
@@ -152,20 +181,24 @@ def test_all_blobs_downloaded_for_manifest_all_complete(proxy_cache_blob_worker,
     # Create test blobs with placements
     location = ImageStorageLocation.get()
 
+    blob1_content = b"complete worker blob one"
     blob1 = ImageStorage.create(
-        content_checksum="sha256:blob1_complete",
-        image_size=1024,
+        content_checksum=str(sha256_digest(blob1_content)),
+        image_size=len(blob1_content),
         uncompressed_size=2048,
     )
     ImageStoragePlacement.create(storage=blob1, location=location.id)
+    storage.put_content([location.name], get_layer_path(blob1), blob1_content)
     ManifestBlob.create(manifest=manifest, blob=blob1, repository=repo)
 
+    blob2_content = b"complete worker blob two"
     blob2 = ImageStorage.create(
-        content_checksum="sha256:blob2_complete",
-        image_size=2048,
+        content_checksum=str(sha256_digest(blob2_content)),
+        image_size=len(blob2_content),
         uncompressed_size=4096,
     )
     ImageStoragePlacement.create(storage=blob2, location=location.id)
+    storage.put_content([location.name], get_layer_path(blob2), blob2_content)
     ManifestBlob.create(manifest=manifest, blob=blob2, repository=repo)
 
     # All blobs have placements, should return True
@@ -204,18 +237,21 @@ def test_all_blobs_downloaded_for_manifest_incomplete(proxy_cache_blob_worker, i
     # Create test blobs - one with placement, one without (placeholder)
     location = ImageStorageLocation.get()
 
+    blob1_content = b"readable worker blob"
     blob1 = ImageStorage.create(
-        content_checksum="sha256:blob1_incomplete",
-        image_size=1024,
+        content_checksum=str(sha256_digest(blob1_content)),
+        image_size=len(blob1_content),
         uncompressed_size=2048,
     )
     ImageStoragePlacement.create(storage=blob1, location=location.id)
+    storage.put_content([location.name], get_layer_path(blob1), blob1_content)
     ManifestBlob.create(manifest=manifest, blob=blob1, repository=repo)
 
     # This blob is a placeholder - no ImageStoragePlacement
+    blob2_content = b"placeholder worker blob"
     blob2 = ImageStorage.create(
-        content_checksum="sha256:blob2_incomplete",
-        image_size=2048,
+        content_checksum=str(sha256_digest(blob2_content)),
+        image_size=len(blob2_content),
         uncompressed_size=4096,
     )
     ManifestBlob.create(manifest=manifest, blob=blob2, repository=repo)
@@ -269,20 +305,25 @@ def test_reset_security_status_when_blobs_complete(proxy_cache_blob_worker, init
     # Create test blobs with placements
     location = ImageStorageLocation.get()
 
+    blob1_content = b"reset worker blob one"
     blob1 = ImageStorage.create(
-        content_checksum="sha256:blob1_reset",
-        image_size=1024,
+        content_checksum=str(sha256_digest(blob1_content)),
+        image_size=len(blob1_content),
         uncompressed_size=2048,
     )
     ImageStoragePlacement.create(storage=blob1, location=location.id)
+    storage.put_content([location.name], get_layer_path(blob1), blob1_content)
     ManifestBlob.create(manifest=manifest, blob=blob1, repository=repo)
 
+    blob2_content = b"reset worker blob two"
+    blob2_digest = str(sha256_digest(blob2_content))
     blob2 = ImageStorage.create(
-        content_checksum="sha256:blob2_reset",
-        image_size=2048,
+        content_checksum=blob2_digest,
+        image_size=len(blob2_content),
         uncompressed_size=4096,
     )
     ImageStoragePlacement.create(storage=blob2, location=location.id)
+    storage.put_content([location.name], get_layer_path(blob2), blob2_content)
     ManifestBlob.create(manifest=manifest, blob=blob2, repository=repo)
 
     # Verify security status exists before reset
@@ -293,7 +334,7 @@ def test_reset_security_status_when_blobs_complete(proxy_cache_blob_worker, init
     assert status.index_status == IndexStatus.MANIFEST_UNSUPPORTED
 
     # Trigger the reset by calling with one of the blob digests
-    proxy_cache_blob_worker._reset_security_status_if_complete("sha256:blob2_reset", repo.id)
+    proxy_cache_blob_worker._reset_security_status_if_complete(blob2_digest, repo.id)
 
     # Verify security status was deleted
     status_count = (
@@ -351,24 +392,28 @@ def test_reset_security_status_partial_download_no_reset(proxy_cache_blob_worker
     # Create test blobs - only one with placement
     location = ImageStorageLocation.get()
 
+    blob1_content = b"partial worker readable blob"
+    blob1_digest = str(sha256_digest(blob1_content))
     blob1 = ImageStorage.create(
-        content_checksum="sha256:blob1_partial",
-        image_size=1024,
+        content_checksum=blob1_digest,
+        image_size=len(blob1_content),
         uncompressed_size=2048,
     )
     ImageStoragePlacement.create(storage=blob1, location=location.id)
+    storage.put_content([location.name], get_layer_path(blob1), blob1_content)
     ManifestBlob.create(manifest=manifest, blob=blob1, repository=repo)
 
     # This blob is a placeholder - no ImageStoragePlacement
+    blob2_content = b"partial worker placeholder blob"
     blob2 = ImageStorage.create(
-        content_checksum="sha256:blob2_partial",
-        image_size=2048,
+        content_checksum=str(sha256_digest(blob2_content)),
+        image_size=len(blob2_content),
         uncompressed_size=4096,
     )
     ManifestBlob.create(manifest=manifest, blob=blob2, repository=repo)
 
     # Trigger the reset attempt
-    proxy_cache_blob_worker._reset_security_status_if_complete("sha256:blob1_partial", repo.id)
+    proxy_cache_blob_worker._reset_security_status_if_complete(blob1_digest, repo.id)
 
     # Verify security status still exists (not deleted)
     status = ManifestSecurityStatus.get(
@@ -422,16 +467,19 @@ def test_reset_security_status_only_affects_unsupported(proxy_cache_blob_worker,
     # Create test blobs with placements
     location = ImageStorageLocation.get()
 
+    blob1_content = b"failed status worker blob"
+    blob1_digest = str(sha256_digest(blob1_content))
     blob1 = ImageStorage.create(
-        content_checksum="sha256:blob1_failed",
-        image_size=1024,
+        content_checksum=blob1_digest,
+        image_size=len(blob1_content),
         uncompressed_size=2048,
     )
     ImageStoragePlacement.create(storage=blob1, location=location.id)
+    storage.put_content([location.name], get_layer_path(blob1), blob1_content)
     ManifestBlob.create(manifest=manifest, blob=blob1, repository=repo)
 
     # Trigger the reset attempt
-    proxy_cache_blob_worker._reset_security_status_if_complete("sha256:blob1_failed", repo.id)
+    proxy_cache_blob_worker._reset_security_status_if_complete(blob1_digest, repo.id)
 
     # Verify security status still exists (should not be deleted because it's FAILED not UNSUPPORTED)
     status = ManifestSecurityStatus.get(
@@ -564,6 +612,6 @@ def test_should_download_blob_storage_error(proxy_cache_blob_worker, initialized
 
     with patch(
         "workers.proxycacheblobworker.storage.exists",
-        side_effect=IOError("storage unavailable"),
+        side_effect=RuntimeError("storage unavailable"),
     ):
         assert proxy_cache_blob_worker._should_download_blob(digest, repo.id, registry_proxy_model)

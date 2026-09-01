@@ -142,6 +142,26 @@ def temp_link_blob(repository_id, blob_digest, link_expiration_s):
         return storage
 
 
+def temp_link_blob_by_id(repository_id, blob_id, blob_digest, link_expiration_s):
+    """
+    Temporarily links the exact blob record to the repository.
+
+    The digest check prevents callers from mounting a different storage row than the one resolved
+    and authorized in the source repository.
+    """
+    with db_transaction():
+        try:
+            storage = ImageStorage.get(
+                ImageStorage.id == blob_id,
+                ImageStorage.content_checksum == blob_digest,
+            )
+        except ImageStorage.DoesNotExist:
+            return None
+
+        linked = _temp_link_blob(repository_id, storage, link_expiration_s)
+        return storage if linked is not None else None
+
+
 def _temp_link_blob(repository_id, storage, link_expiration_s):
     """Note: Should *always* be called by a parent under a transaction."""
     try:
@@ -208,13 +228,25 @@ def initiate_upload(namespace, repo_name, uuid, location_name, storage_metadata)
     return initiate_upload_for_repo(repo, uuid, location_name, storage_metadata)
 
 
-def initiate_upload_for_repo(repo, uuid, location_name, storage_metadata):
+def initiate_upload_for_repo(
+    repo,
+    uuid,
+    location_name,
+    storage_metadata,
+    requested_digest_algorithm=None,
+    requested_digest_state=None,
+):
     """
     Initiates a blob upload for a specific repository object, in a specific location.
     """
     location = storage_model.get_image_location_for_name(location_name)
     return BlobUpload.create(
-        repository=repo, location=location.id, uuid=uuid, storage_metadata=storage_metadata
+        repository=repo,
+        location=location.id,
+        uuid=uuid,
+        storage_metadata=storage_metadata,
+        requested_digest_algorithm=requested_digest_algorithm,
+        requested_digest_state=requested_digest_state,
     )
 
 

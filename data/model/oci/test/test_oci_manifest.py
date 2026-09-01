@@ -1,3 +1,4 @@
+import hashlib
 import json
 import random
 import string
@@ -15,9 +16,11 @@ from data.database import (
     ManifestBlob,
     ManifestChild,
     ManifestSecurityStatus,
+    RepositoryManifestDigest,
     Tag,
     get_epoch_timestamp_ms,
 )
+from data.model import ManifestDigestConflictException
 from data.model.blob import store_blob_record_and_temp_link
 from data.model.oci.label import list_manifest_labels
 from data.model.oci.manifest import (
@@ -26,12 +29,13 @@ from data.model.oci.manifest import (
     get_or_create_manifest,
     lookup_manifest,
     lookup_manifest_referrers,
+    register_repository_manifest_digest,
 )
 from data.model.oci.retriever import RepositoryContentRetriever
 from data.model.oci.tag import filter_to_alive_tags, get_tag
 from data.model.repository import create_repository, get_repository
 from data.model.storage import get_layer_path
-from digest.digest_tools import sha256_digest
+from digest.digest_tools import digest_bytes, sha256_digest
 from image.docker.schema1 import DockerSchema1Manifest, DockerSchema1ManifestBuilder
 from image.docker.schema2.list import DockerSchema2ManifestListBuilder
 from image.docker.schema2.manifest import (
@@ -63,6 +67,91 @@ def test_lookup_manifest(initialized_db):
         digest = tag.manifest.digest
         with assert_query_count(1):
             assert lookup_manifest(repo, digest, allow_dead=True) == tag.manifest
+
+
+@pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
+def test_alternative_manifest_registration_preserves_visible_legacy_sha256(
+    algorithm, initialized_db
+):
+    tag = filter_to_alive_tags(Tag.select()).where(Tag.hidden == False).get()  # noqa: E712
+    manifest = tag.manifest
+    parsed = parse_manifest_from_bytes(
+        Bytes.for_string_or_unicode(manifest.manifest_bytes),
+        manifest.media_type.name,
+    )
+    alternative_digest = digest_bytes(algorithm, parsed.bytes.as_encoded_str())
+
+    created = get_or_create_manifest(
+        manifest.repository_id,
+        parsed,
+        storage,
+        requested_digest=alternative_digest,
+    )
+
+    assert created.manifest.id == manifest.id
+    assert lookup_manifest(manifest.repository_id, manifest.digest, allow_hidden=True) == manifest
+    assert (
+        lookup_manifest(manifest.repository_id, alternative_digest, allow_hidden=True) == manifest
+    )
+    assert {
+        registration.digest
+        for registration in RepositoryManifestDigest.select().where(
+            RepositoryManifestDigest.repository == manifest.repository_id,
+            RepositoryManifestDigest.manifest == manifest,
+        )
+    } == {manifest.digest, alternative_digest}
+
+
+@pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
+def test_manifest_registration_is_repository_scoped_and_cannot_remap(algorithm, initialized_db):
+    first_tag = filter_to_alive_tags(Tag.select()).where(Tag.hidden == False).get()  # noqa: E712
+    first_manifest = first_tag.manifest
+    second_manifest = (
+        Manifest.select()
+        .where(
+            Manifest.repository == first_manifest.repository,
+            Manifest.id != first_manifest.id,
+        )
+        .get()
+    )
+    other_tag = (
+        filter_to_alive_tags(Tag.select())
+        .where(
+            Tag.hidden == False,  # noqa: E712
+            Tag.repository != first_manifest.repository,
+        )
+        .get()
+    )
+    digest = f"{algorithm}:" + "1" * (hashlib.new(algorithm).digest_size * 2)
+
+    with pytest.raises(ManifestDigestConflictException):
+        register_repository_manifest_digest(
+            first_manifest.repository,
+            other_tag.manifest,
+            digest,
+        )
+
+    register_repository_manifest_digest(first_manifest.repository, first_manifest, digest)
+    register_repository_manifest_digest(other_tag.repository, other_tag.manifest, digest)
+
+    assert lookup_manifest(first_manifest.repository, digest, allow_hidden=True) == first_manifest
+    assert lookup_manifest(other_tag.repository, digest, allow_hidden=True) == other_tag.manifest
+    assert (
+        lookup_manifest(first_manifest.repository, first_manifest.digest, allow_hidden=True) is None
+    )
+    with pytest.raises(ManifestDigestConflictException):
+        register_repository_manifest_digest(
+            first_manifest.repository,
+            second_manifest,
+            digest,
+        )
+    assert (
+        RepositoryManifestDigest.get(
+            repository=first_manifest.repository,
+            digest=digest,
+        ).manifest_id
+        == first_manifest.id
+    )
 
 
 def test_lookup_manifest_dead_tag(initialized_db):

@@ -23,6 +23,7 @@ from util.repomirror.skopeomirror import SkopeoMirror, SkopeoResults
 from workers.repomirrorworker import (
     PreemptedException,
     _get_v2_bearer_token,
+    _map_failure_to_reason,
     copy_filtered_architectures,
     delete_obsolete_tags,
     perform_mirror,
@@ -38,6 +39,18 @@ def _mock_dns_for_ssrf_validation():
     with patch("util.security.ssrf._getaddrinfo") as mock_dns:
         mock_dns.return_value = [(2, 1, 6, "", ("93.184.216.34", 0))]
         yield mock_dns
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "digest algorithm is unsupported",
+        "digest algorithm sha512 is not supported for mirroring",
+        "digest algorithm is disabled by registry configuration",
+    ],
+)
+def test_unsupported_digest_failure_reason(message):
+    assert _map_failure_to_reason(message) == "unsupported_digest_algorithm"
 
 
 def _assert_skopeo_args(actual_args, expected_args):
@@ -151,6 +164,7 @@ def test_successful_mirror(run_skopeo_mock, initialized_db, app):
                 "/usr/bin/skopeo",
                 "copy",
                 "--all",
+                "--preserve-digests",
                 "--remove-signatures",
                 "--src-tls-verify=False",
                 "--dest-tls-verify=True",
@@ -265,6 +279,7 @@ def test_mirror_unsigned_images(run_skopeo_mock, initialized_db, app):
                 "--insecure-policy",
                 "copy",
                 "--all",
+                "--preserve-digests",
                 "--remove-signatures",
                 "--src-tls-verify=False",
                 "--dest-tls-verify=True",
@@ -324,6 +339,7 @@ def test_successful_disabled_sync_now(run_skopeo_mock, initialized_db, app):
                 "/usr/bin/skopeo",
                 "copy",
                 "--all",
+                "--preserve-digests",
                 "--remove-signatures",
                 "--src-tls-verify=True",
                 "--dest-tls-verify=True",
@@ -382,6 +398,7 @@ def test_successful_mirror_verbose_logs(run_skopeo_mock, initialized_db, app, mo
                 "--debug",
                 "copy",
                 "--all",
+                "--preserve-digests",
                 "--remove-signatures",
                 "--src-tls-verify=True",
                 "--dest-tls-verify=True",
@@ -473,6 +490,7 @@ def test_rollback(
                 "/usr/bin/skopeo",
                 "copy",
                 "--all",
+                "--preserve-digests",
                 "--remove-signatures",
                 "--src-tls-verify=True",
                 "--dest-tls-verify=True",
@@ -489,6 +507,7 @@ def test_rollback(
                 "/usr/bin/skopeo",
                 "copy",
                 "--all",
+                "--preserve-digests",
                 "--remove-signatures",
                 "--src-tls-verify=True",
                 "--dest-tls-verify=True",
@@ -505,6 +524,7 @@ def test_rollback(
                 "/usr/bin/skopeo",
                 "copy",
                 "--all",
+                "--preserve-digests",
                 "--remove-signatures",
                 "--src-tls-verify=True",
                 "--dest-tls-verify=True",
@@ -598,6 +618,7 @@ def test_mirror_config_server_hostname(run_skopeo_mock, initialized_db, app, mon
                 "--debug",
                 "copy",
                 "--all",
+                "--preserve-digests",
                 "--remove-signatures",
                 "--src-tls-verify=True",
                 "--dest-tls-verify=True",
@@ -663,6 +684,7 @@ def test_quote_params(run_skopeo_mock, initialized_db, app):
                 "/usr/bin/skopeo",
                 "copy",
                 "--all",
+                "--preserve-digests",
                 "--remove-signatures",
                 "--src-tls-verify=True",
                 "--dest-tls-verify=True",
@@ -727,6 +749,7 @@ def test_quote_params_password(run_skopeo_mock, initialized_db, app):
                 "/usr/bin/skopeo",
                 "copy",
                 "--all",
+                "--preserve-digests",
                 "--remove-signatures",
                 "--src-tls-verify=True",
                 "--dest-tls-verify=True",
@@ -1031,6 +1054,7 @@ def test_mirror_without_architecture_filter_uses_all(run_skopeo_mock, initialize
                 "/usr/bin/skopeo",
                 "copy",
                 "--all",
+                "--preserve-digests",
                 "--remove-signatures",
                 "--src-tls-verify=False",
                 "--dest-tls-verify=True",
@@ -1120,6 +1144,7 @@ def test_mirror_single_arch_image_with_matching_filter(run_skopeo_mock, initiali
                 "/usr/bin/skopeo",
                 "copy",
                 "--all",
+                "--preserve-digests",
                 "--remove-signatures",
                 "--src-tls-verify=False",
                 "--dest-tls-verify=True",
@@ -1275,6 +1300,7 @@ def test_mirror_mixed_tags_with_architecture_filter(
                 "/usr/bin/skopeo",
                 "copy",
                 "--all",
+                "--preserve-digests",
                 "--remove-signatures",
                 "--src-tls-verify=False",
                 "--dest-tls-verify=True",
@@ -2227,6 +2253,7 @@ def test_perform_mirror_cancel_during_sync(mock_check_status, run_skopeo_mock, i
                 "/usr/bin/skopeo",
                 "copy",
                 "--all",
+                "--preserve-digests",
                 "--remove-signatures",
                 "--src-tls-verify=False",
                 "--dest-tls-verify=True",

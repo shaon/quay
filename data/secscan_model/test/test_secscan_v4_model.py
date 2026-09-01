@@ -193,6 +193,47 @@ def test_load_security_information_success(initialized_db, set_secscan_config):
     assert result.security_information == SecurityInformation(Layer(manifest.digest, "", "", 4, []))
 
 
+def test_load_security_information_uses_repository_visible_digest(
+    initialized_db, set_secscan_config
+):
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+    tag = registry_model.get_repo_tag(repository_ref, "latest")
+    manifest = registry_model.get_manifest_for_tag(tag)
+    manifest_row = Manifest.get_by_id(manifest._db_id)
+    external_digest = "sha512:" + "a" * 128
+    model.oci.manifest.register_repository_manifest_digest(
+        repository_ref.id, manifest_row, external_digest
+    )
+
+    ManifestSecurityStatus.update(
+        error_json={},
+        index_status=IndexStatus.COMPLETED,
+        indexer_hash="abc",
+        indexer_version=IndexerVersion.V4,
+        metadata_json={},
+    ).where(ManifestSecurityStatus.manifest == manifest._db_id).execute()
+
+    secscan = V4SecurityScanner(application, instance_keys, storage)
+    secscan._secscan_api = mock.Mock()
+    secscan._secscan_api.vulnerability_report.return_value = {
+        "manifest_hash": external_digest,
+        "state": "IndexFinished",
+        "packages": {},
+        "distributions": {},
+        "repository": {},
+        "environments": {},
+        "package_vulnerabilities": {},
+        "success": True,
+        "err": "",
+    }
+
+    result = secscan.load_security_information(manifest)
+
+    assert result.status == ScanLookupStatus.SUCCESS
+    secscan._secscan_api.vulnerability_report.assert_called_once_with(external_digest)
+    assert result.security_information == SecurityInformation(Layer(external_digest, "", "", 4, []))
+
+
 def test_load_security_information_success_with_cache(initialized_db, set_secscan_config):
     model_cache = InMemoryDataModelCache(TEST_CACHE_CONFIG)
     model_cache.empty_for_testing()

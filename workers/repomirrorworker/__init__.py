@@ -169,7 +169,11 @@ def _map_failure_to_reason(error_message):
     """
     error_lower = str(error_message).lower()
 
-    if "auth" in error_lower or "unauthorized" in error_lower or "forbidden" in error_lower:
+    if "digest algorithm" in error_lower and any(
+        reason in error_lower for reason in ("unsupported", "not supported", "disabled")
+    ):
+        return "unsupported_digest_algorithm"
+    elif "auth" in error_lower or "unauthorized" in error_lower or "forbidden" in error_lower:
         return "auth_failed"
     elif "timeout" in error_lower or "timed out" in error_lower:
         return "network_timeout"

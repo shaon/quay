@@ -24,8 +24,12 @@ def test_allowed_hash_algorithms_defaults_to_sha256():
     "value",
     [
         ["sha256"],
+        ["sha384"],
         ["sha512"],
+        ["sha256", "sha384"],
         ["sha256", "sha512"],
+        ["sha384", "sha512"],
+        ["sha256", "sha384", "sha512"],
     ],
 )
 def test_allowed_hash_algorithms_accepts_exact_supported_allowlists(value, tmp_path):
@@ -53,6 +57,7 @@ def test_allowed_hash_algorithms_rejects_empty_list():
     "value",
     [
         ["sha256", "sha256"],
+        ["sha384", "sha384"],
         ["sha512", "sha512"],
     ],
 )
@@ -67,7 +72,7 @@ def test_allowed_hash_algorithms_rejects_unknown_algorithm():
     schema = CONFIG_SCHEMA["properties"]["ALLOWED_HASH_ALGORITHMS"]
 
     with pytest.raises(ValidationError):
-        validate(["sha384"], schema)
+        validate(["sha999"], schema)
 
 
 @pytest.mark.parametrize(

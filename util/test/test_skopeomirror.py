@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+from unittest.mock import patch
 
 import pytest
 
@@ -88,6 +89,25 @@ def test_registry_netloc_docker_daemon():
         _registry_netloc("docker-daemon:registry.example.com/image:tag") == "registry.example.com"
     )
     assert _registry_netloc("docker-daemon:image") is None
+
+
+def test_skopeo_copy_preserves_manifest_digests():
+    mirror = SkopeoMirror()
+    with patch.object(mirror, "run_skopeo") as run_skopeo:
+        mirror.copy(
+            "docker://source.example.com/ns/repo:tag",
+            "docker://destination.example.com/ns/repo:tag",
+            timeout=SKOPEO_TIMEOUT_SECONDS,
+        )
+
+    args = run_skopeo.call_args.args[0]
+    assert args[:5] == [
+        "/usr/bin/skopeo",
+        "copy",
+        "--all",
+        "--preserve-digests",
+        "--remove-signatures",
+    ]
 
 
 @pytest.mark.integration

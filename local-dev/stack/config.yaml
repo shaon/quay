@@ -104,7 +104,7 @@ FEATURE_USER_METADATA: True
 #  SERVICE_NAME: "Keycloak"
 #  OIDC_SERVER: "http://host.containers.internal:8081/realms/quay/"
 #  CLIENT_ID: "quay-ui"
-#  CLIENT_SECRET: "KbIEbjqeK73iL6zhXZLaVSOCiD5mhB3h"
+#  CLIENT_SECRET: "KbIEbjqeK73iL6zhXZLaVSOCiD5mhB3h"  # gitleaks:allow
 #  LOGIN_SCOPES: ["openid", "profile", "email"]
 #  DEBUGGING: true
 #  USE_PKCE: true
@@ -134,3 +134,7 @@ SPAM_DETECTION_FAIL_OPEN: false
 SPAM_DETECTION_CLASSIFIER_PATH: /quay-registry/conf/stack/spam-classifier-e2e-v1.json
 SPAM_DETECTION_CLASSIFIER_VERSION: e2e-v1
 SPAM_DETECTION_CLASSIFIER_SHA256: 0861a11b624e0ed790530c8821930254a98f10cdc5c320d12e08a636a4fbc118
+ALLOWED_HASH_ALGORITHMS:
+  - sha256
+  - sha384
+  - sha512

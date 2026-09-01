@@ -445,7 +445,7 @@ class DefaultConfig(ImmutableConfig):
     # Feature Flag: If set to true, Quay will run using FIPS compliant hash functions.
     FEATURE_FIPS = False
 
-    # Exact allowlist of digest algorithms accepted for new client-visible digest writes.
+    # Hard allowlist for client-visible digest reads and writes.
     # Internal storage and deduplication continue to use canonical SHA-256.
     ALLOWED_HASH_ALGORITHMS: List[str] = ["sha256"]
 

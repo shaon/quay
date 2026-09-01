@@ -17,11 +17,14 @@ from auth.permissions import (
     SuperUserPermission,
 )
 from auth.registry_jwt_auth import get_auth_headers, process_registry_jwt_auth
+from data.database import RepositoryState
 from data.model import PushesDisabledException, QuotaExceededException
 from data.readreplica import ReadOnlyModeException
 from data.registry_model import registry_model
 from endpoints.decorators import anon_allowed, route_show_if
 from endpoints.v2.errors import (
+    DigestDisabled,
+    DigestUnsupported,
     InvalidRequest,
     PushesDisabled,
     QuotaExceeded,
@@ -31,7 +34,7 @@ from endpoints.v2.errors import (
     Unsupported,
     V2RegistryException,
 )
-from proxy import UpstreamRegistryError
+from proxy import ProxyDigestDisabledError, ProxyDigestUnsupportedError, UpstreamRegistryError
 from util.http import abort
 from util.metrics.prometheus import timed_blueprint
 from util.pagination import decrypt_page_token, encrypt_page_token
@@ -39,6 +42,19 @@ from util.registry.dockerver import docker_version
 
 logger = logging.getLogger(__name__)
 v2_bp = timed_blueprint(Blueprint("v2", __name__), get_app=lambda: app)
+
+
+_MIRROR_REPOSITORY_STATES = frozenset({RepositoryState.MIRROR, RepositoryState.ORG_MIRROR})
+
+
+def is_mirror_repository(repository_ref):
+    return repository_ref.state in _MIRROR_REPOSITORY_STATES
+
+
+def validate_mirror_digest_algorithm(repository_ref, algorithm):
+    """Reject non-SHA-256 ingestion into repositories managed by mirror workers."""
+    if is_mirror_repository(repository_ref) and algorithm not in (None, "sha256"):
+        raise DigestUnsupported(algorithm)
 
 
 @v2_bp.app_errorhandler(V2RegistryException)
@@ -55,6 +71,16 @@ def handle_registry_v2_exception(error):
 @v2_bp.app_errorhandler(ReadOnlyModeException)
 def handle_readonly(ex):
     return _format_error_response(ReadOnlyMode())
+
+
+@v2_bp.app_errorhandler(ProxyDigestUnsupportedError)
+def handle_proxy_digest_unsupported(error):
+    return _format_error_response(DigestUnsupported(error.algorithm))
+
+
+@v2_bp.app_errorhandler(ProxyDigestDisabledError)
+def handle_proxy_digest_disabled(error):
+    return _format_error_response(DigestDisabled(error.algorithm))
 
 
 @v2_bp.app_errorhandler(UpstreamRegistryError)

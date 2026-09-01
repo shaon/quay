@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import threading
 import uuid
 from datetime import datetime, timedelta
 from io import BytesIO
@@ -17,17 +18,28 @@ from data.cache import cache_key
 from data.cache.impl import InMemoryDataModelCache
 from data.cache.test.test_cache import TEST_CACHE_CONFIG
 from data.database import (
+    ImageStorage,
     ImageStorageLocation,
     Manifest,
     ManifestBlob,
     ManifestLabel,
     Repository,
+    RepositoryBlobDigest,
+    RepositoryManifestDigest,
     Tag,
+    UploadedBlob,
     User,
+    db,
+    db_transaction,
     get_epoch_timestamp_ms,
 )
-from data.model import QuotaExceededException, namespacequota
+from data.model import (
+    BlobDigestConflictException,
+    QuotaExceededException,
+    namespacequota,
+)
 from data.model.blob import store_blob_record_and_temp_link
+from data.model.oci.manifest import ReferrerDigestUnsupportedException
 from data.model.oci.retriever import RepositoryContentRetriever
 from data.model.storage import get_layer_path
 from data.registry_model.blobuploader import BlobUploadSettings, upload_blob
@@ -733,6 +745,94 @@ def test_commit_blob_upload(registry_model):
     assert not registry_model.lookup_blob_upload(repository_ref, blob_upload.upload_id)
 
 
+def test_commit_blob_upload_is_idempotent_after_concurrent_finalization(registry_model):
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+    blob_upload = registry_model.create_blob_upload(
+        repository_ref, str(uuid.uuid4()), "local_us", {"some": "metadata"}
+    )
+    canonical_digest = "sha256:" + hashlib.sha256(b"content").hexdigest()
+    requested_digest = "sha512:" + hashlib.sha512(b"content").hexdigest()
+
+    first = registry_model.commit_blob_upload(blob_upload, canonical_digest, 60, requested_digest)
+    second = registry_model.commit_blob_upload(blob_upload, canonical_digest, 60, requested_digest)
+
+    assert first == second
+    assert (
+        RepositoryBlobDigest.select()
+        .where(
+            RepositoryBlobDigest.repository == repository_ref.id,
+            RepositoryBlobDigest.digest == requested_digest,
+        )
+        .count()
+        == 1
+    )
+
+
+def test_commit_blob_upload_rejects_conflicting_registration(registry_model):
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+    requested_digest = "sha512:" + hashlib.sha512(b"same external digest").hexdigest()
+
+    first_upload = registry_model.create_blob_upload(
+        repository_ref, str(uuid.uuid4()), "local_us", {}
+    )
+    first_canonical = "sha256:" + hashlib.sha256(uuid.uuid4().bytes).hexdigest()
+    registry_model.commit_blob_upload(first_upload, first_canonical, 60, requested_digest)
+
+    second_upload = registry_model.create_blob_upload(
+        repository_ref, str(uuid.uuid4()), "local_us", {}
+    )
+    second_canonical = "sha256:" + hashlib.sha256(uuid.uuid4().bytes).hexdigest()
+    assert (
+        not ImageStorage.select().where(ImageStorage.content_checksum == second_canonical).exists()
+    )
+    with pytest.raises(BlobDigestConflictException):
+        registry_model.commit_blob_upload(second_upload, second_canonical, 60, requested_digest)
+
+    registration = RepositoryBlobDigest.get(repository=repository_ref.id, digest=requested_digest)
+    assert registration.image_storage.content_checksum == first_canonical
+    assert registry_model.lookup_blob_upload(repository_ref, second_upload.upload_id) is not None
+
+
+def test_blob_upload_lookup_enforces_repository_boundary(registry_model):
+    source_repository = registry_model.lookup_repository("devtable", "simple")
+    other_repository = registry_model.lookup_repository("devtable", "complex")
+    blob_upload = registry_model.create_blob_upload(
+        source_repository, str(uuid.uuid4()), "local_us", {}
+    )
+
+    assert registry_model.lookup_blob_upload(source_repository, blob_upload.upload_id)
+    assert registry_model.lookup_blob_upload(other_repository, blob_upload.upload_id) is None
+
+    registry_model.delete_blob_upload(blob_upload)
+
+
+def test_alternative_registration_preserves_legacy_sha256_visibility(registry_model):
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+    canonical_digest = "sha256:" + hashlib.sha256(b"legacy content").hexdigest()
+    requested_digest = "sha512:" + hashlib.sha512(b"legacy content").hexdigest()
+    location = ImageStorageLocation.get(name="local_us")
+    model.blob.store_blob_record_and_temp_link_in_repo(
+        repository_ref.id, canonical_digest, location, 14, 60
+    )
+    assert registry_model.get_repo_blob_by_digest(repository_ref, canonical_digest)
+
+    blob_upload = registry_model.create_blob_upload(
+        repository_ref, str(uuid.uuid4()), "local_us", {}
+    )
+    registry_model.commit_blob_upload(blob_upload, canonical_digest, 60, requested_digest)
+
+    assert registry_model.get_repo_blob_by_digest(repository_ref, canonical_digest)
+    assert registry_model.get_repo_blob_by_digest(repository_ref, requested_digest)
+    assert {
+        registration.digest
+        for registration in RepositoryBlobDigest.select().where(
+            RepositoryBlobDigest.repository == repository_ref.id,
+            RepositoryBlobDigest.image_storage
+            == ImageStorage.get(content_checksum=canonical_digest),
+        )
+    } == {canonical_digest, requested_digest}
+
+
 def test_mount_blob_into_repository(registry_model):
     repository_ref = registry_model.lookup_repository("devtable", "simple")
     latest_tag = registry_model.get_repo_tag(repository_ref, "latest")
@@ -757,6 +857,297 @@ def test_mount_blob_into_repository(registry_model):
 
 class SomeException(Exception):
     pass
+
+
+def test_mount_alternative_digest_registers_only_destination_external_identity(registry_model):
+    source_repository = registry_model.lookup_repository("devtable", "simple")
+    target_repository = registry_model.lookup_repository("devtable", "complex")
+    latest_tag = registry_model.get_repo_tag(source_repository, "latest")
+    manifest = registry_model.get_manifest_for_tag(latest_tag)
+    blob = registry_model.get_manifest_local_blobs(manifest, storage)[0]
+    alternative_digest = "sha512:" + hashlib.sha512(blob.digest.encode()).hexdigest()
+    source_storage = ImageStorage.get_by_id(blob._db_id)
+    model.oci.blob.register_repository_blob_digest(
+        source_repository.id, source_storage, alternative_digest
+    )
+    model_cache = InMemoryDataModelCache(TEST_CACHE_CONFIG)
+
+    # Missing blobs are not negatively cached, so a new immutable registration is immediately
+    # visible without explicit invalidation.
+    assert (
+        registry_model.get_cached_repo_blob(
+            model_cache,
+            target_repository.namespace_name,
+            target_repository.name,
+            alternative_digest,
+        )
+        is None
+    )
+
+    assert registry_model.mount_blob_into_repository(
+        blob, target_repository, 60, alternative_digest
+    )
+
+    cached_blob = registry_model.get_cached_repo_blob(
+        model_cache,
+        target_repository.namespace_name,
+        target_repository.name,
+        alternative_digest,
+    )
+    assert cached_blob._db_id == blob._db_id
+    assert registry_model.get_repo_blob_by_digest(target_repository, alternative_digest) == blob
+    assert registry_model.get_repo_blob_by_digest(target_repository, blob.digest) is None
+    assert (
+        RepositoryBlobDigest.select()
+        .where(
+            RepositoryBlobDigest.repository == target_repository.id,
+            RepositoryBlobDigest.digest == alternative_digest,
+        )
+        .count()
+        == 1
+    )
+
+
+def test_mount_alternative_digest_preserves_existing_legacy_sha256(registry_model):
+    source_repository = registry_model.lookup_repository("devtable", "simple")
+    target_repository = registry_model.lookup_repository("devtable", "complex")
+    latest_tag = registry_model.get_repo_tag(source_repository, "latest")
+    manifest = registry_model.get_manifest_for_tag(latest_tag)
+    blob = registry_model.get_manifest_local_blobs(manifest, storage)[0]
+    alternative_digest = "sha512:" + hashlib.sha512(b"legacy target").hexdigest()
+    source_storage = ImageStorage.get_by_id(blob._db_id)
+    model.oci.blob.register_repository_blob_digest(
+        source_repository.id, source_storage, alternative_digest
+    )
+    assert model.blob.temp_link_blob_by_id(target_repository.id, blob._db_id, blob.digest, 60)
+    assert registry_model.get_repo_blob_by_digest(target_repository, blob.digest)
+
+    assert registry_model.mount_blob_into_repository(
+        blob, target_repository, 60, alternative_digest
+    )
+
+    assert registry_model.get_repo_blob_by_digest(target_repository, blob.digest)
+    assert registry_model.get_repo_blob_by_digest(target_repository, alternative_digest)
+    registrations = RepositoryBlobDigest.select().where(
+        RepositoryBlobDigest.repository == target_repository.id,
+        RepositoryBlobDigest.image_storage == blob._db_id,
+    )
+    assert {registration.digest for registration in registrations} == {
+        blob.digest,
+        alternative_digest,
+    }
+
+
+def test_mount_rejects_destination_digest_remap(registry_model):
+    source_repository = registry_model.lookup_repository("devtable", "simple")
+    target_repository = registry_model.lookup_repository("devtable", "complex")
+    latest_tag = registry_model.get_repo_tag(source_repository, "latest")
+    manifest = registry_model.get_manifest_for_tag(latest_tag)
+    source_blob = registry_model.get_manifest_local_blobs(manifest, storage)[0]
+    alternative_digest = "sha512:" + hashlib.sha512(b"conflict").hexdigest()
+    location = ImageStorageLocation.get(name="local_us")
+    other_digest = "sha256:" + hashlib.sha256(b"other content").hexdigest()
+    other_storage = model.blob.store_blob_record_and_temp_link_in_repo(
+        target_repository.id, other_digest, location, 13, 60
+    )
+    model.oci.blob.register_repository_blob_digest(
+        target_repository.id, other_storage, alternative_digest
+    )
+    source_link_count = (
+        UploadedBlob.select()
+        .where(
+            UploadedBlob.repository == target_repository.id,
+            UploadedBlob.blob == source_blob._db_id,
+        )
+        .count()
+    )
+
+    previous_transaction_factory = db_transaction.obj
+    db_transaction.initialize(lambda: db.transaction())
+    try:
+        with pytest.raises(BlobDigestConflictException):
+            registry_model.mount_blob_into_repository(
+                source_blob, target_repository, 60, alternative_digest
+            )
+    finally:
+        db_transaction.initialize(previous_transaction_factory)
+
+    registration = RepositoryBlobDigest.get(
+        repository=target_repository.id, digest=alternative_digest
+    )
+    assert registration.image_storage_id == other_storage.id
+    assert (
+        UploadedBlob.select()
+        .where(
+            UploadedBlob.repository == target_repository.id,
+            UploadedBlob.blob == source_blob._db_id,
+        )
+        .count()
+        == source_link_count
+    )
+
+
+@pytest.mark.skipif(
+    not os.environ.get("TEST_DATABASE_URI", "").startswith("postgresql"),
+    reason="Parallel unique-index race coverage requires PostgreSQL",
+)
+def test_repository_digest_registration_live_concurrency(registry_model):
+    repository = registry_model.lookup_repository("devtable", "simple")
+    storage_id = ImageStorage.select(ImageStorage.id).order_by(ImageStorage.id).get().id
+    digest = "sha512:" + hashlib.sha512(uuid.uuid4().bytes).hexdigest()
+    barrier = threading.Barrier(2, timeout=10)
+    thread_state = threading.local()
+    errors = []
+    results = []
+    marker_ids = []
+    real_get_or_none = RepositoryBlobDigest.get_or_none
+    previous_transaction_factory = db_transaction.obj
+
+    def synchronized_get_or_none(*args, **kwargs):
+        result = real_get_or_none(*args, **kwargs)
+        if not getattr(thread_state, "passed_precheck", False):
+            thread_state.passed_precheck = True
+            barrier.wait()
+        return result
+
+    def register():
+        try:
+            with db.connection_context(), db.transaction():
+                storage_row = ImageStorage.get_by_id(storage_id)
+                marker = UploadedBlob.create(
+                    repository=repository.id,
+                    blob=storage_row,
+                    expires_at=datetime.utcnow() + timedelta(minutes=5),
+                )
+                marker_ids.append(marker.id)
+                results.append(
+                    model.oci.blob.register_repository_blob_digest(
+                        repository.id, storage_row, digest
+                    ).image_storage_id
+                )
+        except Exception as exc:  # pragma: no cover - surfaced by the assertion below
+            errors.append(exc)
+
+    db_transaction.initialize(lambda: db.transaction())
+    try:
+        with patch.object(
+            RepositoryBlobDigest,
+            "get_or_none",
+            side_effect=synchronized_get_or_none,
+        ):
+            threads = [threading.Thread(target=register) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=15)
+                assert not thread.is_alive(), "registration worker did not finish"
+
+        assert not errors, errors
+        assert results == [storage_id, storage_id]
+        assert UploadedBlob.select().where(UploadedBlob.id.in_(marker_ids)).count() == 2
+        assert (
+            RepositoryBlobDigest.select()
+            .where(
+                RepositoryBlobDigest.repository == repository.id,
+                RepositoryBlobDigest.digest == digest,
+            )
+            .count()
+            == 1
+        )
+    finally:
+        db_transaction.initialize(previous_transaction_factory)
+        UploadedBlob.delete().where(UploadedBlob.id.in_(marker_ids)).execute()
+        RepositoryBlobDigest.delete().where(
+            RepositoryBlobDigest.repository == repository.id,
+            RepositoryBlobDigest.digest == digest,
+        ).execute()
+        db.commit()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("TEST_DATABASE_URI", "").startswith("postgresql"),
+    reason="Parallel unique-index race coverage requires PostgreSQL",
+)
+def test_repository_manifest_digest_registration_live_concurrency(registry_model):
+    repository = registry_model.lookup_repository("devtable", "simple")
+    manifest_id = (
+        Manifest.select(Manifest.id)
+        .where(Manifest.repository == repository.id)
+        .order_by(Manifest.id)
+        .get()
+        .id
+    )
+    storage_id = ImageStorage.select(ImageStorage.id).order_by(ImageStorage.id).get().id
+    digest = "sha512:" + hashlib.sha512(uuid.uuid4().bytes).hexdigest()
+    barrier = threading.Barrier(2, timeout=10)
+    thread_state = threading.local()
+    errors = []
+    results = []
+    marker_ids = []
+    real_get_or_none = RepositoryManifestDigest.get_or_none
+    previous_transaction_factory = db_transaction.obj
+
+    def synchronized_get_or_none(*args, **kwargs):
+        result = real_get_or_none(*args, **kwargs)
+        if not getattr(thread_state, "passed_precheck", False):
+            thread_state.passed_precheck = True
+            barrier.wait()
+        return result
+
+    def register():
+        try:
+            with db.connection_context(), db.transaction():
+                manifest_row = Manifest.get_by_id(manifest_id)
+                marker = UploadedBlob.create(
+                    repository=repository.id,
+                    blob=storage_id,
+                    expires_at=datetime.utcnow() + timedelta(minutes=5),
+                )
+                marker_ids.append(marker.id)
+                results.append(
+                    model.oci.manifest.register_repository_manifest_digest(
+                        repository.id,
+                        manifest_row,
+                        digest,
+                    ).manifest_id
+                )
+        except Exception as exc:  # pragma: no cover - surfaced by the assertion below
+            errors.append(exc)
+
+    db_transaction.initialize(lambda: db.transaction())
+    try:
+        with patch.object(
+            RepositoryManifestDigest,
+            "get_or_none",
+            side_effect=synchronized_get_or_none,
+        ):
+            threads = [threading.Thread(target=register) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=15)
+                assert not thread.is_alive(), "registration worker did not finish"
+
+        assert not errors, errors
+        assert results == [manifest_id, manifest_id]
+        assert UploadedBlob.select().where(UploadedBlob.id.in_(marker_ids)).count() == 2
+        assert (
+            RepositoryManifestDigest.select()
+            .where(
+                RepositoryManifestDigest.repository == repository.id,
+                RepositoryManifestDigest.digest == digest,
+            )
+            .count()
+            == 1
+        )
+    finally:
+        db_transaction.initialize(previous_transaction_factory)
+        UploadedBlob.delete().where(UploadedBlob.id.in_(marker_ids)).execute()
+        RepositoryManifestDigest.delete().where(
+            RepositoryManifestDigest.repository == repository.id,
+            RepositoryManifestDigest.digest == digest,
+        ).execute()
+        db.commit()
 
 
 def test_get_cached_repo_blob(registry_model):
@@ -850,34 +1241,38 @@ def test_create_manifest_and_retarget_tag_with_quota(registry_model):
     new_quota = namespacequota.create_namespace_quota(user, 1)
     namespacequota.create_namespace_quota_limit(new_quota, "reject", 100)
 
-    rejected = False
+    previous_transaction_factory = db_transaction.obj
+    db_transaction.initialize(lambda: db.transaction())
     try:
-        registry_model.create_manifest_and_retarget_tag(
-            repository_ref,
-            manifest,
-            "newtag",
-            storage,
-            verify_quota=True,
-        )
-    except QuotaExceededException:
-        rejected = True
-    assert rejected
+        with pytest.raises(QuotaExceededException):
+            registry_model.create_manifest_and_retarget_tag(
+                repository_ref,
+                manifest,
+                "newtag",
+                storage,
+                verify_quota=True,
+            )
+    finally:
+        db_transaction.initialize(previous_transaction_factory)
 
-    # Assert that a temporary tag outside the time machine window was created since the manifest was rejected
-    # Get the tag that has beeen created in the last second
-    tag = (
-        Tag.select()
+    # Quota rejection is part of the manifest lifecycle transaction. No graph, registration, or
+    # tag is retained solely for garbage collection after the transaction rolls back.
+    assert (
+        not Manifest.select()
         .where(
-            Tag.lifetime_start_ms > get_epoch_timestamp_ms() - 1000,
-            Tag.repository == repository_ref._db_id,
+            Manifest.repository == repository_ref._db_id,
+            Manifest.digest == manifest.digest,
         )
-        .get()
+        .exists()
     )
-    assert tag.name.startswith("$temp-")
-    assert tag.lifetime_end_ms is not None
-    assert tag.lifetime_end_ms < get_epoch_timestamp_ms() - user.removed_tag_expiration_s * 1000
-    assert tag.hidden
-    assert not tag.reversion
+    assert (
+        not Tag.select()
+        .where(
+            Tag.repository == repository_ref._db_id,
+            Tag.name == "newtag",
+        )
+        .exists()
+    )
 
 
 def test_get_schema1_parsed_manifest(registry_model):
@@ -1619,6 +2014,359 @@ def test_referrers_cache_invalidated_on_push(initialized_db, registry_model):
     )
     assert len(referrers_after) == 1
     assert referrers_after[0].digest == manifest_b.digest
+
+
+def _build_referrer_manifest(org_name, repo_name, marker, subject=None, artifact_type=None):
+    builder = _create_oci_manifest_with_blobs(
+        org_name,
+        repo_name,
+        config_content=json.dumps(
+            {
+                "config": {"marker": marker},
+                "rootfs": {"type": "layers", "diff_ids": []},
+                "history": [],
+            }
+        ),
+    )
+    if subject is not None:
+        builder.set_subject(
+            subject.digest,
+            len(subject.internal_manifest_bytes.as_encoded_str()),
+            subject.media_type,
+        )
+    manifest = builder.build()
+    if artifact_type is None:
+        return manifest
+
+    manifest_dict = json.loads(manifest.bytes.as_unicode())
+    manifest_dict["artifactType"] = artifact_type
+    return OCIManifest(Bytes.for_string_or_unicode(json.dumps(manifest_dict)))
+
+
+def _add_manifest_registration(repository_ref, manifest, algorithm):
+    digest = (
+        f"{algorithm}:"
+        + hashlib.new(algorithm, manifest.internal_manifest_bytes.as_encoded_str()).hexdigest()
+    )
+    model.oci.manifest.register_repository_manifest_digest(
+        repository_ref.id,
+        Manifest.get_by_id(manifest.id),
+        digest,
+    )
+    return digest
+
+
+@pytest.mark.parametrize("publication", ["tag", "temporary-tag"])
+@pytest.mark.parametrize("alternative_identity", ["artifact", "subject"])
+def test_registry_publication_rejects_alternative_referrer_identity_before_persistence(
+    publication, alternative_identity, initialized_db, registry_model
+):
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+    subject_impl = _create_oci_manifest_with_blobs("devtable", "simple").build()
+    subject, _ = registry_model.create_manifest_and_retarget_tag(
+        repository_ref,
+        subject_impl,
+        "registry-boundary-subject",
+        storage,
+        requested_digest=subject_impl.digest,
+        raise_on_error=True,
+    )
+
+    requested_digest = None
+    if alternative_identity == "subject":
+        alternative_subject_digest = _add_manifest_registration(repository_ref, subject, "sha512")
+        subject = registry_model.lookup_manifest_by_digest(
+            repository_ref,
+            alternative_subject_digest,
+            allow_hidden=True,
+            raise_on_error=True,
+        )
+
+    artifact = _build_referrer_manifest(
+        "devtable",
+        "simple",
+        f"registry-boundary-{publication}-{alternative_identity}",
+        subject=subject,
+        artifact_type="application/vnd.example.signature",
+    )
+    if alternative_identity == "artifact":
+        requested_digest = "sha384:" + hashlib.sha384(artifact.bytes.as_encoded_str()).hexdigest()
+    else:
+        requested_digest = artifact.digest
+
+    before = {
+        "manifests": Manifest.select().where(Manifest.repository == repository_ref.id).count(),
+        "registrations": RepositoryManifestDigest.select()
+        .where(RepositoryManifestDigest.repository == repository_ref.id)
+        .count(),
+        "tags": Tag.select().where(Tag.repository == repository_ref.id).count(),
+    }
+    cache = MagicMock()
+    cache.cache_config = TEST_CACHE_CONFIG
+
+    with pytest.raises(ReferrerDigestUnsupportedException):
+        if publication == "tag":
+            registry_model.create_manifest_and_retarget_tag(
+                repository_ref,
+                artifact,
+                "blocked-registry-artifact",
+                storage,
+                model_cache=cache,
+                requested_digest=requested_digest,
+                raise_on_error=True,
+            )
+        else:
+            registry_model.create_manifest_with_temp_tag(
+                repository_ref,
+                artifact,
+                300,
+                storage,
+                model_cache=cache,
+                requested_digest=requested_digest,
+                raise_on_error=True,
+            )
+
+    assert {
+        "manifests": Manifest.select().where(Manifest.repository == repository_ref.id).count(),
+        "registrations": RepositoryManifestDigest.select()
+        .where(RepositoryManifestDigest.repository == repository_ref.id)
+        .count(),
+        "tags": Tag.select().where(Tag.repository == repository_ref.id).count(),
+    } == before
+    cache.invalidate.assert_not_called()
+
+
+def test_native_referrers_select_visible_sha256_and_omit_alternative_only(
+    initialized_db, registry_model
+):
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+    subject_impl = _create_oci_manifest_with_blobs("devtable", "simple").build()
+    subject, _ = registry_model.create_manifest_and_retarget_tag(
+        repository_ref,
+        subject_impl,
+        "native-subject",
+        storage,
+        requested_digest=subject_impl.digest,
+        raise_on_error=True,
+    )
+
+    referrers = []
+    for marker, artifact_type in (
+        ("mixed", "application/vnd.example.signature"),
+        ("alternative-only", "application/vnd.example.signature"),
+        ("sha256-only", "application/vnd.example.sbom"),
+    ):
+        manifest_impl = _build_referrer_manifest(
+            "devtable",
+            "simple",
+            marker,
+            subject=subject,
+            artifact_type=artifact_type,
+        )
+        created, _ = registry_model.create_manifest_and_retarget_tag(
+            repository_ref,
+            manifest_impl,
+            f"native-{marker}",
+            storage,
+            requested_digest=manifest_impl.digest,
+            raise_on_error=True,
+        )
+        referrers.append(created)
+
+    mixed, alternative_only, sha256_only = referrers
+    mixed_alternative = _add_manifest_registration(repository_ref, mixed, "sha384")
+    alternative_only_digest = _add_manifest_registration(repository_ref, alternative_only, "sha512")
+    RepositoryManifestDigest.delete().where(
+        RepositoryManifestDigest.repository == repository_ref.id,
+        RepositoryManifestDigest.manifest == alternative_only.id,
+        RepositoryManifestDigest.digest == alternative_only.digest,
+    ).execute()
+
+    found = registry_model.lookup_referrers_for_manifest(repository_ref, subject)
+    assert {referrer.id for referrer in found} == {mixed.id, sha256_only.id}
+    assert {referrer.digest for referrer in found} == {mixed.digest, sha256_only.digest}
+    assert all(referrer.digest.startswith("sha256:") for referrer in found)
+    assert all(
+        registry_model.lookup_manifest_by_digest(
+            repository_ref, referrer.digest, allow_hidden=True
+        ).id
+        == referrer.id
+        for referrer in found
+    )
+
+    signatures = registry_model.lookup_referrers_for_manifest(
+        repository_ref,
+        subject,
+        artifact_type="application/vnd.example.signature",
+    )
+    assert [referrer.id for referrer in signatures] == [mixed.id]
+    assert signatures[0].digest == mixed.digest
+
+    assert RepositoryManifestDigest.get(
+        repository=repository_ref.id,
+        manifest=mixed.id,
+        digest=mixed_alternative,
+    )
+    assert RepositoryManifestDigest.get(
+        repository=repository_ref.id,
+        manifest=alternative_only.id,
+        digest=alternative_only_digest,
+    )
+
+    # Authorized deletion remains independent of discovery identity selection.
+    deleted = registry_model.delete_tags_for_manifest(
+        InMemoryDataModelCache(TEST_CACHE_CONFIG), alternative_only
+    )
+    assert deleted
+    assert RepositoryManifestDigest.get(
+        repository=repository_ref.id,
+        manifest=alternative_only.id,
+        digest=alternative_only_digest,
+    )
+
+
+def test_fallback_referrers_match_native_sha256_selection(initialized_db, registry_model):
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+    subject_impl = _create_oci_manifest_with_blobs("devtable", "simple").build()
+    subject, _ = registry_model.create_manifest_and_retarget_tag(
+        repository_ref,
+        subject_impl,
+        "fallback-subject",
+        storage,
+        requested_digest=subject_impl.digest,
+        raise_on_error=True,
+    )
+
+    fallback_referrers = []
+    for marker, artifact_type in (
+        ("mixed", "application/vnd.example.signature"),
+        ("alternative-only", "application/vnd.example.signature"),
+        ("sha256-only", "application/vnd.example.sbom"),
+    ):
+        manifest_impl = _build_referrer_manifest(
+            "devtable",
+            "simple",
+            f"fallback-{marker}",
+            artifact_type=artifact_type,
+        )
+        created, _ = registry_model.create_manifest_and_retarget_tag(
+            repository_ref,
+            manifest_impl,
+            f"fallback-{marker}",
+            storage,
+            requested_digest=manifest_impl.digest,
+            raise_on_error=True,
+        )
+        fallback_referrers.append(created)
+
+    mixed, alternative_only, sha256_only = fallback_referrers
+    mixed_alternative = _add_manifest_registration(repository_ref, mixed, "sha384")
+    alternative_only_digest = _add_manifest_registration(repository_ref, alternative_only, "sha512")
+    RepositoryManifestDigest.delete().where(
+        RepositoryManifestDigest.repository == repository_ref.id,
+        RepositoryManifestDigest.manifest == alternative_only.id,
+        RepositoryManifestDigest.digest == alternative_only.digest,
+    ).execute()
+
+    index_builder = OCIIndexBuilder()
+    for referrer, descriptor_digest in (
+        (mixed, mixed_alternative),
+        (alternative_only, alternative_only_digest),
+        (sha256_only, sha256_only.digest),
+    ):
+        index_builder.add_manifest_digest(
+            descriptor_digest,
+            len(referrer.internal_manifest_bytes.as_encoded_str()),
+            referrer.media_type,
+            None,
+            None,
+        )
+    index = index_builder.build()
+    fallback_tag = "-".join(subject.digest.split(":", 1))
+    registry_model.create_manifest_and_retarget_tag(
+        repository_ref,
+        index,
+        fallback_tag,
+        storage,
+        requested_digest=index.digest,
+        raise_on_error=True,
+    )
+
+    found = registry_model.lookup_referrers_for_manifest(repository_ref, subject)
+    assert {referrer.id for referrer in found} == {mixed.id, sha256_only.id}
+    assert {referrer.digest for referrer in found} == {mixed.digest, sha256_only.digest}
+    assert all(referrer.digest.startswith("sha256:") for referrer in found)
+    assert all(
+        registry_model.lookup_manifest_by_digest(
+            repository_ref, referrer.digest, allow_hidden=True
+        ).id
+        == referrer.id
+        for referrer in found
+    )
+
+    signatures = registry_model.lookup_referrers_for_manifest(
+        repository_ref,
+        subject,
+        artifact_type="application/vnd.example.signature",
+    )
+    assert [referrer.id for referrer in signatures] == [mixed.id]
+    assert signatures[0].digest == mixed.digest
+
+
+def test_cached_alternative_referrer_descriptor_is_defensively_omitted(
+    initialized_db, registry_model
+):
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+    subject_impl = _create_oci_manifest_with_blobs("devtable", "simple").build()
+    subject, _ = registry_model.create_manifest_and_retarget_tag(
+        repository_ref,
+        subject_impl,
+        "cached-subject",
+        storage,
+        requested_digest=subject_impl.digest,
+        raise_on_error=True,
+    )
+    referrer_impl = _build_referrer_manifest(
+        "devtable",
+        "simple",
+        "cached-alternative",
+        subject=subject,
+        artifact_type="application/vnd.example.signature",
+    )
+    referrer, _ = registry_model.create_manifest_and_retarget_tag(
+        repository_ref,
+        referrer_impl,
+        "cached-alternative",
+        storage,
+        requested_digest=referrer_impl.digest,
+        raise_on_error=True,
+    )
+    alternative_digest = _add_manifest_registration(repository_ref, referrer, "sha512")
+    RepositoryManifestDigest.delete().where(
+        RepositoryManifestDigest.repository == repository_ref.id,
+        RepositoryManifestDigest.manifest == referrer.id,
+        RepositoryManifestDigest.digest == referrer.digest,
+    ).execute()
+    stale_referrer = registry_model.lookup_manifest_by_digest(
+        repository_ref,
+        alternative_digest,
+        allow_hidden=True,
+        raise_on_error=True,
+    )
+    stale_dict = stale_referrer.asdict()
+    stale_dict["internal_manifest_bytes"] = stale_dict["internal_manifest_bytes"].as_unicode()
+    stale_dict["inputs"]["repository"] = stale_dict["inputs"]["repository"].asdict()
+    stale_dict["inputs"]["legacy_id_handler"] = None
+    stale_dict["inputs"]["legacy_image_handler"] = None
+
+    stale_cache = MagicMock()
+    stale_cache.cache_config = TEST_CACHE_CONFIG
+    stale_cache.retrieve.return_value = [stale_dict]
+
+    assert (
+        registry_model.lookup_cached_referrers_for_manifest(stale_cache, repository_ref, subject)
+        == []
+    )
 
 
 def test_referrers_cache_artifact_type_isolation(initialized_db, registry_model):

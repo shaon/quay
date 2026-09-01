@@ -1,25 +1,27 @@
 from flask import Response, request
 
 import features
-from app import model_cache
+from app import app, model_cache
 from auth.registry_jwt_auth import process_registry_jwt_auth
 from data.model import ManifestDoesNotExist, RepositoryDoesNotExist
 from data.registry_model import registry_model
 from digest import digest_tools
 from endpoints.decorators import (
     anon_protect,
-    check_readonly,
     disallow_for_account_recovery_mode,
     inject_registry_model,
     parse_repository_name,
     route_show_if,
 )
 from endpoints.v2 import require_repo_read, v2_bp
-from endpoints.v2.errors import ManifestInvalid, ManifestUnknown, NameUnknown
+from endpoints.v2.errors import (
+    DigestDisabled,
+    DigestInvalid,
+    DigestUnsupported,
+    ManifestInvalid,
+    NameUnknown,
+)
 from image.oci.index import OCIIndexBuilder
-from image.shared.schemas import parse_manifest_from_bytes
-from util.bytes import Bytes
-from util.http import abort
 
 BASE_REFERRERS_ROUTE = '/<repopath:repository>/referrers/<regex("{0}"):manifest_ref>'
 MANIFEST_REFERRERS_ROUTE = BASE_REFERRERS_ROUTE.format(digest_tools.DIGEST_PATTERN)
@@ -34,6 +36,7 @@ MANIFEST_REFERRERS_ROUTE = BASE_REFERRERS_ROUTE.format(digest_tools.DIGEST_PATTE
 @anon_protect
 @inject_registry_model()
 def list_manifest_referrers(namespace_name, repo_name, manifest_ref, registry_model):
+    manifest_ref = _validate_manifest_reference(manifest_ref)
     try:
         repository_ref = registry_model.lookup_repository(
             namespace_name, repo_name, raise_on_error=True, manifest_ref=manifest_ref
@@ -66,7 +69,40 @@ def _build_referrers_index_for_manifests(referrers):
 
     for referrer in referrers:
         parsed_referrer = referrer.get_parsed_manifest()
-        index_builder.add_manifest_for_referrers_index(parsed_referrer)
+        index_builder.add_manifest_digest(
+            referrer.digest,
+            len(referrer.internal_manifest_bytes.as_encoded_str()),
+            referrer.media_type,
+            None,
+            None,
+            parsed_referrer.artifact_type,
+            getattr(parsed_referrer, "annotations", None),
+        )
 
     index = index_builder.build()
     return index
+
+
+def _validate_manifest_reference(manifest_ref):
+    try:
+        parsed = digest_tools.Digest.parse_digest(manifest_ref, strict=True)
+    except digest_tools.UnsupportedDigestAlgorithmException:
+        raise DigestUnsupported(manifest_ref.split(":", 1)[0])
+    except digest_tools.InvalidDigestException as exc:
+        raise DigestInvalid(
+            message="provided manifest digest is malformed",
+            detail={
+                "digest": manifest_ref,
+                "reason": "malformed",
+                "description": str(exc),
+            },
+        )
+
+    # Alternative-digest referrer discovery is intentionally deferred to Demo 8. Keep this
+    # capability boundary ahead of the global allowlist so enabled alternative algorithms still
+    # report "unsupported" for this API.
+    if parsed.hash_alg != "sha256":
+        raise DigestUnsupported(parsed.hash_alg)
+    if parsed.hash_alg not in app.config.get("ALLOWED_HASH_ALGORITHMS", ["sha256"]):
+        raise DigestDisabled(parsed.hash_alg)
+    return str(parsed)

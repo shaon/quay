@@ -131,11 +131,16 @@ func TestValidateAllowedHashAlgorithms(t *testing.T) {
 		wantError  bool
 	}{
 		{name: "sha256 only", algorithms: "[sha256]"},
+		{name: "sha384 only", algorithms: "[sha384]"},
 		{name: "sha512 only", algorithms: "[sha512]"},
+		{name: "sha256 and sha384", algorithms: "[sha256, sha384]"},
 		{name: "sha256 and sha512", algorithms: "[sha256, sha512]"},
+		{name: "sha384 and sha512", algorithms: "[sha384, sha512]"},
+		{name: "all supported", algorithms: "[sha256, sha384, sha512]"},
 		{name: "empty", algorithms: "[]", wantError: true},
-		{name: "duplicate", algorithms: "[sha256, sha256]", wantError: true},
-		{name: "unknown", algorithms: "[sha384]", wantError: true},
+		{name: "duplicate sha256", algorithms: "[sha256, sha256]", wantError: true},
+		{name: "duplicate sha384", algorithms: "[sha384, sha384]", wantError: true},
+		{name: "unknown", algorithms: "[sha999]", wantError: true},
 		{name: "uppercase", algorithms: "[SHA256]", wantError: true},
 		{name: "malformed hyphen", algorithms: "[sha-256]", wantError: true},
 		{name: "malformed punctuation", algorithms: "[sha512!]", wantError: true},

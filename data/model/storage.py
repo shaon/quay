@@ -1,5 +1,6 @@
 import logging
 from collections import namedtuple
+from enum import Enum
 
 from cachetools.func import lru_cache
 from peewee import SQL, IntegrityError
@@ -416,6 +417,38 @@ def get_layer_path(storage_record):
     return get_layer_path_for_storage(
         storage_record.uuid, storage_record.cas_path, storage_record.content_checksum
     )
+
+
+class StorageContentStatus(Enum):
+    MISSING_PLACEMENT = "missing_placement"
+    MISSING_CONTENT = "missing_content"
+    READ_ERROR = "read_error"
+    READABLE = "readable"
+
+
+def get_storage_content_status(storage_record, storage_engine):
+    """Return database-placement and physical-readability status for a storage row."""
+    placements = list(
+        ImageStoragePlacement.select().where(ImageStoragePlacement.storage == storage_record)
+    )
+    if not placements:
+        return StorageContentStatus.MISSING_PLACEMENT
+
+    layer_path = get_layer_path(storage_record)
+    read_error = False
+    for placement in placements:
+        location_name = get_image_location_for_id(placement.location_id).name
+        try:
+            if storage_engine.exists([location_name], layer_path):
+                return StorageContentStatus.READABLE
+        except Exception:
+            # Storage backends use different exception types. Any failed probe means physical
+            # readability is unproven and the proxy path must fail closed into repair.
+            read_error = True
+
+    if read_error:
+        return StorageContentStatus.READ_ERROR
+    return StorageContentStatus.MISSING_CONTENT
 
 
 def get_layer_path_for_storage(storage_uuid, cas_path, content_checksum):

@@ -25,6 +25,7 @@ from data.database import (
     RepositoryAutoPrunePolicy,
     RepositoryBuild,
     RepositoryBuildTrigger,
+    RepositoryManifestDigest,
     RepositoryNotification,
     RepositoryPermission,
     RepositoryState,
@@ -485,6 +486,21 @@ def _garbage_collect_manifest(manifest_id, context):
         if _check_manifest_used(manifest_id):
             return False
 
+        scanner_digests = {
+            registration.digest
+            for registration in RepositoryManifestDigest.select(
+                RepositoryManifestDigest.digest
+            ).where(
+                RepositoryManifestDigest.manifest == manifest_id,
+                RepositoryManifestDigest.repository == context.repository,
+            )
+        }
+        if not scanner_digests:
+            # A legacy manifest without registrations is visible by canonical SHA-256 fallback.
+            # Once registrations exist, do not disclose an unregistered canonical identity to the
+            # external scanner during cleanup.
+            scanner_digests.add(manifest.digest)
+
         # Delete any label rows.
         deleted_manifest_label = (
             ManifestLabel.delete()
@@ -550,24 +566,39 @@ def _garbage_collect_manifest(manifest_id, context):
             .execute()
         )
 
+        # Repository-scoped identities are lifecycle metadata for this manifest. Delete them
+        # explicitly because development/test schemas may not have the migration's ON DELETE
+        # cascade even though production schemas do.
+        deleted_manifest_digests = (
+            RepositoryManifestDigest.delete()
+            .where(
+                RepositoryManifestDigest.manifest == manifest_id,
+                RepositoryManifestDigest.repository == context.repository,
+            )
+            .execute()
+        )
+
         # Delete the manifest.
         manifest.delete_instance()
 
     context.mark_manifest_removed(manifest)
 
     if features.SECURITY_SCANNER and config.app_config.get("SECURITY_SCANNER_V4_MANIFEST_CLEANUP"):
-        try:
-            secscan_model.garbage_collect_manifest_report(manifest.digest)
-        except:
-            logger.warning(
-                "Exception attempting to delete manifest %s from secscan service" % manifest.digest
-            )
+        for scanner_digest in scanner_digests:
+            try:
+                secscan_model.garbage_collect_manifest_report(scanner_digest)
+            except Exception:
+                logger.warning(
+                    "Exception attempting to delete manifest %s from secscan service",
+                    scanner_digest,
+                )
 
     gc_table_rows_deleted.labels(table="ManifestLabel").inc(deleted_manifest_label)
     gc_table_rows_deleted.labels(table="ManifestChild").inc(deleted_manifest_child)
     gc_table_rows_deleted.labels(table="ManifestBlob").inc(deleted_manifest_blob)
     gc_table_rows_deleted.labels(table="ManifestSecurityStatus").inc(deleted_manifest_security)
     gc_table_rows_deleted.labels(table="ManifestPullStatistics").inc(deleted_manifest_pull_stats)
+    gc_table_rows_deleted.labels(table="RepositoryManifestDigest").inc(deleted_manifest_digests)
     gc_table_rows_deleted.labels(table="Manifest").inc()
 
     return True

@@ -1,4 +1,5 @@
 import logging
+import re
 from functools import wraps
 
 from flask import Response, request, url_for
@@ -9,13 +10,21 @@ from auth.registry_jwt_auth import process_registry_jwt_auth
 from data.database import db_disallow_replica_use
 from data.model import (
     ImmutableTagException,
+    ManifestDigestConflictException,
     ManifestDoesNotExist,
     QuotaExceededException,
     RepositoryDoesNotExist,
     TagDoesNotExist,
     namespacequota,
 )
-from data.model.oci.manifest import CreateManifestException
+from data.model.oci.manifest import (
+    CreateManifestException,
+    ManifestBlobUnknownException,
+    ManifestChildUnknownException,
+    ManifestDescriptorMismatchException,
+    ManifestSubjectUnknownException,
+    ReferrerDigestUnsupportedException,
+)
 from data.model.oci.tag import RetargetTagException
 from data.registry_model import registry_model
 from digest import digest_tools
@@ -33,8 +42,17 @@ from endpoints.decorators import (
     parse_repository_name,
 )
 from endpoints.metrics import image_pulls, image_pushes
-from endpoints.v2 import require_repo_read, require_repo_write, v2_bp
+from endpoints.v2 import (
+    require_repo_read,
+    require_repo_write,
+    v2_bp,
+    validate_mirror_digest_algorithm,
+)
 from endpoints.v2.errors import (
+    DigestDisabled,
+    DigestInvalid,
+    DigestUnsupported,
+    ManifestBlobUnknown,
     ManifestInvalid,
     ManifestUnknown,
     NameInvalid,
@@ -42,6 +60,7 @@ from endpoints.v2.errors import (
     QuotaExceeded,
     TagExpired,
     TagImmutable,
+    TagInvalid,
 )
 from image.docker.schema1 import (
     DOCKER_SCHEMA1_CONTENT_TYPES,
@@ -102,11 +121,18 @@ def fetch_manifest_by_tagname(namespace_name, repo_name, manifest_ref, registry_
         image_pulls.labels("v2", "tag", 404).inc()
         raise ManifestUnknown(str(e))
 
-    manifest = registry_model.get_manifest_for_tag(tag)
+    manifest = registry_model.get_manifest_for_tag(
+        tag,
+        allowed_algorithms=app.config.get("ALLOWED_HASH_ALGORITHMS", ["sha256"]),
+    )
     if manifest is None:
-        # Something went wrong.
+        # The tag exists, but none of its repository-visible identities are currently enabled.
+        disabled_manifest = registry_model.get_manifest_for_tag(
+            tag,
+            allowed_algorithms=digest_tools.DIGEST_ALGORITHM_LENGTHS,
+        )
         image_pulls.labels("v2", "tag", 400).inc()
-        raise ManifestInvalid()
+        raise DigestDisabled(disabled_manifest.digest.partition(":")[0])
 
     try:
         manifest_bytes, manifest_digest, manifest_media_type = _rewrite_schema_if_necessary(
@@ -119,6 +145,12 @@ def fetch_manifest_by_tagname(namespace_name, repo_name, manifest_ref, registry_
     if manifest_bytes is None:
         image_pulls.labels("v2", "tag", 404).inc()
         raise ManifestUnknown()
+
+    # Conversion can produce different response bytes and a different digest. Enforce the policy
+    # on the final representation instead of reporting an enabled identity for unrelated bytes.
+    response_digest = _parse_manifest_reference(manifest_digest)
+    _validate_manifest_digest_algorithm(response_digest.hash_alg)
+    manifest_digest = str(response_digest)
 
     track_and_log(
         "pull_repo",
@@ -161,6 +193,10 @@ def fetch_manifest_by_tagname(namespace_name, repo_name, manifest_ref, registry_
 @anon_protect
 @inject_registry_model()
 def fetch_manifest_by_digest(namespace_name, repo_name, manifest_ref, registry_model):
+    parsed_reference = _parse_manifest_reference(manifest_ref)
+    _validate_manifest_digest_algorithm(parsed_reference.hash_alg)
+    manifest_ref = str(parsed_reference)
+
     try:
         repository_ref = registry_model.lookup_repository(
             namespace_name,
@@ -208,7 +244,7 @@ def fetch_manifest_by_digest(namespace_name, repo_name, manifest_ref, registry_m
         status=200,
         headers={
             "Content-Type": manifest.media_type,
-            "Docker-Content-Digest": manifest.digest,
+            "Docker-Content-Digest": manifest_ref,
         },
     )
 
@@ -306,9 +342,23 @@ def _doesnt_accept_schema_v1():
 @check_readonly
 @check_pushes_disabled
 def write_manifest_by_tagname(namespace_name, repo_name, manifest_ref):
+    # A tag-addressed PUT carries no client-selected digest algorithm. Its historical external
+    # identity is canonical SHA-256, so reject the request rather than choosing another enabled
+    # algorithm implicitly.
+    _validate_manifest_digest_algorithm("sha256")
     parsed = _parse_manifest(request.content_type, request.data)
+    _validate_referrer_publication_digests(parsed, parsed.digest)
+    _validate_manifest_descriptor_digests(parsed)
 
-    return _write_manifest_and_log(namespace_name, repo_name, manifest_ref, parsed)
+    # A tag reference carries no alternative digest identity. Registering the canonical digest
+    # preserves the historical digest returned for tag pulls and makes that exposure intentional.
+    return _write_manifest_and_log(
+        namespace_name,
+        repo_name,
+        manifest_ref,
+        parsed,
+        requested_digest=parsed.digest,
+    )
 
 
 def _enqueue_blobs_for_replication(manifest, storage, namespace_name):
@@ -332,13 +382,57 @@ def _enqueue_blobs_for_replication(manifest, storage, namespace_name):
 @check_readonly
 @check_pushes_disabled
 def write_manifest_by_digest(namespace_name, repo_name, manifest_ref):
+    requested_digest = _parse_manifest_reference(manifest_ref)
+    _validate_manifest_digest_algorithm(requested_digest.hash_alg)
+
     parsed = _parse_manifest(request.content_type, request.data)
-    if parsed.digest != manifest_ref:
+    _validate_referrer_publication_digests(parsed, requested_digest)
+    _validate_manifest_descriptor_digests(parsed)
+    requested_tags = _requested_manifest_tags()
+
+    if parsed.schema_version == 1:
+        # Signed schema 1 uses Docker's historical payload digest rather than a hash of the full
+        # request body. Preserve that SHA-256 contract, but do not create alternative identities
+        # that violate exact-byte validation.
+        if requested_digest.hash_alg != "sha256":
+            raise DigestUnsupported(requested_digest.hash_alg)
+        computed_digest = parsed.digest
+    else:
+        computed_digest = digest_tools.digest_bytes(
+            requested_digest.hash_alg,
+            request.data,
+        )
+
+    if computed_digest != str(requested_digest):
         image_pushes.labels("v2", 400, "").inc()
-        raise ManifestInvalid(detail={"message": "manifest digest mismatch"})
+        raise DigestInvalid(
+            detail={"digest": str(requested_digest), "reason": "mismatch"},
+            message="provided digest did not match manifest content",
+        )
 
     if parsed.schema_version != 2:
-        return _write_manifest_and_log(namespace_name, repo_name, parsed.tag, parsed)
+        if requested_tags:
+            raise ManifestInvalid(
+                detail={"message": "tag query parameters are not supported for schema 1"}
+            )
+        return _write_manifest_and_log(
+            namespace_name,
+            repo_name,
+            parsed.tag,
+            parsed,
+            requested_digest=str(requested_digest),
+        )
+
+    if requested_tags:
+        return _write_manifest_and_log(
+            namespace_name,
+            repo_name,
+            requested_tags[0],
+            parsed,
+            requested_digest=str(requested_digest),
+            additional_tag_names=requested_tags[1:],
+            include_oci_tag_header=True,
+        )
 
     # If the manifest is schema version 2, then this cannot be a normal tag-based push, as the
     # manifest does not contain the tag and this call was not given a tag name.
@@ -350,15 +444,46 @@ def write_manifest_by_digest(namespace_name, repo_name, manifest_ref):
     if repository_ref is None:
         image_pushes.labels("v2", 404, "").inc()
         raise NameUnknown("repository not found")
-
-    expiration_sec = app.config["PUSH_TEMP_TAG_EXPIRATION_SEC"]
-    manifest = registry_model.create_manifest_with_temp_tag(
+    _validate_mirror_manifest_digests(
         repository_ref,
         parsed,
-        expiration_sec,
-        storage,
-        model_cache=model_cache,
+        requested_digest=str(requested_digest),
     )
+
+    expiration_sec = app.config["PUSH_TEMP_TAG_EXPIRATION_SEC"]
+    try:
+        manifest = registry_model.create_manifest_with_temp_tag(
+            repository_ref,
+            parsed,
+            expiration_sec,
+            storage,
+            model_cache=model_cache,
+            requested_digest=str(requested_digest),
+            raise_on_error=True,
+        )
+    except ManifestBlobUnknownException as mbue:
+        raise ManifestBlobUnknown(detail={"digest": mbue.digest, "descriptor": "blob"})
+    except ManifestChildUnknownException as mcue:
+        raise ManifestBlobUnknown(detail={"digest": mcue.digest, "descriptor": "child"})
+    except ManifestSubjectUnknownException as msue:
+        raise ManifestBlobUnknown(detail={"digest": msue.digest, "descriptor": "subject"})
+    except ManifestDescriptorMismatchException as mdme:
+        raise ManifestInvalid(
+            detail={
+                "digest": mdme.digest,
+                "reason": "descriptor_mismatch",
+                "field": mdme.reason,
+            }
+        )
+    except ReferrerDigestUnsupportedException as rdue:
+        raise DigestUnsupported(rdue.algorithm)
+    except ManifestDigestConflictException:
+        raise DigestInvalid(
+            detail={"digest": str(requested_digest), "reason": "conflict"},
+            message="manifest digest is already registered to different content",
+        )
+    except CreateManifestException as cme:
+        raise ManifestInvalid(detail={"message": str(cme)})
 
     if manifest is None:
         image_pushes.labels("v2", 400, "").inc()
@@ -374,14 +499,99 @@ def write_manifest_by_digest(namespace_name, repo_name, manifest_ref):
         "OK",
         status=201,
         headers={
-            "Docker-Content-Digest": manifest.digest,
+            "Docker-Content-Digest": str(requested_digest),
             "Location": url_for(
                 "v2.fetch_manifest_by_digest",
                 repository="%s/%s" % (namespace_name, repo_name),
-                manifest_ref=manifest.digest,
+                manifest_ref=str(requested_digest),
             ),
         },
     )
+
+
+def _requested_manifest_tags():
+    tags = list(dict.fromkeys(request.args.getlist("tag")))
+    for tag in tags:
+        if re.fullmatch(VALID_TAG_PATTERN, tag) is None:
+            raise TagInvalid(detail={"tag": tag})
+    return tags
+
+
+def _parse_manifest_reference(manifest_ref):
+    try:
+        return digest_tools.Digest.parse_digest(manifest_ref, strict=True)
+    except digest_tools.UnsupportedDigestAlgorithmException:
+        algorithm = (
+            manifest_ref.split(":", 1)[0] if isinstance(manifest_ref, str) else str(manifest_ref)
+        )
+        raise DigestUnsupported(algorithm)
+    except digest_tools.InvalidDigestException as exc:
+        raise DigestInvalid(
+            detail={
+                "digest": manifest_ref,
+                "reason": "malformed",
+                "description": str(exc),
+            },
+            message="provided manifest digest is malformed",
+        )
+
+
+def _validate_manifest_digest_algorithm(algorithm):
+    if algorithm not in digest_tools.DIGEST_ALGORITHM_LENGTHS:
+        raise DigestUnsupported(algorithm)
+    if algorithm not in app.config.get("ALLOWED_HASH_ALGORITHMS", ["sha256"]):
+        raise DigestDisabled(algorithm)
+
+
+def _manifest_descriptor_digests(manifest_impl):
+    try:
+        descriptor_digests = list(manifest_impl.blob_digests or [])
+        if manifest_impl.is_manifest_list:
+            descriptor_digests.extend(
+                descriptor.get("digest")
+                for descriptor in manifest_impl.manifest_dict.get("manifests", [])
+            )
+        if manifest_impl.subject is not None:
+            subject = manifest_impl.subject
+            descriptor_digests.append(
+                subject.get("digest") if isinstance(subject, dict) else subject.digest
+            )
+        return descriptor_digests
+    except (AttributeError, ManifestException) as exc:
+        raise ManifestInvalid(detail={"message": str(exc)})
+
+
+def _validate_manifest_descriptor_digests(manifest_impl):
+    for descriptor_digest in _manifest_descriptor_digests(manifest_impl):
+        parsed = _parse_manifest_reference(descriptor_digest)
+        _validate_manifest_digest_algorithm(parsed.hash_alg)
+
+
+def _validate_referrer_publication_digests(manifest_impl, requested_digest):
+    subject = manifest_impl.subject
+    if subject is None:
+        return
+
+    subject_digest = subject.get("digest") if isinstance(subject, dict) else subject.digest
+    parsed_subject = _parse_manifest_reference(subject_digest)
+    parsed_artifact = (
+        requested_digest
+        if isinstance(requested_digest, digest_tools.Digest)
+        else _parse_manifest_reference(requested_digest)
+    )
+
+    # Alternative artifact and subject identities are a Demo 8 capability. Parse both identities
+    # strictly before applying this boundary, and leave blob/layer descriptor algorithms alone.
+    for digest in (parsed_artifact, parsed_subject):
+        if digest.hash_alg != "sha256":
+            raise DigestUnsupported(digest.hash_alg)
+
+
+def _validate_mirror_manifest_digests(repository_ref, manifest_impl, requested_digest=None):
+    manifest_digest = requested_digest or manifest_impl.digest
+    for digest in [manifest_digest, *_manifest_descriptor_digests(manifest_impl)]:
+        parsed = _parse_manifest_reference(digest)
+        validate_mirror_digest_algorithm(repository_ref, parsed.hash_alg)
 
 
 def _parse_manifest(content_type, request_data):
@@ -416,6 +626,10 @@ def delete_manifest_by_digest(namespace_name, repo_name, manifest_ref):
     Note: there is no equivalent method for deleting by tag name because it is
     forbidden by the spec.
     """
+    # Authorized cleanup remains available when the digest algorithm is hard-disabled.
+    parsed_reference = _parse_manifest_reference(manifest_ref)
+    manifest_ref = str(parsed_reference)
+
     with db_disallow_replica_use():
         repository_ref = registry_model.lookup_repository(
             namespace_name, repo_name, model_cache=model_cache
@@ -476,37 +690,65 @@ def delete_manifest_by_tag(namespace_name, repo_name, manifest_ref):
         return Response(status=202)
 
 
-def _write_manifest_and_log(namespace_name, repo_name, tag_name, manifest_impl):
+def _write_manifest_and_log(
+    namespace_name,
+    repo_name,
+    tag_name,
+    manifest_impl,
+    requested_digest=None,
+    additional_tag_names=None,
+    include_oci_tag_header=False,
+):
     _validate_schema1_manifest(namespace_name, repo_name, manifest_impl)
     with db_disallow_replica_use():
         repository_ref, manifest, tag = _write_manifest(
-            namespace_name, repo_name, tag_name, manifest_impl
+            namespace_name,
+            repo_name,
+            tag_name,
+            manifest_impl,
+            requested_digest=requested_digest,
+            additional_tag_names=additional_tag_names,
         )
 
         # Queue all blob manifests for replication
         if features.STORAGE_REPLICATION:
             _enqueue_blobs_for_replication(manifest, storage, namespace_name)
 
-        track_and_log("push_repo", repository_ref, tag=tag_name, mediaType=manifest.media_type)
-        spawn_notification(repository_ref, "repo_push", {"updated_tags": [tag_name]})
+        updated_tags = list(dict.fromkeys([tag_name, *(additional_tag_names or [])]))
+        for updated_tag in updated_tags:
+            track_and_log(
+                "push_repo", repository_ref, tag=updated_tag, mediaType=manifest.media_type
+            )
+        spawn_notification(repository_ref, "repo_push", {"updated_tags": updated_tags})
         image_pushes.labels("v2", 201, manifest.media_type).inc()
 
-        return Response(
+        response_digest = requested_digest or manifest.digest
+        response = Response(
             "OK",
             status=201,
             headers={
-                "Docker-Content-Digest": manifest.digest,
+                "Docker-Content-Digest": response_digest,
                 "Location": url_for(
                     "v2.fetch_manifest_by_digest",
                     repository="%s/%s" % (namespace_name, repo_name),
-                    manifest_ref=manifest.digest,
+                    manifest_ref=response_digest,
                 ),
             },
         )
+        if include_oci_tag_header:
+            for updated_tag in updated_tags:
+                response.headers.add("OCI-Tag", updated_tag)
+        return response
 
 
 def _write_manifest(
-    namespace_name, repo_name, tag_name, manifest_impl, registry_model=registry_model
+    namespace_name,
+    repo_name,
+    tag_name,
+    manifest_impl,
+    registry_model=registry_model,
+    requested_digest=None,
+    additional_tag_names=None,
 ):
     # Ensure that the repository exists.
     repository_ref = registry_model.lookup_repository(
@@ -514,6 +756,11 @@ def _write_manifest(
     )
     if repository_ref is None:
         raise NameUnknown("repository not found")
+    _validate_mirror_manifest_digests(
+        repository_ref,
+        manifest_impl,
+        requested_digest=requested_digest,
+    )
 
     # Create the manifest(s) and retarget the tag to point to it.
     try:
@@ -526,6 +773,29 @@ def _write_manifest(
             verify_quota=app.config.get("FEATURE_QUOTA_MANAGEMENT", False)
             and app.config.get("FEATURE_VERIFY_QUOTA", True),
             model_cache=model_cache,
+            requested_digest=requested_digest,
+            additional_tag_names=additional_tag_names,
+        )
+    except ManifestBlobUnknownException as mbue:
+        raise ManifestBlobUnknown(detail={"digest": mbue.digest, "descriptor": "blob"})
+    except ManifestChildUnknownException as mcue:
+        raise ManifestBlobUnknown(detail={"digest": mcue.digest, "descriptor": "child"})
+    except ManifestSubjectUnknownException as msue:
+        raise ManifestBlobUnknown(detail={"digest": msue.digest, "descriptor": "subject"})
+    except ManifestDescriptorMismatchException as mdme:
+        raise ManifestInvalid(
+            detail={
+                "digest": mdme.digest,
+                "reason": "descriptor_mismatch",
+                "field": mdme.reason,
+            }
+        )
+    except ReferrerDigestUnsupportedException as rdue:
+        raise DigestUnsupported(rdue.algorithm)
+    except ManifestDigestConflictException:
+        raise DigestInvalid(
+            detail={"digest": requested_digest, "reason": "conflict"},
+            message="manifest digest is already registered to different content",
         )
     except CreateManifestException as cme:
         raise ManifestInvalid(detail={"message": str(cme)})

@@ -8,6 +8,7 @@ import (
 
 var supportedHashAlgorithms = map[string]struct{}{
 	"sha256": {},
+	"sha384": {},
 	"sha512": {},
 }
 

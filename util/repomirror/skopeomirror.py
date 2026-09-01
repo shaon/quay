@@ -130,6 +130,7 @@ class SkopeoMirror(object):
         args = args + [
             "copy",
             "--all",
+            "--preserve-digests",
             "--remove-signatures",
             "--src-tls-verify=%s" % src_tls_verify,
             "--dest-tls-verify=%s" % dest_tls_verify,

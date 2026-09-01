@@ -7,6 +7,7 @@ from peewee import fn
 import features
 from app import app
 from data.database import Manifest
+from data.model.oci.manifest import CreateManifestException, resolve_manifest_subject
 from image.shared.schemas import ManifestException, parse_manifest_from_bytes
 from util.bytes import Bytes
 from util.log import logfile_path
@@ -61,11 +62,19 @@ class ManifestSubjectBackfillWorker(Worker):
                 parsed = parse_manifest_from_bytes(
                     manifest_bytes, manifest_row.media_type.name, validate=False
                 )
-                subject = parsed.subject
-            except ManifestException as me:
-                logger.warning(
-                    "Got exception when trying to parse manifest %s: %s", manifest_row.id, me
-                )
+                resolved_subject = resolve_manifest_subject(manifest_row.repository_id, parsed)
+                subject = resolved_subject.digest if resolved_subject is not None else None
+            except (ManifestException, CreateManifestException) as me:
+                # Do not mark an unresolved or cross-repository subject as backfilled. A later
+                # retry may succeed after the subject graph has been ingested in this repository.
+                logger.warning("Could not resolve subject for manifest %s: %s", manifest_row.id, me)
+                # Clear any value written by an older non-resolving worker, but keep the row
+                # pending so a later pass can resolve it after repository-local ingestion.
+                Manifest.update(subject=None).where(
+                    Manifest.id == manifest_row.id,
+                    (Manifest.subject_backfilled == False) | (Manifest.subject_backfilled >> None),
+                ).execute()
+                continue
 
             updated = (
                 Manifest.update(

@@ -14,9 +14,11 @@ from data.database import (
     IndexStatus,
     Manifest,
     ManifestSecurityStatus,
+    RepositoryManifestDigest,
     db_transaction,
     get_epoch_timestamp_ms,
 )
+from data.model import oci
 from data.registry_model import registry_model
 from data.registry_model.datatypes import Manifest as ManifestDataType
 from data.secscan_model.datatypes import (
@@ -67,6 +69,18 @@ TAG_LIMIT = 100
 IndexReportState = namedtuple("IndexReportState", ["Index_Finished", "Index_Error"])(  # type: ignore[call-arg]
     "IndexFinished", "IndexError"
 )
+
+
+def manifest_for_security_scanner(manifest_row):
+    """Wraps a manifest with a stable repository-visible scanner identity."""
+    return ManifestDataType.for_manifest(
+        manifest_row,
+        None,
+        digest=oci.manifest.get_repository_manifest_scanner_digest(
+            manifest_row.repository_id,
+            manifest_row,
+        ),
+    )
 
 
 class ScanToken(namedtuple("NextScanToken", ["min_id"])):
@@ -243,13 +257,18 @@ class V4SecurityScanner(SecurityScannerInterface):
 
         assert status.index_status == IndexStatus.COMPLETED
 
+        scanner_digest = oci.manifest.get_repository_manifest_scanner_digest(
+            manifest_or_legacy_image.repository._db_id,
+            manifest_or_legacy_image._db_id,
+        )
+
         def security_report_loader():
-            return self._secscan_api.vulnerability_report(manifest_or_legacy_image.digest)
+            return self._secscan_api.vulnerability_report(scanner_digest)
 
         try:
             if model_cache:
                 security_report_key = cache_key.for_security_report(
-                    manifest_or_legacy_image.digest, model_cache.cache_config
+                    scanner_digest, model_cache.cache_config
                 )
                 report = model_cache.retrieve(security_report_key, security_report_loader)
             else:
@@ -571,7 +590,7 @@ class V4SecurityScanner(SecurityScannerInterface):
                 abt.set()
                 continue
 
-            manifest = ManifestDataType.for_manifest(candidate, None)
+            manifest = manifest_for_security_scanner(candidate)
             if manifest.is_manifest_list:
                 mark_manifest_unsupported(manifest)
                 continue
@@ -903,16 +922,18 @@ class V4SecurityScanner(SecurityScannerInterface):
 
     def garbage_collect_manifest_report(self, manifest_digest):
         def manifest_digest_exists():
-            query = Manifest.select(can_use_read_replica=True).where(
-                Manifest.digest == manifest_digest
+            canonical_exists = (
+                Manifest.select(can_use_read_replica=True)
+                .where(Manifest.digest == manifest_digest)
+                .exists()
             )
-
-            try:
-                query.get()
-            except Manifest.DoesNotExist:
-                return False
-
-            return True
+            if canonical_exists:
+                return True
+            return (
+                RepositoryManifestDigest.select(can_use_read_replica=True)
+                .where(RepositoryManifestDigest.digest == manifest_digest)
+                .exists()
+            )
 
         with db_transaction():
             if not manifest_digest_exists():

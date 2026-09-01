@@ -57,9 +57,12 @@ class RegistryDataInterface(object):
         """
 
     @abstractmethod
-    def get_manifest_for_tag(self, tag):
+    def get_manifest_for_tag(self, tag, allowed_algorithms=None):
         """
         Returns the manifest associated with the given tag.
+
+        If allowed_algorithms is supplied, the returned digest is a deterministic enabled
+        repository-visible identity, or None is returned when no such identity exists.
         """
 
     @abstractmethod
@@ -91,6 +94,8 @@ class RegistryDataInterface(object):
         storage,
         raise_on_error=False,
         model_cache=None,
+        requested_digest=None,
+        additional_tag_names=None,
     ):
         """
         Creates a manifest in a repository, adding all of the necessary data in the model.
@@ -101,7 +106,8 @@ class RegistryDataInterface(object):
         Note that all blobs referenced by the manifest must exist under the repository or this
         method will fail and return None.
 
-        Returns a reference to the (created manifest, tag) or (None, None) on error.
+        Returns a reference to the (created manifest, first tag) or (None, None) on error. Any
+        additional tag names are assigned in the same transaction.
 
         If model_cache is provided and the manifest has a subject, the referrers
         cache for the subject digest is invalidated.
@@ -340,7 +346,15 @@ class RegistryDataInterface(object):
         """
 
     @abstractmethod
-    def create_blob_upload(self, repository_ref, upload_id, location_name, storage_metadata):
+    def create_blob_upload(
+        self,
+        repository_ref,
+        upload_id,
+        location_name,
+        storage_metadata,
+        requested_digest_algorithm=None,
+        requested_digest_state=None,
+    ):
         """
         Creates a new blob upload and returns a reference.
 
@@ -363,6 +377,7 @@ class RegistryDataInterface(object):
         byte_count,
         chunk_count,
         sha_state,
+        requested_digest_state=None,
     ):
         """
         Updates the fields of the blob upload to match those given.
@@ -377,16 +392,29 @@ class RegistryDataInterface(object):
         """
 
     @abstractmethod
-    def commit_blob_upload(self, blob_upload, blob_digest_str, blob_expiration_seconds):
+    def commit_blob_upload(
+        self,
+        blob_upload,
+        blob_digest_str,
+        blob_expiration_seconds,
+        requested_digest_str=None,
+    ):
         """
         Commits the blob upload into a blob and sets an expiration before that blob will be GCed.
         """
 
     @abstractmethod
-    def mount_blob_into_repository(self, blob, target_repository_ref, expiration_sec):
+    def mount_blob_into_repository(
+        self,
+        blob,
+        target_repository_ref,
+        expiration_sec,
+        mounted_digest=None,
+    ):
         """
         Mounts the blob from another repository into the specified target repository, and adds an
-        expiration before that blob is automatically GCed.
+        expiration before that blob is automatically GCed. The mounted digest is registered as a
+        repository-scoped external identity; if omitted, the canonical blob digest is used.
 
         This function is useful during push operations if an existing blob from another repository
         is being pushed. Returns False if the mounting fails. Note that this function does *not*
@@ -410,7 +438,14 @@ class RegistryDataInterface(object):
 
     @abstractmethod
     def create_manifest_with_temp_tag(
-        self, repository_ref, manifest_interface_instance, expiration_sec, storage, model_cache=None
+        self,
+        repository_ref,
+        manifest_interface_instance,
+        expiration_sec,
+        storage,
+        model_cache=None,
+        requested_digest=None,
+        raise_on_error=False,
     ):
         """
         Creates a manifest under the repository and sets a temporary tag to point to it.

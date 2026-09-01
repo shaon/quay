@@ -872,6 +872,111 @@ class TestManifestPullThroughStorage:
             assert placements.count() == 0
 
 
+class TestProxyDigestBoundary:
+    orgname = "cache-digest-boundary"
+    registry = "docker.io/library"
+
+    @pytest.fixture(autouse=True)
+    def setup(self, client, app):
+        model_cache.empty_for_testing()
+        self.client = client
+        self.user = model.user.get_user("devtable")
+        self.org = model.organization.create_organization(
+            self.orgname, f"{self.orgname}@devtable.com", self.user
+        )
+        self.org.save()
+        model.proxy_cache.create_proxy_cache_config(
+            org_name=self.orgname,
+            upstream_registry=self.registry,
+            expiration_s=3600,
+        )
+        self.context, self.subject = build_context_and_subject(
+            ValidatedAuthContext(user=self.user)
+        )
+
+    def _headers(self, repository):
+        headers = _get_auth_headers(self.subject, self.context, repository)
+        headers["Accept"] = DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE
+        return headers
+
+    @pytest.mark.parametrize("algorithm,length", [("sha384", 96), ("sha512", 128)])
+    def test_digest_pull_rejects_alternative_before_upstream_request(
+        self, algorithm, length
+    ):
+        image_name = f"direct-{algorithm}"
+        repository = f"{self.orgname}/{image_name}"
+        digest = f"{algorithm}:" + "a" * length
+        proxy_mock = MagicMock()
+
+        with (
+            patch.dict(
+                realapp.config,
+                {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384", "sha512"]},
+            ),
+            patch(
+                "data.registry_model.registry_proxy_model.Proxy",
+                MagicMock(return_value=proxy_mock),
+            ),
+        ):
+            response = conduct_call(
+                self.client,
+                "v2.fetch_manifest_by_digest",
+                url_for,
+                "GET",
+                {"repository": repository, "manifest_ref": digest},
+                expected_code=400,
+                headers=self._headers(repository),
+            )
+
+        assert response.get_json()["errors"][0] == {
+            "code": "UNSUPPORTED",
+            "message": "digest algorithm is unsupported",
+            "detail": {"algorithm": algorithm, "reason": "unsupported"},
+        }
+        proxy_mock.manifest_exists.assert_not_called()
+        proxy_mock.get_manifest.assert_not_called()
+        assert model.repository.get_repository(self.orgname, image_name) is None
+
+    @pytest.mark.parametrize("algorithm,length", [("sha384", 96), ("sha512", 128)])
+    def test_tag_pull_rejects_alternative_upstream_digest_without_persistence(
+        self, algorithm, length
+    ):
+        image_name = f"tag-{algorithm}"
+        repository = f"{self.orgname}/{image_name}"
+        digest = f"{algorithm}:" + "b" * length
+        proxy_mock = MagicMock()
+        proxy_mock.manifest_exists.return_value = digest
+
+        with (
+            patch.dict(
+                realapp.config,
+                {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384", "sha512"]},
+            ),
+            patch(
+                "data.registry_model.registry_proxy_model.Proxy",
+                MagicMock(return_value=proxy_mock),
+            ),
+        ):
+            response = conduct_call(
+                self.client,
+                "v2.fetch_manifest_by_tagname",
+                url_for,
+                "GET",
+                {"repository": repository, "manifest_ref": "latest"},
+                expected_code=400,
+                headers=self._headers(repository),
+            )
+
+        assert response.get_json()["errors"][0] == {
+            "code": "UNSUPPORTED",
+            "message": "digest algorithm is unsupported",
+            "detail": {"algorithm": algorithm, "reason": "unsupported"},
+        }
+        proxy_mock.manifest_exists.assert_called_once()
+        proxy_mock.get_manifest.assert_not_called()
+        assert model.repository.get_repository(self.orgname, image_name) is None
+
+
 class TestManifestPullThroughUpstreamDown:
     """Tests that cached images can be served when the upstream registry is unavailable."""
 

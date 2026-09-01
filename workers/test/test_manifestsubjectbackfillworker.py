@@ -1,6 +1,9 @@
+from unittest.mock import patch
+
 import pytest
 
 from data import database, model
+from data.model.oci.manifest import CreateManifestException
 from test.fixtures import *
 from workers.manifestsubjectbackfillworker import ManifestSubjectBackfillWorker
 
@@ -26,3 +29,23 @@ def test_basic(initialized_db):
             ).get()
 
     assert not worker._backfill_manifest_subject()
+
+
+def test_unresolved_subject_remains_pending_for_retry(initialized_db):
+    worker = ManifestSubjectBackfillWorker()
+    database.Manifest.update(subject_backfilled=True).execute()
+    manifest = database.Manifest.select().first()
+    database.Manifest.update(
+        subject="sha512:" + "a" * 128,
+        subject_backfilled=False,
+    ).where(database.Manifest.id == manifest.id).execute()
+
+    with patch(
+        "workers.manifestsubjectbackfillworker.resolve_manifest_subject",
+        side_effect=CreateManifestException("subject is not registered in this repository"),
+    ):
+        assert worker._backfill_manifest_subject()
+
+    manifest = database.Manifest.get_by_id(manifest.id)
+    assert manifest.subject_backfilled is False
+    assert manifest.subject is None

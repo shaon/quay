@@ -21,7 +21,7 @@ def proxy_manifest_response():
                 manifest_media_type,
             ).digest
 
-        def mock_get_manifest(manifest_ref, media_type=None):
+        def mock_get_manifest(manifest_ref, media_type=None, max_bytes=None):
             if manifest_ref != expected_manifest_ref:
                 raise UpstreamRegistryError(404)
             return manifest_json, manifest_media_type

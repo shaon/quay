@@ -23,6 +23,22 @@ TOKEN_RENEWAL_THRESHOLD = 10  # interval (in seconds) when to renew auth token
 REGISTRY_URLS = {"docker.io": "registry-1.docker.io"}
 
 
+class ProxyDigestUnsupportedError(Exception):
+    """Raised when proxy cache encounters a digest outside its SHA-256 boundary."""
+
+    def __init__(self, algorithm):
+        self.algorithm = algorithm
+        super().__init__(f"proxy cache does not support digest algorithm {algorithm}")
+
+
+class ProxyDigestDisabledError(Exception):
+    """Raised when proxy cache encounters SHA-256 while it is globally disabled."""
+
+    def __init__(self, algorithm):
+        self.algorithm = algorithm
+        super().__init__(f"digest algorithm {algorithm} is disabled")
+
+
 class UpstreamRegistryError(Exception):
     def __init__(self, detail, status_code=None):
         self.status_code = status_code
@@ -37,6 +53,14 @@ class UpstreamAuthError(UpstreamRegistryError):
     """Raised when upstream credentials are rejected (401/403 after retry)."""
 
     pass
+
+
+class UpstreamManifestTooLargeError(UpstreamRegistryError):
+    """Raised before an upstream manifest response can exceed its bounded read."""
+
+    def __init__(self, max_bytes):
+        self.max_bytes = max_bytes
+        super().__init__(f"manifest response exceeds {max_bytes} byte limit")
 
 
 def parse_www_auth(value: str) -> dict[str, str]:
@@ -84,16 +108,45 @@ class Proxy:
             self._authorized = True
 
     def get_manifest(
-        self, image_ref: str, media_types: list[str] | None = None
+        self,
+        image_ref: str,
+        media_types: list[str] | None = None,
+        max_bytes: int | None = None,
     ) -> tuple[bytes, str | None]:
         url = f"{self.base_url}/v2/{self._repo}/manifests/{image_ref}"
         headers = {}
         if media_types is not None:
             headers["Accept"] = ", ".join(media_types)
-        resp = self.get(url, headers=headers)
-        raw_manifest = resp.content
-        content_type = resp.headers.get("content-type")
-        return raw_manifest, content_type
+
+        if max_bytes is None:
+            resp = self.get(url, headers=headers)
+            return resp.content, resp.headers.get("content-type")
+
+        resp = self.get(url, headers=headers, stream=True)
+        try:
+            content_length = resp.headers.get("content-length")
+            if content_length is not None:
+                try:
+                    if int(content_length) > max_bytes:
+                        raise UpstreamManifestTooLargeError(max_bytes)
+                except ValueError:
+                    # An invalid or missing length cannot authorize an unbounded read. The streamed
+                    # byte counter below remains authoritative.
+                    pass
+
+            raw_manifest = bytearray()
+            try:
+                for chunk in resp.iter_content(chunk_size=64 * 1024):
+                    if not chunk:
+                        continue
+                    raw_manifest.extend(chunk)
+                    if len(raw_manifest) > max_bytes:
+                        raise UpstreamManifestTooLargeError(max_bytes)
+            except (RequestException, ConnectionError) as exc:
+                raise UpstreamRegistryError(str(exc)) from exc
+            return bytes(raw_manifest), resp.headers.get("content-type")
+        finally:
+            resp.close()
 
     def manifest_exists(self, image_ref: str, media_types: list[str] | None = None) -> str | None:
         """

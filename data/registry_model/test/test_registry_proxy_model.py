@@ -1,3 +1,4 @@
+import hashlib
 import json
 import random
 from datetime import timedelta
@@ -6,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from playhouse.test_utils import assert_query_count
 
+from app import app as application
 from app import storage
 from data.database import (
     ImageStorage,
@@ -15,6 +17,8 @@ from data.database import (
     ManifestBlob,
     ManifestChild,
     MediaType,
+    RepositoryBlobDigest,
+    RepositoryManifestDigest,
     Tag,
     db_transaction,
     get_epoch_timestamp_ms,
@@ -31,12 +35,13 @@ from data.model.blob import store_blob_record_and_temp_link
 from data.model.oci.manifest import get_or_create_manifest
 from data.model.organization import create_organization
 from data.model.proxy_cache import create_proxy_cache_config
-from data.model.repository import create_repository
+from data.model.repository import create_repository, get_repository
 from data.model.storage import get_layer_path
 from data.model.user import get_user
 from data.registry_model import registry_model
 from data.registry_model.datatypes import Manifest as ManifestType
 from data.registry_model.registry_proxy_model import (
+    ACCEPTED_MEDIA_TYPES,
     ProxyModel,
     get_proxy_cache_config_for_org,
 )
@@ -56,6 +61,7 @@ from image.docker.schema2.manifest import (
 from image.docker.schema2.test.test_config import CONFIG_DIGEST, CONFIG_SIZE
 from image.shared import ManifestException
 from image.shared.schemas import parse_manifest_from_bytes
+from proxy import ProxyDigestUnsupportedError
 from proxy.fixtures import proxy_manifest_response  # noqa: F401,F403
 from test.fixtures import *  # noqa: F401,F403
 from util.bytes import Bytes
@@ -1054,6 +1060,129 @@ class TestRegistryProxyModelCreateManifestAndRetargetTag:
         assert not delete_called[
             "called"
         ], "ManifestBlob.delete() should not be called when no blobs were created"
+
+
+class TestRegistryProxyDigestBoundary:
+    upstream_registry = "quay.io"
+    upstream_repository = "app-sre/ubi8-ubi"
+    orgname = "proxy-digest-boundary"
+
+    @pytest.fixture(autouse=True)
+    def setup(self, app, monkeypatch):
+        monkeypatch.setitem(
+            application.config,
+            "ALLOWED_HASH_ALGORITHMS",
+            ["sha256", "sha384", "sha512"],
+        )
+        self.user = get_user("devtable")
+        self.org = create_organization(
+            self.orgname, f"{self.orgname}@devtable.com", self.user
+        )
+        self.org.save()
+        create_proxy_cache_config(
+            org_name=self.orgname,
+            upstream_registry=self.upstream_registry,
+            expiration_s=3600,
+        )
+
+    @pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
+    @patch("data.registry_model.registry_proxy_model.Proxy", MagicMock())
+    def test_digest_pull_is_rejected_before_upstream_or_persistence(
+        self, create_repo, algorithm
+    ):
+        repo_ref = create_repo(self.orgname, self.upstream_repository, self.user)
+        proxy_model = ProxyModel(self.orgname, self.upstream_repository, self.user)
+        digest = f"{algorithm}:" + "a" * (hashlib.new(algorithm).digest_size * 2)
+
+        with pytest.raises(ProxyDigestUnsupportedError) as exc_info:
+            proxy_model.lookup_manifest_by_digest(repo_ref, digest)
+
+        assert exc_info.value.algorithm == algorithm
+        proxy_model._proxy.manifest_exists.assert_not_called()
+        proxy_model._proxy.get_manifest.assert_not_called()
+        assert not Manifest.select().where(Manifest.repository == repo_ref.id).exists()
+        assert (
+            not RepositoryManifestDigest.select()
+            .where(RepositoryManifestDigest.repository == repo_ref.id)
+            .exists()
+        )
+        assert (
+            not RepositoryBlobDigest.select()
+            .where(RepositoryBlobDigest.repository == repo_ref.id)
+            .exists()
+        )
+
+    @pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
+    @patch("data.registry_model.registry_proxy_model.Proxy", MagicMock())
+    def test_tag_with_alternative_upstream_digest_is_rejected_before_repository_creation(
+        self, algorithm
+    ):
+        proxy_model = ProxyModel(self.orgname, "uncached", self.user)
+        proxy_model._proxy.reset_mock()
+        digest = f"{algorithm}:" + "b" * (hashlib.new(algorithm).digest_size * 2)
+        proxy_model._proxy.manifest_exists.return_value = digest
+
+        with pytest.raises(ProxyDigestUnsupportedError) as exc_info:
+            proxy_model.lookup_repository(
+                self.orgname,
+                "uncached",
+                raise_on_error=True,
+                manifest_ref="latest",
+            )
+
+        assert exc_info.value.algorithm == algorithm
+        proxy_model._proxy.manifest_exists.assert_called_once_with(
+            "latest", ACCEPTED_MEDIA_TYPES
+        )
+        proxy_model._proxy.get_manifest.assert_not_called()
+        assert get_repository(self.orgname, "uncached") is None
+
+    @pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
+    @patch("data.registry_model.registry_proxy_model.Proxy", MagicMock())
+    def test_alternative_manifest_descriptor_is_rejected_before_blob_fetch_or_persistence(
+        self, create_repo, algorithm
+    ):
+        repo_ref = create_repo(self.orgname, self.upstream_repository, self.user)
+        proxy_model = ProxyModel(self.orgname, self.upstream_repository, self.user)
+        descriptor = f"{algorithm}:" + "c" * (hashlib.new(algorithm).digest_size * 2)
+        manifest_bytes = json.dumps(
+            {
+                "schemaVersion": 2,
+                "mediaType": DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE,
+                "config": {
+                    "mediaType": DOCKER_SCHEMA2_CONFIG_CONTENT_TYPE,
+                    "size": 2,
+                    "digest": descriptor,
+                },
+                "layers": [],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        root_digest = str(sha256_digest(manifest_bytes))
+        proxy_model._proxy.manifest_exists.return_value = root_digest
+        proxy_model._proxy.get_manifest.return_value = (
+            manifest_bytes,
+            DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE,
+        )
+
+        with pytest.raises(ProxyDigestUnsupportedError) as exc_info:
+            proxy_model.get_repo_tag(repo_ref, "latest")
+
+        assert exc_info.value.algorithm == algorithm
+        proxy_model._proxy.get_blob.assert_not_called()
+        assert not Manifest.select().where(Manifest.repository == repo_ref.id).exists()
+        assert (
+            not RepositoryManifestDigest.select()
+            .where(RepositoryManifestDigest.repository == repo_ref.id)
+            .exists()
+        )
+        assert (
+            not RepositoryBlobDigest.select()
+            .where(RepositoryBlobDigest.repository == repo_ref.id)
+            .exists()
+        )
+        assert not Tag.select().where(Tag.repository == repo_ref.id).exists()
 
 
 @pytest.mark.xdist_group("registry_proxy_serial")

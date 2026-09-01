@@ -54,9 +54,29 @@ class BlobUploadUnknown(V2RegistryException):
 
 
 class DigestInvalid(V2RegistryException):
-    def __init__(self, detail=None):
+    def __init__(self, detail=None, message=None):
         super(DigestInvalid, self).__init__(
-            "DIGEST_INVALID", "provided digest did not match uploaded content", detail
+            "DIGEST_INVALID",
+            message or "provided digest did not match uploaded content",
+            detail,
+        )
+
+
+class DigestUnsupported(V2RegistryException):
+    def __init__(self, algorithm):
+        super(DigestUnsupported, self).__init__(
+            "UNSUPPORTED",
+            "digest algorithm is unsupported",
+            {"algorithm": algorithm, "reason": "unsupported"},
+        )
+
+
+class DigestDisabled(V2RegistryException):
+    def __init__(self, algorithm):
+        super(DigestDisabled, self).__init__(
+            "UNSUPPORTED",
+            "digest algorithm is disabled by registry configuration",
+            {"algorithm": algorithm, "reason": "disabled"},
         )
 
 

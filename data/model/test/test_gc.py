@@ -26,6 +26,7 @@ from data.database import (
     ManifestLabel,
     ManifestPullStatistics,
     MediaType,
+    RepositoryManifestDigest,
     Tag,
     TagNotificationSuccess,
     TagPullStatistics,
@@ -503,6 +504,36 @@ def test_time_machine_gc(default_tag_policy, initialized_db):
                 delete_tag(repo, "tag1", expect_gc=True)
 
 
+def test_gc_removes_manifest_digest_registrations(default_tag_policy, initialized_db):
+    repo = model.repository.create_repository("devtable", "newrepo", None)
+    manifest, _ = create_manifest_for_testing(
+        repo, differentiation_field="registered", include_shared_blob=True
+    )
+    external_digest = "sha512:" + "a" * 128
+    model.oci.manifest.register_repository_manifest_digest(repo.id, manifest, external_digest)
+    Tag.delete().where(Tag.manifest == manifest).execute()
+
+    context = model.gc._GarbageCollectorContext(repo)
+    context.add_manifest_id(manifest.id)
+    with (
+        mock_patch("data.model.gc.features.SECURITY_SCANNER", True),
+        mock_patch.dict(model.gc.config.app_config, {"SECURITY_SCANNER_V4_MANIFEST_CLEANUP": True}),
+        mock_patch("data.model.gc.secscan_model.garbage_collect_manifest_report") as cleanup_report,
+    ):
+        model.gc._run_garbage_collection(context)
+
+    cleanup_report.assert_called_once_with(external_digest)
+    assert (
+        not RepositoryManifestDigest.select()
+        .where(
+            RepositoryManifestDigest.repository == repo,
+            RepositoryManifestDigest.digest == external_digest,
+        )
+        .exists()
+    )
+    assert Manifest.get_or_none(Manifest.id == manifest.id) is None
+
+
 def test_manifest_with_tags(default_tag_policy, initialized_db):
     """
     A repository with two tags pointing to a manifest.
@@ -767,7 +798,13 @@ def test_check_manifest_used_scoped_to_repository(initialized_db):
     )
     oci_manifest2 = oci_builder2.build()
 
-    manifest2_created = model.oci.manifest.get_or_create_manifest(repo2, oci_manifest2, storage)
+    # New writes reject cross-repository subjects. Insert a legacy/corrupt row directly so this
+    # test continues to verify that GC scopes defensive subject checks to the repository.
+    manifest2_created = model.oci.manifest.create_manifest(
+        repo2,
+        oci_manifest2,
+        canonical_subject_digest=oci_manifest1.digest,
+    )
     assert manifest2_created
 
     # Cross-repo referrer should not prevent GC of manifest1 in repo1

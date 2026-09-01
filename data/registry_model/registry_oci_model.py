@@ -1,7 +1,7 @@
 import logging
 import uuid
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 from peewee import fn
 
@@ -47,6 +47,7 @@ from image.docker.schema1 import DOCKER_SCHEMA1_CONTENT_TYPES
 from image.docker.schema2 import EMPTY_LAYER_BLOB_DIGEST, EMPTY_LAYER_BYTES
 from image.oci import OCI_IMAGE_INDEX_CONTENT_TYPE
 from image.shared import ManifestException
+from image.shared.schemas import is_manifest_list_type
 from util.bytes import Bytes
 from util.timedeltastring import convert_to_timedelta
 
@@ -246,12 +247,33 @@ class OCIModel(RegistryDataInterface):
         assert found_tag is None or not found_tag.hidden
         return Tag.for_tag(found_tag, self._legacy_image_id_handler)
 
-    def get_manifest_for_tag(self, tag):
+    def get_manifest_for_tag(self, tag, allowed_algorithms=None):
         """
         Returns the manifest associated with the given tag.
+
+        Tag requests do not carry a digest algorithm. When an allowlist is supplied, select an
+        enabled repository-visible registration for the exact manifest bytes instead of exposing
+        canonical SHA-256 unconditionally.
         """
         assert tag is not None
-        return tag.manifest
+        manifest = tag.manifest
+        if allowed_algorithms is None:
+            return manifest
+
+        digest = oci.manifest.get_repository_manifest_digest(
+            tag.repository._db_id,
+            tag._manifest_row,
+            allowed_algorithms=allowed_algorithms,
+        )
+        if digest is None:
+            return None
+
+        return Manifest.for_manifest(
+            tag._manifest_row,
+            self._legacy_image_id_handler,
+            legacy_image_row=manifest._legacy_image_row,
+            digest=digest,
+        )
 
     def lookup_manifest_by_digest(
         self,
@@ -279,7 +301,41 @@ class OCIModel(RegistryDataInterface):
                 raise model.ManifestDoesNotExist()
             return None
 
-        return Manifest.for_manifest(manifest, self._legacy_image_id_handler)
+        return Manifest.for_manifest(
+            manifest,
+            self._legacy_image_id_handler,
+            digest=manifest_digest,
+        )
+
+    def _repository_sha256_referrers(self, repository_ref, referrers):
+        selected = []
+        for referrer in referrers:
+            if referrer is None:
+                continue
+
+            referrer_row = database.Manifest.get_or_none(
+                database.Manifest.id == referrer.id,
+                database.Manifest.repository == repository_ref._db_id,
+            )
+            if referrer_row is None:
+                continue
+
+            digest = oci.manifest.get_repository_manifest_digest(
+                repository_ref._db_id,
+                referrer_row,
+                allowed_algorithms=["sha256"],
+            )
+            if digest is None:
+                continue
+
+            selected.append(
+                Manifest.for_manifest(
+                    referrer_row,
+                    self._legacy_image_id_handler,
+                    digest=digest,
+                )
+            )
+        return selected
 
     def lookup_cached_referrers_for_manifest(
         self, model_cache, repository_ref, manifest, artifact_type=None
@@ -313,7 +369,11 @@ class OCIModel(RegistryDataInterface):
                 referrer_dict["internal_manifest_bytes"] = Bytes.for_string_or_unicode(
                     referrer_dict["internal_manifest_bytes"]
                 )
-            return [Manifest.from_dict(referrer_dict) for referrer_dict in result]
+            cached_referrers = [Manifest.from_dict(referrer_dict) for referrer_dict in result]
+            # Cached descriptors may predate the Demo 1 boundary. Rebuild every cache hit from the
+            # current repository rows so a stale alternative or hidden canonical digest cannot be
+            # exposed.
+            return self._repository_sha256_referrers(repository_ref, cached_referrers)
         except FromDictionaryException:
             return self.lookup_referrers_for_manifest(repository_ref, manifest, artifact_type)
 
@@ -323,26 +383,26 @@ class OCIModel(RegistryDataInterface):
         Returns a manifest index.
         """
 
-        referrers = oci.manifest.lookup_manifest_referrers(
-            manifest.repository._db_id, manifest.digest, artifact_type
+        referrers = list(
+            oci.manifest.lookup_manifest_referrers(
+                manifest.repository._db_id, manifest.digest, artifact_type
+            )
         )
 
-        referrers_manifests = [
-            Manifest.for_manifest(referrer, self._legacy_image_id_handler) for referrer in referrers
-        ]
-        referrers_digests = {r.digest for r in referrers}
+        referrers_manifests = self._repository_sha256_referrers(repository_ref, referrers)
+        referrer_ids = {referrer.id for referrer in referrers}
 
         # Check for existing image indices with referrers tag schema
         referrers_tag_schema_index = self.lookup_referrers_for_tag_schema(manifest)
         if referrers_tag_schema_index:
             for m in referrers_tag_schema_index:
-                if (
-                    m.digest in referrers_digests
+                if m is None or (
+                    m.id in referrer_ids
                     or artifact_type is not None
                     and artifact_type != m.artifact_type
                 ):
                     continue
-                referrers_manifests.append(m)
+                referrers_manifests.extend(self._repository_sha256_referrers(repository_ref, [m]))
 
         return referrers_manifests
 
@@ -540,27 +600,90 @@ class OCIModel(RegistryDataInterface):
 
         return Tag.for_tag(tag, self._legacy_image_id_handler)
 
+    def _invalidate_manifest_cache(self, repository_ref, manifests, model_cache):
+        if model_cache is None:
+            return
+
+        repository_id = repository_ref._db_id
+        pending_manifests = [manifest for manifest in manifests if manifest is not None]
+        visited = set()
+        while pending_manifests:
+            current_manifests = list(
+                {
+                    manifest.id: manifest
+                    for manifest in pending_manifests
+                    if manifest.id not in visited
+                }.values()
+            )
+            if not current_manifests:
+                break
+            visited.update(manifest.id for manifest in current_manifests)
+
+            for manifest in current_manifests:
+                for digest in oci.manifest.get_repository_manifest_digests(repository_id, manifest):
+                    model_cache.invalidate(
+                        cache_key.for_repository_manifest(
+                            repository_id, digest, model_cache.cache_config
+                        )
+                    )
+
+            parent_ids = set()
+            for manifest in current_manifests:
+                media_type = manifest.media_type
+                if not isinstance(media_type, str):
+                    media_type = database.Manifest.media_type.get_name(manifest.media_type_id)
+                if is_manifest_list_type(media_type):
+                    parent_ids.add(manifest.id)
+            if not parent_ids:
+                break
+            child_ids = {
+                relationship.child_manifest_id
+                for relationship in ManifestChild.select(ManifestChild.child_manifest).where(
+                    ManifestChild.repository == repository_id,
+                    ManifestChild.manifest.in_(parent_ids),
+                )
+            }
+            pending_manifests = list(
+                database.Manifest.select().where(
+                    database.Manifest.repository == repository_id,
+                    database.Manifest.id.in_(child_ids - visited),
+                )
+            )
+
     def _invalidate_referrers_cache_for_manifest(
         self, repository_ref, manifest_interface_instance, model_cache
     ):
         if model_cache is None or manifest_interface_instance.subject is None:
             return
 
-        subject_digest = manifest_interface_instance.subject.digest
-        unfiltered_key = cache_key.for_manifest_referrers(
-            repository_ref._db_id, subject_digest, model_cache.cache_config
+        subject = manifest_interface_instance.subject
+        subject_digest = subject.get("digest") if isinstance(subject, dict) else subject.digest
+        subject_manifest = oci.manifest.resolve_repository_manifest_descriptor(
+            repository_ref._db_id,
+            subject_digest,
+            unknown_exception=oci.manifest.ManifestSubjectUnknownException,
         )
-        model_cache.invalidate(unfiltered_key)
-
-        artifact_type = manifest_interface_instance.artifact_type
-        if artifact_type is not None:
-            filtered_key = cache_key.for_manifest_referrers(
-                repository_ref._db_id,
-                subject_digest,
-                model_cache.cache_config,
-                artifact_type=artifact_type,
+        subject_cache_digests = set(
+            oci.manifest.get_repository_manifest_digests(repository_ref._db_id, subject_manifest)
+        )
+        # Internal wrappers use the canonical digest as their cache key even when that identity is
+        # not externally visible. Invalidating it does not expose it.
+        subject_cache_digests.add(subject_manifest.digest)
+        for visible_digest in subject_cache_digests:
+            unfiltered_key = cache_key.for_manifest_referrers(
+                repository_ref._db_id, visible_digest, model_cache.cache_config
             )
-            model_cache.invalidate(filtered_key)
+            model_cache.invalidate(unfiltered_key)
+
+            artifact_type = manifest_interface_instance.artifact_type
+            if artifact_type is not None:
+                filtered_key = cache_key.for_manifest_referrers(
+                    repository_ref._db_id,
+                    visible_digest,
+                    model_cache.cache_config,
+                    artifact_type=artifact_type,
+                )
+                model_cache.invalidate(filtered_key)
 
     def create_manifest_and_retarget_tag(
         self,
@@ -571,6 +694,60 @@ class OCIModel(RegistryDataInterface):
         raise_on_error=False,
         verify_quota=False,
         model_cache=None,
+        requested_digest=None,
+        prevalidated=False,
+        prevalidated_labels=None,
+        prevalidated_child_labels=None,
+        additional_tag_names=None,
+    ):
+        try:
+            result, previous_manifests, current_manifest = (
+                self._create_manifest_and_retarget_tag_transaction(
+                    repository_ref,
+                    manifest_interface_instance,
+                    tag_name,
+                    storage,
+                    raise_on_error=raise_on_error,
+                    verify_quota=verify_quota,
+                    requested_digest=requested_digest,
+                    prevalidated=prevalidated,
+                    prevalidated_labels=prevalidated_labels,
+                    prevalidated_child_labels=prevalidated_child_labels,
+                    additional_tag_names=additional_tag_names,
+                )
+            )
+        except QuotaExceededException:
+            # A rejected lifecycle transaction is rolled back before creating the durable quota
+            # notification. Notification persistence must not force partial graph persistence.
+            namespacequota.notify_organization_admins(repository_ref, "quota_error")
+            raise
+
+        # Invalidate only after commit. Invalidating inside the transaction allows another request
+        # to repopulate stale state before the tag move becomes visible.
+        if current_manifest is not None:
+            self._invalidate_manifest_cache(
+                repository_ref,
+                [*previous_manifests, current_manifest],
+                model_cache,
+            )
+            self._invalidate_referrers_cache_for_manifest(
+                repository_ref, manifest_interface_instance, model_cache
+            )
+        return result
+
+    def _create_manifest_and_retarget_tag_transaction(
+        self,
+        repository_ref,
+        manifest_interface_instance,
+        tag_name,
+        storage,
+        raise_on_error=False,
+        verify_quota=False,
+        requested_digest=None,
+        prevalidated=False,
+        prevalidated_labels=None,
+        prevalidated_child_labels=None,
+        additional_tag_names=None,
     ):
         """
         Creates a manifest in a repository, adding all of the necessary data in the model.
@@ -581,24 +758,42 @@ class OCIModel(RegistryDataInterface):
         Note that all blobs referenced by the manifest must exist under the repository or this
         method will fail and return None.
 
-        Returns a reference to the (created manifest, tag) or (None, None) on error, unless
+        Returns a reference to the (created manifest, first tag) or (None, None) on error, unless
         raise_on_error is set to True, in which case a CreateManifestException may also be
-        raised.
+        raised. Additional tags are retargeted in the same transaction.
         """
-        with db_disallow_replica_use():
-            # Get or create the manifest itself.
+        tag_names = list(dict.fromkeys([tag_name, *(additional_tag_names or [])]))
+        # The configured transaction factory is a no-op in unit tests and retarget_tag opens its
+        # own nested transaction. Multi-tag writes need a real atomic scope so all requested tags
+        # and the manifest graph roll back together in tests and production.
+        atomic_context = database.db.atomic() if len(tag_names) > 1 else nullcontext()
+        with db_disallow_replica_use(), db_transaction(), atomic_context:
+            previous_manifests = [
+                previous_tag.manifest
+                for current_tag_name in tag_names
+                if (previous_tag := oci.tag.get_tag(repository_ref._db_id, current_tag_name))
+                is not None
+            ]
+
+            # Get or create the canonical manifest and persist the requested repository identity.
             created_manifest = oci.manifest.get_or_create_manifest(
                 repository_ref._db_id,
                 manifest_interface_instance,
                 storage,
                 for_tagging=True,
                 raise_on_error=raise_on_error,
+                requested_digest=requested_digest,
+                prevalidated=prevalidated,
+                prevalidated_labels=prevalidated_labels,
+                prevalidated_child_labels=prevalidated_child_labels,
             )
             if created_manifest is None:
-                return (None, None)
+                return (None, None), previous_manifests, None
 
             wrapped_manifest = Manifest.for_manifest(
-                created_manifest.manifest, self._legacy_image_id_handler
+                created_manifest.manifest,
+                self._legacy_image_id_handler,
+                digest=requested_digest,
             )
 
             # Optional expiration and immutability labels
@@ -641,36 +836,36 @@ class OCIModel(RegistryDataInterface):
                 if quota["severity_level"] == "Warning":
                     namespacequota.notify_organization_admins(repository_ref, "quota_warning")
                 elif quota["severity_level"] == "Reject":
-                    namespacequota.notify_organization_admins(repository_ref, "quota_error")
-
-                    # Exiting here leaves the manifest without a tag causing it to not be picked
-                    # up by garbage collection. Create an expired temporary tag so it can be picked
-                    # up by GC.
-                    if created_manifest.newly_created:
-                        oci.tag.create_temporary_tag_outside_timemachine(created_manifest.manifest)
-
+                    # The surrounding transaction rolls back any new graph and digest
+                    # registrations when quota enforcement rejects the tag assignment.
                     raise QuotaExceededException()
 
-            # Re-target the tag to it.
-            tag = oci.tag.retarget_tag(
-                tag_name,
-                created_manifest.manifest,
-                raise_on_error=raise_on_error,
-                expiration_seconds=expiration_seconds,
-                immutable_from_label=immutable_from_label,
-            )
-            if tag is None:
-                return (None, None)
-
-            self._invalidate_referrers_cache_for_manifest(
-                repository_ref, manifest_interface_instance, model_cache
-            )
+            # Re-target every requested tag in the same transaction. Returning the first tag
+            # preserves the existing registry-model interface for single-tag callers.
+            tags = []
+            for current_tag_name in tag_names:
+                tag = oci.tag.retarget_tag(
+                    current_tag_name,
+                    created_manifest.manifest,
+                    raise_on_error=raise_on_error,
+                    expiration_seconds=expiration_seconds,
+                    immutable_from_label=immutable_from_label,
+                )
+                if tag is None:
+                    return (None, None), previous_manifests, None
+                tags.append(tag)
 
             return (
-                wrapped_manifest,
-                Tag.for_tag(
-                    tag, self._legacy_image_id_handler, manifest_row=created_manifest.manifest
+                (
+                    wrapped_manifest,
+                    Tag.for_tag(
+                        tags[0],
+                        self._legacy_image_id_handler,
+                        manifest_row=created_manifest.manifest,
+                    ),
                 ),
+                previous_manifests,
+                created_manifest.manifest,
             )
 
     def retarget_tag(
@@ -759,10 +954,11 @@ class OCIModel(RegistryDataInterface):
             if deleted_tag is None:
                 return None
 
-            manifest_cache_key = cache_key.for_repository_manifest(
-                deleted_tag.repository.id, deleted_tag.manifest.digest, model_cache.cache_config
+            self._invalidate_manifest_cache(
+                repository_ref,
+                [deleted_tag.manifest],
+                model_cache,
             )
-            model_cache.invalidate(manifest_cache_key)
 
             gen_key = cache_key.for_active_repo_tags_gen(
                 deleted_tag.repository.id, model_cache.cache_config
@@ -781,10 +977,11 @@ class OCIModel(RegistryDataInterface):
         with db_disallow_replica_use():
             deleted_tags = oci.tag.delete_tags_for_manifest(manifest._db_id)
 
-            manifest_cache_key = cache_key.for_repository_manifest(
-                manifest.repository.id, manifest.digest, model_cache.cache_config
+            self._invalidate_manifest_cache(
+                manifest.repository,
+                [manifest],
+                model_cache,
             )
-            model_cache.invalidate(manifest_cache_key)
 
             gen_key = cache_key.for_active_repo_tags_gen(
                 manifest.repository.id, model_cache.cache_config
@@ -840,7 +1037,11 @@ class OCIModel(RegistryDataInterface):
 
         try:
             layers = self._list_manifest_layers(
-                manifest_obj.repository_id, parsed, storage, include_placements
+                manifest_obj.repository_id,
+                parsed,
+                storage,
+                include_placements,
+                manifest_id=manifest_obj.id,
             )
         except Exception:
             logger.exception("Could not list manifest layers `%s`", manifest._db_id)
@@ -919,6 +1120,11 @@ class OCIModel(RegistryDataInterface):
         expiration_sec,
         storage,
         model_cache=None,
+        requested_digest=None,
+        raise_on_error=False,
+        prevalidated=False,
+        prevalidated_labels=None,
+        prevalidated_child_labels=None,
     ):
         """
         Creates a manifest under the repository and sets a temporary tag to point to it.
@@ -929,7 +1135,7 @@ class OCIModel(RegistryDataInterface):
         cache for the subject digest is invalidated so that subsequent queries
         return fresh results.
         """
-        with db_disallow_replica_use():
+        with db_disallow_replica_use(), db_transaction():
             # Get or create the manifest itself. get_or_create_manifest will take care of the
             # temporary tag work.
             created_manifest = oci.manifest.get_or_create_manifest(
@@ -937,15 +1143,24 @@ class OCIModel(RegistryDataInterface):
                 manifest_interface_instance,
                 storage,
                 temp_tag_expiration_sec=expiration_sec,
+                raise_on_error=raise_on_error,
+                requested_digest=requested_digest,
+                prevalidated=prevalidated,
+                prevalidated_labels=prevalidated_labels,
+                prevalidated_child_labels=prevalidated_child_labels,
             )
             if created_manifest is None:
                 return None
 
-            self._invalidate_referrers_cache_for_manifest(
-                repository_ref, manifest_interface_instance, model_cache
+            wrapped_manifest = Manifest.for_manifest(
+                created_manifest.manifest, self._legacy_image_id_handler
             )
 
-            return Manifest.for_manifest(created_manifest.manifest, self._legacy_image_id_handler)
+        # Do not permit a cache reload between invalidation and transaction commit.
+        self._invalidate_referrers_cache_for_manifest(
+            repository_ref, manifest_interface_instance, model_cache
+        )
+        return wrapped_manifest
 
     def get_repo_blob_by_digest(self, repository_ref, blob_digest, include_placements=False):
         """
@@ -1214,7 +1429,15 @@ class OCIModel(RegistryDataInterface):
                 repository_ref, blob_digest, include_placements=True
             )
 
-    def create_blob_upload(self, repository_ref, new_upload_id, location_name, storage_metadata):
+    def create_blob_upload(
+        self,
+        repository_ref,
+        new_upload_id,
+        location_name,
+        storage_metadata,
+        requested_digest_algorithm=None,
+        requested_digest_state=None,
+    ):
         """
         Creates a new blob upload and returns a reference.
 
@@ -1227,7 +1450,12 @@ class OCIModel(RegistryDataInterface):
 
             try:
                 upload_record = model.blob.initiate_upload_for_repo(
-                    repo, new_upload_id, location_name, storage_metadata
+                    repo,
+                    new_upload_id,
+                    location_name,
+                    storage_metadata,
+                    requested_digest_algorithm,
+                    requested_digest_state,
                 )
                 return BlobUpload.for_upload(upload_record, location_name=location_name)
             except database.Repository.DoesNotExist:
@@ -1240,7 +1468,7 @@ class OCIModel(RegistryDataInterface):
         """
         with db_disallow_replica_use():
             upload_record = model.blob.get_blob_upload_by_uuid(blob_upload_id)
-            if upload_record is None:
+            if upload_record is None or upload_record.repository_id != repository_ref.id:
                 return None
 
             return BlobUpload.for_upload(upload_record)
@@ -1253,6 +1481,7 @@ class OCIModel(RegistryDataInterface):
         byte_count,
         chunk_count,
         sha_state,
+        requested_digest_state=None,
     ):
         """
         Updates the fields of the blob upload to match those given.
@@ -1261,7 +1490,7 @@ class OCIModel(RegistryDataInterface):
         """
         with db_disallow_replica_use():
             upload_record = model.blob.get_blob_upload_by_uuid(blob_upload.upload_id)
-            if upload_record is None:
+            if upload_record is None or upload_record.repository_id != blob_upload.repository_id:
                 return None
 
             upload_record.uncompressed_byte_count = uncompressed_byte_count
@@ -1269,6 +1498,8 @@ class OCIModel(RegistryDataInterface):
             upload_record.byte_count = byte_count
             upload_record.chunk_count = chunk_count
             upload_record.sha_state = sha_state
+            upload_record.requested_digest_algorithm = blob_upload.requested_digest_algorithm
+            upload_record.requested_digest_state = requested_digest_state
             upload_record.save()
             return BlobUpload.for_upload(upload_record)
 
@@ -1278,21 +1509,45 @@ class OCIModel(RegistryDataInterface):
         """
         with db_disallow_replica_use():
             upload_record = model.blob.get_blob_upload_by_uuid(blob_upload.upload_id)
-            if upload_record is not None:
+            if (
+                upload_record is not None
+                and upload_record.repository_id == blob_upload.repository_id
+            ):
                 upload_record.delete_instance()
 
-    def commit_blob_upload(self, blob_upload, blob_digest_str, blob_expiration_seconds):
+    def commit_blob_upload(
+        self,
+        blob_upload,
+        blob_digest_str,
+        blob_expiration_seconds,
+        requested_digest_str=None,
+    ):
         """
         Commits the blob upload into a blob and sets an expiration before that blob will be GCed.
         """
-        with db_disallow_replica_use():
+        requested_digest_str = requested_digest_str or blob_digest_str
+        with db_disallow_replica_use(), db_transaction():
             upload_record = model.blob.get_blob_upload_by_uuid(blob_upload.upload_id)
             if upload_record is None:
+                existing = model.oci.blob.get_repository_blob_by_digest(
+                    blob_upload.repository_id, requested_digest_str
+                )
+                if existing is None or existing.content_checksum != blob_digest_str:
+                    return None
+                return Blob.for_image_storage(
+                    existing, storage_path=model.storage.get_layer_path(existing)
+                )
+            if upload_record.repository_id != blob_upload.repository_id:
                 return None
 
             repository_id = upload_record.repository_id
+            legacy_blob = None
+            if requested_digest_str != blob_digest_str:
+                legacy_blob = model.oci.blob.get_repository_blob_by_digest(
+                    repository_id, blob_digest_str
+                )
 
-            # Create the blob and temporarily tag it.
+            # Create the canonical blob and temporarily link it to this repository.
             location_obj = model.storage.get_image_location_for_name(blob_upload.location_name)
             blob_record = model.blob.store_blob_record_and_temp_link_in_repo(
                 repository_id,
@@ -1303,13 +1558,29 @@ class OCIModel(RegistryDataInterface):
                 blob_upload.uncompressed_byte_count,
             )
 
-            # Delete the blob upload.
+            # If this repository/blob pair predates registrations, preserve its historical SHA-256
+            # visibility before adding an alternative digest.
+            if legacy_blob is not None and requested_digest_str != blob_digest_str:
+                model.oci.blob.register_repository_blob_digest(
+                    repository_id, blob_record, blob_digest_str
+                )
+            model.oci.blob.register_repository_blob_digest(
+                repository_id, blob_record, requested_digest_str
+            )
+
+            # Delete the blob upload only after the canonical link and registration both exist.
             upload_record.delete_instance()
             return Blob.for_image_storage(
                 blob_record, storage_path=model.storage.get_layer_path(blob_record)
             )
 
-    def mount_blob_into_repository(self, blob, target_repository_ref, expiration_sec):
+    def mount_blob_into_repository(
+        self,
+        blob,
+        target_repository_ref,
+        expiration_sec,
+        mounted_digest=None,
+    ):
         """
         Mounts the blob from another repository into the specified target repository, and adds an
         expiration before that blob is automatically GCed.
@@ -1317,11 +1588,35 @@ class OCIModel(RegistryDataInterface):
         This function is useful during push operations if an existing blob from another repository
         is being pushed. Returns False if the mounting fails.
         """
-        with db_disallow_replica_use():
-            storage = model.blob.temp_link_blob(
-                target_repository_ref._db_id, blob.digest, expiration_sec
+        mounted_digest = mounted_digest or blob.digest
+        target_repository_id = target_repository_ref._db_id
+        with db_disallow_replica_use(), db_transaction():
+            legacy_blob = None
+            if mounted_digest != blob.digest:
+                legacy_blob = model.oci.blob.get_repository_blob_by_digest(
+                    target_repository_id, blob.digest
+                )
+
+            storage = model.blob.temp_link_blob_by_id(
+                target_repository_id,
+                blob._db_id,
+                blob.digest,
+                expiration_sec,
             )
-            return bool(storage)
+            if storage is None:
+                return False
+
+            # Preserve a canonical identity that was already visible through the legacy lookup
+            # contract before adding the first alternative registration. A new alternative-only
+            # mount intentionally receives no canonical SHA-256 registration.
+            if legacy_blob is not None and mounted_digest != blob.digest:
+                model.oci.blob.register_repository_blob_digest(
+                    target_repository_id, storage, blob.digest
+                )
+            model.oci.blob.register_repository_blob_digest(
+                target_repository_id, storage, mounted_digest
+            )
+            return True
 
     def get_legacy_image(self, repository_ref, docker_image_id, storage, include_blob=False):
         """
@@ -1384,16 +1679,15 @@ class OCIModel(RegistryDataInterface):
         )
 
     def _get_manifest_local_blobs(self, manifest, repo_id, storage, include_placements=False):
-        parsed = manifest.get_parsed_manifest()
-        if parsed is None:
-            return None
-
-        local_blob_digests = list(set(parsed.local_blob_digests))
-        if not len(local_blob_digests):
-            return []
-
-        blob_query = self._lookup_repo_storages_by_content_checksum(
-            repo_id, local_blob_digests, storage
+        # ManifestBlob is the persisted canonical graph. Using it avoids reinterpreting external
+        # descriptor identities and guarantees every returned blob belongs to this repository.
+        blob_query = (
+            database.ImageStorage.select()
+            .join(database.ManifestBlob)
+            .where(
+                database.ManifestBlob.repository == repo_id,
+                database.ManifestBlob.manifest == manifest._db_id,
+            )
         )
         blobs = []
         for image_storage in blob_query:
@@ -1410,7 +1704,14 @@ class OCIModel(RegistryDataInterface):
 
         return blobs
 
-    def _list_manifest_layers(self, repo_id, parsed, storage, include_placements=False):
+    def _list_manifest_layers(
+        self,
+        repo_id,
+        parsed,
+        storage,
+        include_placements=False,
+        manifest_id=None,
+    ):
         """
         Returns an *ordered list* of the layers found in the manifest, starting at the base and
         working towards the leaf, including the associated Blob and its placements (if specified).
@@ -1427,11 +1728,21 @@ class OCIModel(RegistryDataInterface):
         if requires_empty_blob:
             blob_digests.append(EMPTY_LAYER_BLOB_DIGEST)
 
-        if blob_digests:
-            blob_query = self._lookup_repo_storages_by_content_checksum(
-                repo_id, blob_digests, storage
-            )
-            storage_map = {blob.content_checksum: blob for blob in blob_query}
+        for blob_digest in blob_digests:
+            image_storage = self._get_shared_storage(blob_digest, storage=storage)
+            if image_storage is None:
+                image_storage = oci.blob.get_repository_blob_by_digest(repo_id, blob_digest)
+            if image_storage is not None and (
+                manifest_id is None
+                or database.ManifestBlob.select()
+                .where(
+                    database.ManifestBlob.repository == repo_id,
+                    database.ManifestBlob.manifest == manifest_id,
+                    database.ManifestBlob.blob == image_storage.id,
+                )
+                .exists()
+            ):
+                storage_map[blob_digest] = image_storage
 
         layers = parsed.get_layers(retriever)
         if layers is None:

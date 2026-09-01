@@ -8,12 +8,11 @@ from peewee import Select, fn
 
 import features
 from app import app, proxy_cache_blob_queue, storage
-from data.database import ImageStorage, ImageStoragePlacement
+from data.database import ImageStorage
 from data.database import Manifest as ManifestTable
 from data.database import ManifestBlob, ManifestChild
 from data.database import Tag as TagTable
 from data.database import (
-    db,
     db_disallow_replica_use,
     db_transaction,
     get_epoch_timestamp_ms,
@@ -37,9 +36,10 @@ from data.model.quota import (
 )
 from data.model.repository import create_repository, get_repository
 from data.model.storage import (
-    get_image_location_for_id,
+    StorageContentStatus,
     get_layer_path,
     get_or_create_blob_with_lock,
+    get_storage_content_status,
     with_blob_lock_or_fallback,
 )
 from data.registry_model.blobuploader import (
@@ -53,6 +53,7 @@ from data.registry_model.blobuploader import (
 )
 from data.registry_model.datatypes import Manifest, RepositoryReference, Tag
 from data.registry_model.registry_oci_model import OCIModel
+from digest import digest_tools
 from image.docker.schema1 import (
     DOCKER_SCHEMA1_MANIFEST_CONTENT_TYPE,
     DOCKER_SCHEMA1_SIGNED_MANIFEST_CONTENT_TYPE,
@@ -66,10 +67,28 @@ from image.oci import OCI_IMAGE_INDEX_CONTENT_TYPE, OCI_IMAGE_MANIFEST_CONTENT_T
 from image.shared import ManifestException
 from image.shared.interfaces import ManifestInterface
 from image.shared.schemas import parse_manifest_from_bytes
-from proxy import Proxy, UpstreamAuthError, UpstreamRegistryError
+from proxy import (
+    Proxy,
+    ProxyDigestDisabledError,
+    ProxyDigestUnsupportedError,
+    UpstreamAuthError,
+    UpstreamManifestTooLargeError,
+    UpstreamRegistryError,
+)
 from util.bytes import Bytes
 
 logger = logging.getLogger(__name__)
+
+MAX_PROXY_MANIFEST_SIZE_BYTES = 4 * 1024 * 1024
+
+
+class ProxyManifestSizeExceeded(ManifestDoesNotExist):
+    """Raised when an upstream manifest exceeds the proxy response limit."""
+
+    def __init__(self, max_allowed):
+        self.max_allowed = max_allowed
+        super().__init__(f"upstream manifest exceeds response size limit ({max_allowed})")
+
 
 ACCEPTED_MEDIA_TYPES = [
     OCI_IMAGE_MANIFEST_CONTENT_TYPE,
@@ -114,6 +133,9 @@ class ProxyModel(OCIModel):
         If the repository does not exist and the given manifest_ref exists upstream,
         creates the repository.
         """
+        if manifest_ref is not None and ":" in manifest_ref:
+            self._parse_enabled_proxy_digest(manifest_ref)
+
         repo = get_repository(namespace_name, repo_name)
         exists = repo is not None
         if exists:
@@ -132,7 +154,9 @@ class ProxyModel(OCIModel):
             return None
 
         try:
-            self._proxy.manifest_exists(manifest_ref, ACCEPTED_MEDIA_TYPES)
+            upstream_digest = self._proxy.manifest_exists(manifest_ref, ACCEPTED_MEDIA_TYPES)
+            if upstream_digest is not None:
+                self._parse_enabled_proxy_digest(upstream_digest)
         except UpstreamRegistryError as e:
             if raise_on_error:
                 raise RepositoryDoesNotExist(str(e))
@@ -258,6 +282,8 @@ class ProxyModel(OCIModel):
         Raises QuotaExceededException if the given tag is larger than the max quota
         allotted for the namespace or if there are not enough tags to prune.
         """
+
+        self._parse_enabled_proxy_digest(manifest_digest)
 
         wrapped_manifest = super().lookup_manifest_by_digest(
             repository_ref, manifest_digest, allow_dead=True, require_available=False
@@ -405,17 +431,57 @@ class ProxyModel(OCIModel):
         ],
     ) -> tuple[Manifest | None, Tag | None]:
         """
-        Returns the newly created manifest and tag.
+        Returns the newly created SHA-256 manifest and tag.
 
-        Raises a UpstreamRegistryError exception when the upstream registry
-        returns anything other than a 200 status code.
-        Raises a ManifestDoesNotExist when the manifest pull from upstream errors,
-        or the retrieved manifest is invalid (for docker manifest schema v1).
+        Alternative upstream identities are rejected before manifest download or persistence.
         """
-        self._proxy.manifest_exists(manifest_ref, ACCEPTED_MEDIA_TYPES)
-        upstream_manifest = self._pull_upstream_manifest(repo_ref.name, manifest_ref)
-        manifest, tag = create_manifest_fn(repo_ref, upstream_manifest, manifest_ref)
-        return manifest, tag
+        if ":" in manifest_ref:
+            self._parse_enabled_proxy_digest(manifest_ref)
+
+        upstream_digest = self._proxy.manifest_exists(manifest_ref, ACCEPTED_MEDIA_TYPES)
+        if upstream_digest is not None:
+            self._parse_enabled_proxy_digest(upstream_digest)
+        requested_digest = manifest_ref if ":" in manifest_ref else upstream_digest
+        upstream_manifest = self._pull_upstream_manifest(
+            repo_ref.name,
+            manifest_ref,
+            expected_digest=requested_digest,
+        )
+        return create_manifest_fn(repo_ref, upstream_manifest, manifest_ref)
+
+    def _parse_enabled_proxy_digest(self, digest):
+        try:
+            parsed = digest_tools.Digest.parse_digest(digest, strict=True)
+        except digest_tools.UnsupportedDigestAlgorithmException as exc:
+            algorithm = digest.split(":", 1)[0] if isinstance(digest, str) else str(digest)
+            raise ProxyDigestUnsupportedError(algorithm) from exc
+        except digest_tools.InvalidDigestException as exc:
+            raise ManifestDoesNotExist("invalid upstream digest") from exc
+
+        # Alternative-digest proxy-cache ingestion is deferred to Demo 9. This capability
+        # boundary takes precedence over the global allowlist, just like mirror and import.
+        if parsed.hash_alg != "sha256":
+            raise ProxyDigestUnsupportedError(parsed.hash_alg)
+        if parsed.hash_alg not in app.config.get("ALLOWED_HASH_ALGORITHMS", ["sha256"]):
+            raise ProxyDigestDisabledError(parsed.hash_alg)
+        return parsed
+
+    def _validate_proxy_manifest_digests(self, manifest):
+        digests = [str(digest) for digest in manifest.blob_digests or []]
+        if manifest.subject is not None:
+            digests.append(
+                manifest.subject.get("digest")
+                if isinstance(manifest.subject, dict)
+                else manifest.subject.digest
+            )
+        if manifest.is_manifest_list:
+            digests.extend(
+                descriptor.get("digest")
+                for descriptor in manifest.manifest_dict.get("manifests", [])
+            )
+
+        for digest in digests:
+            self._parse_enabled_proxy_digest(digest)
 
     def _rollback_created_blobs_and_quota(self, repo_ref, manifest, created_blobs):
         """
@@ -462,25 +528,34 @@ class ProxyModel(OCIModel):
         upstream_manifest = None
         upstream_digest = self._proxy.manifest_exists(manifest_ref, ACCEPTED_MEDIA_TYPES)
 
-        # manifest_exists will return an empty/None digest when the upstream
-        # registry omits the docker-content-digest header.
-        if not upstream_digest:
+        up_to_date = False
+        if upstream_digest:
+            parsed_upstream_digest = self._parse_enabled_proxy_digest(upstream_digest)
+            up_to_date = manifest.digest == str(parsed_upstream_digest)
+        else:
             upstream_manifest = self._pull_upstream_manifest(repo_ref.name, manifest_ref)
             upstream_digest = upstream_manifest.digest
+            up_to_date = manifest.digest == upstream_digest
 
         logger.debug(f"Found upstream manifest with digest {upstream_digest}, {manifest_ref=}")
-        up_to_date = manifest.digest == upstream_digest
-
         placeholder = manifest.internal_manifest_bytes.as_unicode() == ""
         if up_to_date and not placeholder:
             if tag.expired:
                 if upstream_manifest is None:
-                    upstream_manifest = self._pull_upstream_manifest(repo_ref.name, manifest_ref)
+                    upstream_manifest = self._pull_upstream_manifest(
+                        repo_ref.name,
+                        manifest_ref,
+                        expected_digest=upstream_digest,
+                    )
                 self._check_image_upload_possible_or_prune(repo_ref, upstream_manifest)
             return tag, False
 
         if upstream_manifest is None:
-            upstream_manifest = self._pull_upstream_manifest(repo_ref.name, manifest_ref)
+            upstream_manifest = self._pull_upstream_manifest(
+                repo_ref.name,
+                manifest_ref,
+                expected_digest=upstream_digest,
+            )
 
         created_blobs = []
 
@@ -512,8 +587,7 @@ class ProxyModel(OCIModel):
                     self._rollback_created_blobs_and_quota(repo_ref, manifest, created_blobs)
                 raise
 
-        # if we got here, the manifest is stale, so we both create a new manifest
-        # entry in the db, and retarget the tag.
+        # If we got here, the manifest is stale, so create it and retarget the tag.
         _, tag = create_manifest_fn(repo_ref, upstream_manifest, manifest_ref)
         return tag, True
 
@@ -539,16 +613,23 @@ class ProxyModel(OCIModel):
         """
         self._check_image_upload_possible_or_prune(repository_ref, manifest)
 
-        db_manifest = oci.manifest.lookup_manifest(
+        db_manifest = oci.manifest.lookup_canonical_manifest(
             repository_ref.id, manifest.digest, allow_dead=True
         )
 
         if db_manifest is None:
-            with db_disallow_replica_use():
-                with db_transaction():
-                    db_manifest = oci.manifest.create_manifest(
-                        repository_ref.id, manifest, raise_on_error=True
-                    )
+            with db_disallow_replica_use(), db_transaction():
+                canonical_subject = oci.manifest.resolve_manifest_subject(
+                    repository_ref.id, manifest
+                )
+                db_manifest = oci.manifest.create_manifest(
+                    repository_ref.id,
+                    manifest,
+                    raise_on_error=True,
+                    canonical_subject_digest=(
+                        canonical_subject.digest if canonical_subject else None
+                    ),
+                )
             if db_manifest is None:
                 return None, None
 
@@ -597,10 +678,20 @@ class ProxyModel(OCIModel):
                     )
 
                     if not manifest.is_manifest_list:
+                        oci.manifest.register_repository_manifest_digest(
+                            repository_ref.id, db_manifest, manifest.digest
+                        )
                         return wrapped_manifest, wrapped_tag
 
+                    child_references = list(manifest.child_manifests(content_retriever=None))
+                    child_descriptors = manifest.manifest_dict.get("manifests", [])
+                    if len(child_references) != len(child_descriptors):
+                        raise ManifestDoesNotExist(
+                            "upstream index descriptors could not be resolved"
+                        )
+
                     manifests_to_connect = []
-                    for child in manifest.child_manifests(content_retriever=None):
+                    for child in child_references:
                         m = oci.manifest.lookup_manifest(
                             repository_ref.id, child.digest, allow_dead=True
                         )
@@ -616,6 +707,9 @@ class ProxyModel(OCIModel):
 
                     oci.manifest.connect_manifests(
                         manifests_to_connect, db_manifest, repository_ref.id
+                    )
+                    oci.manifest.register_repository_manifest_digest(
+                        repository_ref.id, db_manifest, manifest.digest
                     )
 
                     return wrapped_manifest, wrapped_tag
@@ -644,107 +738,159 @@ class ProxyModel(OCIModel):
         Raises QuotaExceededException if there are not enough tags to prune.
         """
         self._check_image_upload_possible_or_prune(repository_ref, manifest)
-        with db_disallow_replica_use():
-            with db_transaction():
-                db_manifest = oci.manifest.create_manifest(repository_ref.id, manifest)
+        requested_digest = manifest_ref or manifest.digest
+        self._parse_enabled_proxy_digest(requested_digest)
+        if ":" in requested_digest:
+            try:
+                parsed_requested_digest = digest_tools.Digest.parse_digest(
+                    requested_digest, strict=True
+                )
+            except digest_tools.InvalidDigestException as exc:
+                raise ManifestDoesNotExist("invalid upstream manifest digest") from exc
+            computed_digest = (
+                manifest.digest
+                if manifest.schema_version == 1
+                else digest_tools.digest_bytes(
+                    parsed_requested_digest.hash_alg,
+                    manifest.bytes.as_encoded_str(),
+                )
+            )
+            if computed_digest != requested_digest:
+                raise ManifestDoesNotExist("upstream manifest digest mismatch")
+
+        if manifest.is_manifest_list:
+            return self._create_proxy_manifest_list_with_temp_tag(
+                repository_ref,
+                manifest,
+                requested_digest,
+            )
+
+        db_manifest = oci.manifest.lookup_canonical_manifest(
+            repository_ref.id, manifest.digest, allow_dead=True
+        )
+        if db_manifest is None:
+            with db_disallow_replica_use(), db_transaction():
+                canonical_subject = oci.manifest.resolve_manifest_subject(
+                    repository_ref.id, manifest
+                )
+                db_manifest = oci.manifest.create_manifest(
+                    repository_ref.id,
+                    manifest,
+                    canonical_subject_digest=(
+                        canonical_subject.digest if canonical_subject else None
+                    ),
+                )
 
         created_blobs = []  # Track ManifestBlob rows created in this attempt
         try:
-            if not manifest.is_manifest_list:
-                created_blobs = self._create_placeholder_blobs(
-                    manifest, db_manifest.id, repository_ref.id
+            created_blobs = self._create_placeholder_blobs(
+                manifest, db_manifest.id, repository_ref.id
+            )
+            with db_disallow_replica_use(), db_transaction():
+                expiration = self._config.expiration_s or None
+                tag = Tag.for_tag(
+                    oci.tag.create_temporary_tag_if_necessary(db_manifest, expiration),
+                    self._legacy_image_id_handler,
                 )
-            with db_disallow_replica_use():
-                with db_transaction():
-                    expiration = self._config.expiration_s or None
-                    tag = Tag.for_tag(
-                        oci.tag.create_temporary_tag_if_necessary(db_manifest, expiration),
-                        self._legacy_image_id_handler,
-                    )
-                    wrapped_manifest = Manifest.for_manifest(
-                        db_manifest, self._legacy_image_id_handler
-                    )
+                wrapped_manifest = Manifest.for_manifest(db_manifest, self._legacy_image_id_handler)
 
-                    if not manifest.is_manifest_list:
-                        return wrapped_manifest, tag
-
-                    manifests_to_connect = []
-                    for child in manifest.child_manifests(content_retriever=None):
-                        m = oci.manifest.lookup_manifest(
-                            repository_ref.id, child.digest, allow_hidden=True, allow_dead=True
-                        )
-                        if m is None:
-                            m = oci.manifest.create_manifest(repository_ref.id, child)
-                        manifests_to_connect.append(m)
-
-                    oci.manifest.connect_manifests(
-                        manifests_to_connect, db_manifest, repository_ref.id
-                    )
-                    for child_manifest in manifests_to_connect:
-                        oci.tag.create_temporary_tag_if_necessary(child_manifest, expiration)
-
-                    return wrapped_manifest, tag
+                oci.manifest.register_repository_manifest_digest(
+                    repository_ref.id, db_manifest, requested_digest
+                )
+                return wrapped_manifest, tag
         except Exception as e:
             logger.warning(
                 "Failed to create blob/tag for manifest %s, cleaning up: %s", db_manifest.id, e
             )
-            # Clean up only the ManifestBlob rows we created in this attempt
             if created_blobs:
                 self._rollback_created_blobs_and_quota(repository_ref, db_manifest, created_blobs)
             raise
 
+    def _create_proxy_manifest_list_with_temp_tag(
+        self,
+        repository_ref,
+        manifest,
+        requested_digest,
+    ):
+        child_rows = []
+        child_references = list(manifest.child_manifests(content_retriever=None))
+        child_descriptors = manifest.manifest_dict.get("manifests", [])
+        if len(child_references) != len(child_descriptors):
+            raise ManifestDoesNotExist("upstream index descriptors could not be resolved")
+
+        for child in child_references:
+            child_row = oci.manifest.lookup_manifest(
+                repository_ref.id,
+                child.digest,
+                allow_hidden=True,
+                allow_dead=True,
+            )
+            child_rows.append((child, child_row))
+
+        with db_disallow_replica_use(), db_transaction():
+            db_manifest = oci.manifest.lookup_canonical_manifest(
+                repository_ref.id, manifest.digest, allow_dead=True
+            )
+            if db_manifest is None:
+                canonical_subject = oci.manifest.resolve_manifest_subject(
+                    repository_ref.id, manifest
+                )
+                db_manifest = oci.manifest.create_manifest(
+                    repository_ref.id,
+                    manifest,
+                    canonical_subject_digest=(
+                        canonical_subject.digest if canonical_subject else None
+                    ),
+                )
+
+            manifests_to_connect = []
+            expiration = self._config.expiration_s or None
+            for child, child_row in child_rows:
+                if child_row is None:
+                    child_row = oci.manifest.create_manifest(repository_ref.id, child)
+                manifests_to_connect.append(child_row)
+                oci.tag.create_temporary_tag_if_necessary(child_row, expiration)
+
+            existing_child_ids = {
+                relationship.child_manifest_id
+                for relationship in ManifestChild.select(ManifestChild.child_manifest).where(
+                    ManifestChild.repository == repository_ref.id,
+                    ManifestChild.manifest == db_manifest,
+                )
+            }
+            oci.manifest.connect_manifests(
+                [child for child in manifests_to_connect if child.id not in existing_child_ids],
+                db_manifest,
+                repository_ref.id,
+            )
+            tag = Tag.for_tag(
+                oci.tag.create_temporary_tag_if_necessary(db_manifest, expiration),
+                self._legacy_image_id_handler,
+            )
+            oci.manifest.register_repository_manifest_digest(
+                repository_ref.id, db_manifest, requested_digest
+            )
+            return (
+                Manifest.for_manifest(db_manifest, self._legacy_image_id_handler),
+                tag,
+            )
+
     def get_repo_blob_by_digest(self, repository_ref, blob_digest, include_placements=False):
         """
-        Returns the blob in the repository with the given digest.
-
-        If the blob is a placeholder, downloads it from the upstream registry.
-        Placeholder blobs are blobs that don't yet have a ImageStoragePlacement
-        associated with it.
-
-        Note that there may be multiple records in the same repository for the same blob digest, so
-        the return value of this function may change.
+        Returns the repository-visible SHA-256 blob and fills a missing placement from upstream.
         """
-        blob = self._get_shared_storage(blob_digest)
+        self._parse_enabled_proxy_digest(blob_digest)
+        blob = oci.blob.lookup_repository_blob_by_digest(repository_ref.id, blob_digest)
         if blob is None:
-            try:
-                blob = (
-                    ImageStorage.select()
-                    .join(ManifestBlob)
-                    .where(
-                        ManifestBlob.repository_id == repository_ref.id,
-                        ImageStorage.content_checksum == blob_digest,
-                    )
-                    .get()
-                )
-            except ImageStorage.DoesNotExist:
-                return None
+            return None
 
-        needs_download = False
-        try:
-            placement = (
-                ImageStoragePlacement.select().where(ImageStoragePlacement.storage == blob).get()
+        content_status = get_storage_content_status(blob, storage)
+        if content_status != StorageContentStatus.READABLE:
+            logger.warning(
+                "Proxy blob %s requires promotion or repair: %s",
+                blob_digest,
+                content_status.value,
             )
-        except ImageStoragePlacement.DoesNotExist:
-            needs_download = True
-
-        if not needs_download:
-            try:
-                layer_path = get_layer_path(blob)
-                location_name = get_image_location_for_id(placement.location_id).name
-                if not storage.exists([location_name], layer_path):
-                    logger.warning(
-                        "Blob %s has placements in DB but is missing from storage, re-fetching from upstream",
-                        blob_digest,
-                    )
-                    needs_download = True
-            except (IOError, OSError):
-                logger.exception(
-                    "Failed to verify blob %s existence in storage, re-fetching from upstream",
-                    blob_digest,
-                )
-                needs_download = True
-
-        if needs_download:
             try:
                 self._download_blob(repository_ref, blob_digest)
             except BlobDigestMismatchException:
@@ -758,11 +904,9 @@ class ProxyModel(OCIModel):
 
         return super().get_repo_blob_by_digest(repository_ref, blob_digest, include_placements)
 
-    def _download_blob(self, repo_ref: RepositoryReference, digest: str) -> None:
-        """
-        Download blob from upstream registry and perform a monolitic upload to
-        Quay's own storage.
-        """
+    def _prefetch_blob(self, repo_ref: RepositoryReference, digest: str):
+        """Download, validate, and finalize bytes without repository registration."""
+        parsed_digest = self._parse_enabled_proxy_digest(digest)
         expiration = (
             self._config.expiration_s
             if self._config.expiration_s
@@ -772,13 +916,33 @@ class ProxyModel(OCIModel):
             maximum_blob_size=app.config["MAXIMUM_LAYER_SIZE"],
             committed_blob_expiration=expiration,
         )
-        uploader = create_blob_upload(repo_ref, storage, settings)
-        with self._proxy.get_blob(digest) as resp:
-            start_offset = 0
-            length = int(resp.headers.get("content-length", -1))
-            with complete_when_uploaded(uploader):
+        uploader = create_blob_upload(
+            repo_ref,
+            storage,
+            settings,
+            requested_digest_algorithm=parsed_digest.hash_alg,
+        )
+        if uploader is None:
+            raise BlobUploadException("could not create proxy blob upload")
+        try:
+            with self._proxy.get_blob(digest) as resp:
+                start_offset = 0
+                length = int(resp.headers.get("content-length", -1))
+                uploader.prepare_for_digest(parsed_digest)
                 uploader.upload_chunk(app.config, resp.raw, start_offset, length)
-                uploader.commit_to_blob(app.config, digest)
+                uploader.prefetch_to_storage(app.config, parsed_digest)
+            return uploader
+        except Exception:
+            uploader.cancel_upload()
+            raise
+
+    def _download_blob(self, repo_ref: RepositoryReference, digest: str) -> None:
+        """Download, validate, and repository-register a blob under its upstream identity."""
+        uploader = self._prefetch_blob(repo_ref, digest)
+        with complete_when_uploaded(uploader):
+            committed = uploader.commit_prefetched_blob(digest)
+            if committed is None:
+                raise BlobUploadException("could not commit proxy blob upload")
 
     def convert_manifest(
         self,
@@ -886,17 +1050,34 @@ class ProxyModel(OCIModel):
             upstream_repo_name = parts[1]
         return upstream_repo_name
 
-    def _pull_upstream_manifest(self, repo: str, manifest_ref: str) -> ManifestInterface:
+    def _pull_upstream_manifest(
+        self,
+        repo: str,
+        manifest_ref: str,
+        expected_digest: str | None = None,
+    ) -> ManifestInterface:
+        if expected_digest is not None:
+            self._parse_enabled_proxy_digest(expected_digest)
+
         try:
             raw_manifest, content_type = self._proxy.get_manifest(
-                manifest_ref, ACCEPTED_MEDIA_TYPES
+                manifest_ref,
+                ACCEPTED_MEDIA_TYPES,
+                max_bytes=MAX_PROXY_MANIFEST_SIZE_BYTES,
             )
         except UpstreamAuthError:
             raise
+        except UpstreamManifestTooLargeError as e:
+            raise ProxyManifestSizeExceeded(e.max_bytes) from e
         except UpstreamRegistryError as e:
             if e.status_code == 404:
                 raise ManifestDoesNotExist(str(e))
             raise
+
+        if len(raw_manifest) > MAX_PROXY_MANIFEST_SIZE_BYTES:
+            # Keep the model boundary fail-closed for mocked or alternate Proxy implementations
+            # that return a materialized body instead of honoring Proxy.get_manifest's stream cap.
+            raise ProxyManifestSizeExceeded(MAX_PROXY_MANIFEST_SIZE_BYTES)
 
         upstream_repo_name = self._upstream_repo(repo)
         upstream_namespace = self._upstream_namespace(repo)
@@ -904,6 +1085,19 @@ class ProxyModel(OCIModel):
         # TODO: do we need the compatibility check from v2._parse_manifest?
         mbytes = Bytes.for_string_or_unicode(raw_manifest)
         manifest = parse_manifest_from_bytes(mbytes, content_type, sparse_manifest_support=True)
+        self._validate_proxy_manifest_digests(manifest)
+        if expected_digest is not None:
+            parsed_expected = self._parse_enabled_proxy_digest(expected_digest)
+            computed_digest = (
+                manifest.digest
+                if manifest.schema_version == 1
+                else digest_tools.digest_bytes(
+                    parsed_expected.hash_alg,
+                    mbytes.as_encoded_str(),
+                )
+            )
+            if computed_digest != str(parsed_expected):
+                raise ManifestDoesNotExist("upstream manifest digest mismatch")
         valid = self._validate_schema1_manifest(upstream_namespace, upstream_repo_name, manifest)
         if not valid:
             raise ManifestDoesNotExist("invalid schema 1 manifest")

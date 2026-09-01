@@ -21,6 +21,14 @@ class InvalidBlobUpload(DataModelException):
     pass
 
 
+class BlobDigestConflictException(DataModelException):
+    pass
+
+
+class ManifestDigestConflictException(DataModelException):
+    pass
+
+
 class InvalidEmailAddressException(DataModelException):
     pass
 
