@@ -1984,3 +1984,249 @@ The check was rerun with authenticated readiness polling. With the temporary act
 - Deferred items D1–D8 remain deferred. No deferred item blocked Story 5.
 - No new PostgreSQL or MySQL run was performed because production mount transaction behavior did not change. Existing production-transaction rollback and prior PostgreSQL registration-race evidence remain applicable.
 - No OCI conformance, broad client matrix, mixed-version, mixed-region, object-storage, replication, or production-readiness claim is made.
+
+## Story 6: Mixed-digest multi-architecture images
+
+**Status: Done under the local definition of done. The production implementation was already present. This session added the missing Story 6 regression evidence and delivery documentation only.**
+
+### Configurable-digest end goal and session state
+
+The overall goal remains repository-visible SHA-256, SHA-384, and SHA-512 identities for supported Registry V2 operations while Quay keeps SHA-256 as its canonical internal storage, deduplication, manifest, and graph identity. Alternative identities must be explicitly registered, repository-scoped, hard-disabled by the active allowlist, and never inferred from globally deduplicated canonical rows.
+
+- Worktree: `/Users/shossain/QuayWorkspace/shaon-feature-PQC`
+- Branch: `shaon-feature-PQC`
+- Base and merge base: `d81004d24669132d45df8fbd1eafc86c149e38fa`
+- Starting commit: `844a495009ea9eafb8284ccbbccb2995fd9bd2ee`
+- Starting subject: `NO-ISSUE: test(registry): validate registered digest pulls and mounts`
+- Relevant implementation commit: `139a00109080e0236fe8c73820d5700e5d837508` (`NO-ISSUE: feat(registry): implement configurable digest lifecycle`)
+- Relevant Story 4 and Story 5 evidence commit: `844a495009ea9eafb8284ccbbccb2995fd9bd2ee`
+- Final session commit: the commit containing this Story 6 section. Its exact hash cannot be embedded in its own Git preimage; obtain it with `git rev-parse HEAD`. The final response and next-session prompt record the exact hash.
+- Starting target status: clean, with no staged, unstaged, or untracked target files.
+- The complete `master...HEAD` baseline covered 70 files, 10,610 insertions, and 652 deletions before this session.
+- No reset, restore, rebase, amend, push, remote change, or other-worktree modification occurred.
+
+Story 1 and Story 2 remain independently **In progress**. Story 3, Story 4, Story 5, and Story 6 are **Done**. Story 6 dependency completion does not change Story 1 or Story 2 status.
+
+### Existing production behavior confirmed
+
+No production file changed. Static tracing and focused execution confirmed the existing implementation already provides the following Story 6 behavior:
+
+- Digest-addressed OCI index and Docker manifest-list PUT routes use the shared strict parser, reject malformed, unsupported, and disabled identities, and hash the exact request bytes with the requested algorithm before publication.
+- The endpoint allowlist check runs before repository lookup and manifest cache use. Mirror-managed repositories retain their explicit SHA-256-only ingestion boundary; Story 6 direct registry pushes are not routed through secondary ingestion.
+- Manifest push and pull decorators enforce destination write and repository read authorization before model operations.
+- Parent descriptors are strict-parsed and allowlist-checked at the route boundary. Child resolution then calls `resolve_repository_manifest_descriptor()` with the exact descriptor digest, size, and media type.
+- Child lookup uses `RepositoryManifestDigest` scoped by the target repository. It does not use another repository's registration or a globally matching canonical `Manifest` row.
+- Child descriptor size is compared with exact persisted child bytes. Descriptor media type is compared with the persisted manifest media type before parent graph writes.
+- Every child configuration and layer digest is strict-parsed and allowlist-checked. `_build_blob_map()` resolves it through the target repository's `RepositoryBlobDigest` plus repository relationship. Config reads use the same repository-scoped retriever.
+- Child manifest exact-byte validation occurs when each child is pushed. Parent exact-byte validation occurs before parent parsing can create graph state.
+- `Manifest.digest`, `ImageStorage.content_checksum`, `ManifestChild`, and `ManifestBlob` remain canonical SHA-256 internal identities. External descriptors are preserved byte-for-byte in persisted manifest JSON and are not rewritten to SHA-256.
+- Parent graph persistence, requested parent registration, quota accounting, and all requested tag changes run in the existing outer lifecycle transaction. Registration insertion uses a nested Peewee `atomic()` savepoint, preserving caller work during an idempotent uniqueness race.
+- Unknown children and descriptor mismatches are detected before parent creation. Registration conflicts and quota or tag failures roll back the graph, parent registration, quota effects, and tags. Existing generic quota and forced multi-tag rollback tests cover the same publication transaction.
+- Registration helpers are immutable and idempotent. They return the existing same-content registration and reject remapping to different canonical content.
+- Digest-addressed PUT, GET, and automatic HEAD preserve the requested identity in `Docker-Content-Digest`. PUT locations use the requested digest. Tag GET and HEAD choose an enabled repository-visible registration for the exact parent.
+- Manifest cache keys contain repository ID and requested digest. Blob cache keys contain namespace, repository, full requested digest, and cache version. Missing values are not cached. Disabled algorithms are rejected before cache use.
+- Parent and descendant cache invalidation occurs only after the tag lifecycle transaction commits and traverses nested indexes without crossing repository boundaries.
+- Subsequent child GET/HEAD and config/layer GET/HEAD resolve the exact registered target-repository identities and return exact persisted bytes.
+- Explicit SHA-256 publication remains valid while SHA-256 is enabled. Alternative-only parent, child, config, and layer objects do not expose canonical SHA-256 unless it was explicitly or historically registered.
+- Existing all-SHA-256 manifest-list behavior and normal single-manifest behavior remain on the established paths.
+
+No automatic canonical fallback, cross-repository descriptor resolution, pre-validation parent publication, ignored child size or media-type mismatch, partial parent state after tested failures, registration remap, pre-commit cache invalidation, tag selection of a disabled identity, GET/HEAD identity divergence, or mixed-descriptor rewriting was found.
+
+### Test changes
+
+Only `endpoints/v2/test/test_manifest.py` changed in the target worktree.
+
+- Extended the existing manifest fixture so manifest, configuration, and layer algorithms can be selected independently without changing defaults for existing tests.
+- Extended the digest PUT helper to request a tag during digest-addressed publication.
+- Replaced the narrow SHA-384-root mixed-child test with `test_story6_mixed_digest_multiarchitecture_contract`, parameterized across OCI index and Docker manifest-list media types and SHA-256, SHA-384, and SHA-512 roots.
+- Each case publishes SHA-256, SHA-384, and SHA-512 children. Each child deliberately uses different configuration and layer algorithms.
+- The contract test covers repeated publication, digest and tag GET/HEAD, child GET/HEAD, config and layer GET/HEAD, independent digest verification, requested response identities, requested locations, tag response headers, hidden canonical rejection, explicit SHA-256 success, parent/child/blob repository isolation, pull and push authorization, primed-cache hard-disable, re-enable, canonical graph relationships, requested-only registrations, and one physical placement per canonical blob.
+- Added OCI index and Docker manifest-list descriptor size and media-type mismatch rollback coverage.
+- Added parent registration-conflict rollback coverage while retaining the existing child/single-manifest registration-conflict coverage.
+- Strengthened unknown-child coverage to request a parent tag and prove that no visible tag remains.
+
+No artifact, subject, referrer, proxy-cache, mirror, copy, import, build, Clair, UI, deletion, garbage-collection, conformance, or operational-tool test changed.
+
+### Exact local test commands and outcomes
+
+Baseline before modification:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py::test_sha384_manifest_list_lifecycle_with_mixed_child_identities endpoints/v2/test/test_manifest.py::test_manifest_list_rejects_cross_repository_and_unknown_child endpoints/v2/test/test_manifest.py::test_manifest_registration_conflict_rolls_back_new_graph endpoints/v2/test/test_manifest.py::test_digest_push_with_multiple_tags_rolls_back_atomically endpoints/v2/test/test_manifest.py::test_manifest_reference_digest_errors endpoints/v2/test/test_manifest.py::test_manifest_pull_digest_errors_are_precise_for_get_and_head endpoints/v2/test/test_manifest.py::test_story4_registered_graph_pull_contract`
+
+Result: **17 passed**.
+
+First new focused run:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py::test_story6_mixed_digest_multiarchitecture_contract endpoints/v2/test/test_manifest.py::test_story6_parent_descriptor_mismatch_rolls_back_publication endpoints/v2/test/test_manifest.py::test_story6_parent_registration_conflict_rolls_back_graph_and_tag endpoints/v2/test/test_manifest.py::test_manifest_list_rejects_cross_repository_and_unknown_child`
+
+Result: **6 passed, 6 failed**. All six failures were a new test assertion using the nonexistent `ImageStorageLocation.image_storage` field. The production behavior and every API assertion had passed before that final database assertion. The test now queries `ImageStoragePlacement.storage`, which is the actual placement relationship.
+
+Corrected focused run: the same command resulted in **12 passed**. The post-Black rerun also resulted in **12 passed**.
+
+Complete manifest endpoint file:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py`
+
+Result: **71 passed**.
+
+Complete blob endpoint file:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_blob.py`
+
+Result: **56 passed**.
+
+OCI manifest model file:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/oci/test/test_oci_manifest.py`
+
+Result: **23 passed**.
+
+Registry model interface file:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_interface.py`
+
+Result: **116 passed, 2 skipped**. The skips are the existing PostgreSQL-only blob and manifest registration races. Production transaction code did not change, and those races passed in earlier handoffs.
+
+Existing registry protocol manifest-list and normal single-manifest coverage:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings test/registry/registry_tests.py -k 'manifest_list or basic_push_pull_by_manifest'`
+
+Result: **27 passed, 1,432 deselected**.
+
+Focused pre-commit:
+
+`.venv/bin/pre-commit run --files endpoints/v2/test/test_manifest.py`
+
+First result: **nonzero because Black reformatted the modified test file**. Every other applicable hook passed. The exact command was rerun and **all applicable hooks passed**.
+
+### Live mixed-graph validation
+
+Environment:
+
+- `quay-quay` was running from image `localhost/quay-local:latest`.
+- `/Users/shossain/QuayWorkspace/shaon-feature-PQC` was bind-mounted to `/quay-registry`.
+- The active allowlist was `['sha256', 'sha384', 'sha512']`.
+- regctl 0.11.5 used its existing registry configuration. No credentials, auth file, password, bearer token, or token response was printed.
+- The source repository was `localhost:8080/testuser/pqc-story6-01a05e6b`.
+- The isolated mixed destination was `localhost:8080/testuser/pqc-story6-mixed-01a05e6b`.
+
+Source graph commands:
+
+`regctl image mod busybox:latest --digest-algo sha256 --create localhost:8080/testuser/pqc-story6-01a05e6b:sha256`
+
+`regctl image mod busybox:latest --digest-algo sha384 --create localhost:8080/testuser/pqc-story6-01a05e6b:sha384`
+
+`regctl image mod busybox:latest --digest-algo sha512 --create localhost:8080/testuser/pqc-story6-01a05e6b:sha512`
+
+Result: **all three passed**.
+
+The final live registry verifier was run with:
+
+`cd /Users/shossain/QuayWorkspace/shaon-feature-PQC && .venv/bin/python /tmp/pqc-story6-live.py`
+
+Result: **passed** against the isolated destination. It uploaded only each selected descriptor's requested identity, pushed every selected child by digest, and published the root by SHA-512 digest with tag `mixed`.
+
+Published root:
+
+`sha512:cf4c1bab313a6b3d69f2ed6c09d52361a7d395912a9290cb5635d4a32994d97520c335adc7b7a2eb7c630b4331a5410c17e0cd5c38dd8c52b611a33477d66910`
+
+Selected children:
+
+- SHA-256 amd64: `sha256:1cfa4e2b09e127b9c4ed43578d3f3c18e7d44ea47b9ea98475c0cbe9086525f8`
+- SHA-384 arm64: `sha384:876366e42534dd11e1781685343332853277ccb011606134c7e1379ed6d9f7f9b06fd14008166cccadccfcb93a88dfdb`
+- SHA-512 ppc64le: `sha512:1783ed52b8c19702555d2f46fc23bbf8d6b4b29235c8ede420537417c32b7ac555ff92e71d34cecafd864aa0fbc61a2d35ac71b7853eb22c75b52e274a93cecf`
+
+Live outcomes:
+
+- Root PUT returned HTTP 201, the requested SHA-512 `Docker-Content-Digest`, the requested digest in `Location`, and the committed tag.
+- Root GET and HEAD by digest passed.
+- Root GET and HEAD by tag passed and returned the registered SHA-512 root identity.
+- All three selected child manifests returned exact persisted bytes through their SHA-256, SHA-384, or SHA-512 descriptor identities. GET and HEAD headers matched.
+- Each child's configuration and layer returned exact stored bytes through the descriptor identity. GET and HEAD headers matched.
+- Independent `hashlib.new(descriptor_algorithm, bytes)` verification passed for **10 objects**: one root index, three child manifests, three configurations, and three layers.
+- The persisted root bytes retained the mixed descriptor algorithms and platform order.
+- Unregistered canonical SHA-256 root, alternative child, alternative configuration, and alternative layer identities returned HTTP 404.
+- An explicitly registered SHA-256 child, configuration, and layer remained pullable.
+- The root did not resolve in another repository.
+
+Container database verification command:
+
+`podman cp /tmp/pqc-story6-live-result.json quay-quay:/tmp/pqc-story6-live-result.json && podman cp /tmp/pqc-story6-dbcheck.py quay-quay:/tmp/pqc-story6-dbcheck.py && podman exec quay-quay python /tmp/pqc-story6-dbcheck.py`
+
+Result: **passed**.
+
+Database findings:
+
+- The SHA-512 root maps to canonical `sha256:09f01645845dd0979eb39708dcb7fbec57a4de9a65e6d8a51889e2534fa7e8d9` in `Manifest` row 139.
+- The three selected children map to canonical SHA-256 `Manifest` rows 136, 137, and 138.
+- `ManifestChild` contains exactly three canonical parent-child edges.
+- Each child has canonical `ManifestBlob` edges to its configuration and layer `ImageStorage` rows.
+- Every object in the destination has exactly its explicitly requested repository registration.
+- Every verified blob has one canonical `ImageStorage` row and one physical placement. No alias created a second physical copy.
+
+Hard-disable command outcome:
+
+- `local-dev/stack/config.yaml` was backed up and SHA-256 hashed.
+- SHA-384 was temporarily removed, `quay-quay` was restarted, and authenticated readiness was checked.
+- GET of the registered SHA-384 child returned HTTP 400, code `UNSUPPORTED`, reason `disabled`.
+- The original configuration was restored byte-for-byte and Quay was restarted.
+- Original and restored configuration SHA-256 were both `4de46dadfc727018452ddd490056beb5f5af736e1d0f5751cb8ddb942430731f`.
+- The restored active allowlist was `['sha256', 'sha384', 'sha512']`.
+
+Re-enable verification:
+
+`regctl manifest get localhost:8080/testuser/pqc-story6-mixed-01a05e6b@sha384:876366e42534dd11e1781685343332853277ccb011606134c7e1379ed6d9f7f9b06fd14008166cccadccfcb93a88dfdb --format raw-body > /tmp/pqc-story6-reenabled-child.json`
+
+Result: **passed**. The returned child contained 610 bytes, and independent SHA-384 verification passed.
+
+### Failures and blockers
+
+Product test failures:
+
+- **None.** Every final focused and required regression command passed.
+
+Test-code failure resolved:
+
+- The first new focused run failed only because the new assertion named the wrong placement-model field. Root cause: `ImageStorageLocation` identifies storage backends; `ImageStoragePlacement.storage` is the relation to canonical content. The test now uses the correct model and passes in all six root/media-type cases.
+
+Infrastructure blockers:
+
+- `python3 /tmp/pqc-story6-live.py` initially failed before contacting Quay because the system Python did not have `requests`. The same verifier ran with the target worktree's virtual environment and passed.
+- No infrastructure blocker remained at completion.
+
+Live validation harness corrections:
+
+- The first live hidden-canonical attempt used one repository for all three complete converted source graphs. The full SHA-256 source graph explicitly registered canonical aliases for objects later selected from alternative graphs, so a canonical layer correctly resolved. This was invalid isolation setup, not a product defect. The final destination uploaded only the requested identities and all hidden-canonical checks passed.
+- The next verifier attempt reused a destination-scoped token for the wrong-repository check and received an authorization result before repository lookup. The final check requested the correct pull scope for the isolated repository and received the required HTTP 404.
+
+### Final static checks
+
+Final pre-commit command after the Story 6 documentation update:
+
+`files=$(git diff --name-only --diff-filter=ACMR) && .venv/bin/pre-commit run --files $files`
+
+Result: **all applicable hooks passed** for `HANDOFF.md` and `endpoints/v2/test/test_manifest.py`.
+
+Compilation and whitespace command:
+
+`.venv/bin/python -m compileall -q endpoints/v2/test/test_manifest.py && git diff --check`
+
+Result: **passed** with no output.
+
+The same final pre-commit, compilation, and diff-check commands were rerun after recording these outcomes and passed again.
+
+Targeted mypy was not run because no production Python changed. A live PostgreSQL transaction or concurrency run was not repeated because no production transaction code changed. Existing production-transaction rollback tests passed in the endpoint and interface suites, and prior PostgreSQL registration-race evidence remains applicable.
+
+### Remaining limitations and deferred work
+
+- Story 6 live validation used an OCI index. Docker manifest-list behavior is covered by the same six-case endpoint test matrix and existing registry protocol tests, but a second live Docker manifest-list graph was not published.
+- No new PostgreSQL or MySQL transaction/concurrency run was performed. Production code did not change.
+- No OCI Distribution conformance run, broad client matrix, mixed-version, mixed-region, object-storage, replication, or production packaging claim is made.
+- SHA-384 remains a Quay extension with client-specific interoperability limits.
+- OCI artifacts, subjects, referrers, proxy cache, mirroring, cross-repository complete-image copy, importing, builds, Clair, UI, deletion, garbage collection, and operational tooling remain outside Story 6.
+- Deferred D1–D8 work remains deferred. No deferred item blocked Story 6.
+- Live repositories and source content created for Story 6 remain available for inspection. Their cleanup belongs to later lifecycle stories; this session did not invoke deletion or garbage collection.
+
+### Recommended next story
+
+Proceed with **Story 7: Push and pull OCI artifacts with registered digest identities**. Start by reading this file completely, then inspect the explicit alternative artifact and subject boundary in `endpoints/v2/manifest.py`, canonical subject resolution and descriptor validation in `data/model/oci/manifest.py`, response datatypes and graph persistence in `data/registry_model/registry_oci_model.py`, and existing artifact tests in `endpoints/v2/test/test_manifest.py`. Do not include Story 8 referrer discovery unless Story 7 cannot be made correct without it. Preserve repository-scoped registrations and hidden canonical identities, and keep Story 1 and Story 2 status unchanged.

@@ -16,9 +16,11 @@ from data.cache.test.test_cache import TEST_CACHE_CONFIG
 from data.database import (
     ImageStorage,
     ImageStorageLocation,
+    ImageStoragePlacement,
     Manifest,
     ManifestBlob,
     ManifestChild,
+    RepositoryBlobDigest,
     RepositoryManifestDigest,
     Tag,
     db,
@@ -88,7 +90,11 @@ def _sha512_single_manifest(
     repository_name,
     layer_bytes=b"alternative digest manifest layer",
     algorithm="sha512",
+    config_algorithm=None,
+    layer_algorithm=None,
 ):
+    config_algorithm = config_algorithm or algorithm
+    layer_algorithm = layer_algorithm or algorithm
     config_bytes = json.dumps(
         {
             "architecture": "amd64",
@@ -107,10 +113,10 @@ def _sha512_single_manifest(
         separators=(",", ":"),
     ).encode("utf-8")
     config_blob, config_digest = _store_registered_manifest_blob(
-        repository_name, config_bytes, algorithm
+        repository_name, config_bytes, config_algorithm
     )
     layer_blob, layer_digest = _store_registered_manifest_blob(
-        repository_name, layer_bytes, algorithm
+        repository_name, layer_bytes, layer_algorithm
     )
     manifest_bytes = json.dumps(
         {
@@ -215,13 +221,23 @@ def _oci_artifact(
     return artifact
 
 
-def _put_manifest(client, repository, manifest_ref, manifest_info, expected_code=201):
+def _put_manifest(
+    client,
+    repository,
+    manifest_ref,
+    manifest_info,
+    expected_code=201,
+    tag=None,
+):
+    params = {"repository": repository, "manifest_ref": manifest_ref}
+    if tag is not None:
+        params["tag"] = tag
     return conduct_call(
         client,
         "v2.write_manifest_by_digest",
         url_for,
         "PUT",
-        {"repository": repository, "manifest_ref": manifest_ref},
+        params,
         expected_code=expected_code,
         headers={
             **_manifest_auth_headers(repository),
@@ -1830,6 +1846,7 @@ def test_manifest_exact_byte_mismatch_and_malformed_descriptor_errors(algorithm,
     assert malformed_error["detail"]["reason"] == "malformed"
 
 
+@pytest.mark.parametrize("root_algorithm", ["sha256", "sha384", "sha512"])
 @pytest.mark.parametrize(
     "parent_media_type",
     [
@@ -1837,14 +1854,49 @@ def test_manifest_exact_byte_mismatch_and_malformed_descriptor_errors(algorithm,
         "application/vnd.docker.distribution.manifest.list.v2+json",
     ],
 )
-def test_sha384_manifest_list_lifecycle_with_mixed_child_identities(parent_media_type, client, app):
+def test_story6_mixed_digest_multiarchitecture_contract(
+    root_algorithm, parent_media_type, client, app
+):
     repository = "devtable/simple"
-    sha384_child = _sha512_single_manifest(repository, b"sha384 child", algorithm="sha384")
-    sha512_child = _sha512_single_manifest(repository, b"sha512 child", algorithm="sha512")
-    canonical_child = _sha512_single_manifest(repository, b"canonical child")
-    for child in (sha384_child, sha512_child, canonical_child):
-        child["media_type"] = DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE
-    headers = _manifest_auth_headers(repository)
+    other_repository = "devtable/complex"
+    tag_name = f"story6-{root_algorithm}-{parent_media_type.split('.')[-2].replace('+json', '')}"
+    child_specs = [
+        ("sha256", "sha384", "sha512", "amd64"),
+        ("sha384", "sha512", "sha256", "arm64"),
+        ("sha512", "sha256", "sha384", "ppc64le"),
+    ]
+    children = []
+    for manifest_algorithm, config_algorithm, layer_algorithm, architecture in child_specs:
+        child = _sha512_single_manifest(
+            repository,
+            f"{parent_media_type}-{root_algorithm}-{manifest_algorithm}".encode("utf-8"),
+            algorithm=manifest_algorithm,
+            config_algorithm=config_algorithm,
+            layer_algorithm=layer_algorithm,
+        )
+        child.update(
+            media_type=DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE,
+            descriptor_digest=child["external_digest"],
+            architecture=architecture,
+        )
+        children.append(child)
+
+    parent = _manifest_index(
+        children,
+        media_type=parent_media_type,
+        algorithm=root_algorithm,
+    )
+    auth_headers = _manifest_auth_headers(repository)
+    parent_headers = {
+        **auth_headers,
+        "Content-Type": parent_media_type,
+        "Accept": parent_media_type,
+    }
+    child_headers = {
+        **auth_headers,
+        "Content-Type": DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE,
+        "Accept": DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE,
+    }
     test_cache = InMemoryDataModelCache(TEST_CACHE_CONFIG)
 
     with (
@@ -1853,144 +1905,452 @@ def test_sha384_manifest_list_lifecycle_with_mixed_child_identities(parent_media
             {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384", "sha512"]},
         ),
         patch("endpoints.v2.manifest.model_cache", test_cache),
+        patch("endpoints.v2.blob.model_cache", test_cache),
     ):
-        _put_manifest(client, repository, sha384_child["external_digest"], sha384_child)
-        _put_manifest(client, repository, sha512_child["external_digest"], sha512_child)
-        conduct_call(
-            client,
-            "v2.write_manifest_by_tagname",
-            url_for,
-            "PUT",
-            {"repository": repository, "manifest_ref": "canonical-child"},
-            expected_code=201,
-            headers={
-                **headers,
-                "Content-Type": DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE,
-            },
-            raw_body=canonical_child["bytes"],
-        )
-        parent = _manifest_index(
-            [
-                {
-                    **sha384_child,
-                    "descriptor_digest": sha384_child["external_digest"],
-                    "architecture": "amd64",
-                },
-                {
-                    **sha512_child,
-                    "descriptor_digest": sha512_child["external_digest"],
-                    "architecture": "arm64",
-                },
-                {
-                    **canonical_child,
-                    "descriptor_digest": canonical_child["canonical_digest"],
-                    "architecture": "ppc64le",
-                },
-            ],
-            media_type=parent_media_type,
-            algorithm="sha384",
-        )
+        for child in children:
+            _put_manifest(client, repository, child["external_digest"], child)
 
         for _ in range(2):
-            response = _put_manifest(client, repository, parent["external_digest"], parent)
+            response = _put_manifest(
+                client,
+                repository,
+                parent["external_digest"],
+                parent,
+                tag=tag_name,
+            )
             assert response.headers["Docker-Content-Digest"] == parent["external_digest"]
             assert response.headers["Location"].endswith("/manifests/" + parent["external_digest"])
+            assert response.headers.getlist("OCI-Tag") == [tag_name]
 
-        for method in ("GET", "HEAD"):
-            response = conduct_call(
+        parent_paths = [
+            ("v2.fetch_manifest_by_digest", parent["external_digest"]),
+            ("v2.fetch_manifest_by_tagname", tag_name),
+        ]
+        for endpoint, manifest_ref in parent_paths:
+            for method in ("GET", "HEAD"):
+                response = conduct_call(
+                    client,
+                    endpoint,
+                    url_for,
+                    method,
+                    {"repository": repository, "manifest_ref": manifest_ref},
+                    expected_code=200,
+                    headers=parent_headers.copy(),
+                )
+                assert response.headers["Docker-Content-Digest"] == parent["external_digest"]
+                assert response.headers["Content-Type"] == parent_media_type
+                assert response.data == (parent["bytes"] if method == "GET" else b"")
+                if method == "GET":
+                    assert (
+                        f"{root_algorithm}:"
+                        + hashlib.new(root_algorithm, response.data).hexdigest()
+                        == parent["external_digest"]
+                    )
+
+        for child in children:
+            child_algorithm = child["external_digest"].partition(":")[0]
+            for method in ("GET", "HEAD"):
+                response = conduct_call(
+                    client,
+                    "v2.fetch_manifest_by_digest",
+                    url_for,
+                    method,
+                    {"repository": repository, "manifest_ref": child["external_digest"]},
+                    expected_code=200,
+                    headers=child_headers.copy(),
+                )
+                assert response.headers["Docker-Content-Digest"] == child["external_digest"]
+                assert response.data == (child["bytes"] if method == "GET" else b"")
+                if method == "GET":
+                    assert (
+                        f"{child_algorithm}:"
+                        + hashlib.new(child_algorithm, response.data).hexdigest()
+                        == child["external_digest"]
+                    )
+
+            for blob in child["referenced_blobs"]:
+                blob_algorithm = blob["external_digest"].partition(":")[0]
+                for method, endpoint in (
+                    ("GET", "v2.download_blob"),
+                    ("HEAD", "v2.check_blob_exists"),
+                ):
+                    response = conduct_call(
+                        client,
+                        endpoint,
+                        url_for,
+                        method,
+                        {"repository": repository, "digest": blob["external_digest"]},
+                        expected_code=200,
+                        headers=auth_headers.copy(),
+                    )
+                    assert response.headers["Docker-Content-Digest"] == blob["external_digest"]
+                    assert response.data == (blob["bytes"] if method == "GET" else b"")
+                    if method == "GET":
+                        assert (
+                            f"{blob_algorithm}:"
+                            + hashlib.new(blob_algorithm, response.data).hexdigest()
+                            == blob["external_digest"]
+                        )
+
+        hidden_manifest_identities = [
+            item["canonical_digest"]
+            for item in [parent, *children]
+            if item["canonical_digest"] != item["external_digest"]
+        ]
+        for hidden_digest in hidden_manifest_identities:
+            for method in ("GET", "HEAD"):
+                conduct_call(
+                    client,
+                    "v2.fetch_manifest_by_digest",
+                    url_for,
+                    method,
+                    {"repository": repository, "manifest_ref": hidden_digest},
+                    expected_code=404,
+                    headers=auth_headers.copy(),
+                )
+
+        hidden_blobs = [
+            blob
+            for child in children
+            for blob in child["referenced_blobs"]
+            if blob["canonical_digest"] != blob["external_digest"]
+        ]
+        for blob in hidden_blobs:
+            for method, endpoint in (
+                ("GET", "v2.download_blob"),
+                ("HEAD", "v2.check_blob_exists"),
+            ):
+                conduct_call(
+                    client,
+                    endpoint,
+                    url_for,
+                    method,
+                    {"repository": repository, "digest": blob["canonical_digest"]},
+                    expected_code=404,
+                    headers=auth_headers.copy(),
+                )
+
+        isolated_paths = [
+            ("v2.fetch_manifest_by_digest", {"manifest_ref": parent["external_digest"]}),
+            ("v2.fetch_manifest_by_digest", {"manifest_ref": children[1]["external_digest"]}),
+            ("v2.download_blob", {"digest": children[2]["referenced_blobs"][0]["external_digest"]}),
+        ]
+        for endpoint, params in isolated_paths:
+            for method in ("GET", "HEAD"):
+                conduct_call(
+                    client,
+                    endpoint,
+                    url_for,
+                    method,
+                    {"repository": other_repository, **params},
+                    expected_code=404,
+                    headers=_manifest_auth_headers(other_repository, actions=("pull",)),
+                )
+
+        for endpoint, params in isolated_paths:
+            for method in ("GET", "HEAD"):
+                conduct_call(
+                    client,
+                    endpoint,
+                    url_for,
+                    method,
+                    {"repository": repository, **params},
+                    expected_code=401,
+                    headers={"Accept": parent_media_type},
+                )
+
+        conduct_call(
+            client,
+            "v2.write_manifest_by_digest",
+            url_for,
+            "PUT",
+            {
+                "repository": repository,
+                "manifest_ref": parent["external_digest"],
+                "tag": "unauthorized-story6",
+            },
+            expected_code=401,
+            headers={
+                **_manifest_auth_headers(repository, actions=("pull",)),
+                "Content-Type": parent_media_type,
+            },
+            raw_body=parent["bytes"],
+        )
+
+        with patch.dict(
+            realapp.config,
+            {
+                "ALLOWED_HASH_ALGORITHMS": [
+                    algorithm
+                    for algorithm in ("sha256", "sha384", "sha512")
+                    if algorithm != root_algorithm
+                ]
+            },
+        ):
+            disabled = conduct_call(
                 client,
                 "v2.fetch_manifest_by_digest",
                 url_for,
-                method,
+                "GET",
                 {"repository": repository, "manifest_ref": parent["external_digest"]},
-                expected_code=200,
-                headers={**headers, "Accept": parent_media_type},
+                expected_code=400,
+                headers=auth_headers.copy(),
             )
-            assert response.headers["Docker-Content-Digest"] == parent["external_digest"]
-            assert response.headers["Content-Type"] == parent_media_type
-            assert response.data == (parent["bytes"] if method == "GET" else b"")
+            assert disabled.get_json()["errors"][0]["detail"] == {
+                "algorithm": root_algorithm,
+                "reason": "disabled",
+            }
+            conduct_call(
+                client,
+                "v2.fetch_manifest_by_digest",
+                url_for,
+                "HEAD",
+                {"repository": repository, "manifest_ref": parent["external_digest"]},
+                expected_code=400,
+                headers=auth_headers.copy(),
+            )
 
-        conduct_call(
-            client,
-            "v2.fetch_manifest_by_digest",
-            url_for,
-            "GET",
-            {"repository": repository, "manifest_ref": parent["canonical_digest"]},
-            expected_code=404,
-            headers=headers.copy(),
-        )
-        conduct_call(
-            client,
-            "v2.fetch_manifest_by_digest",
-            url_for,
-            "GET",
-            {
-                "repository": "devtable/complex",
-                "manifest_ref": parent["external_digest"],
-            },
-            expected_code=404,
-            headers=_manifest_auth_headers("devtable/complex", actions=("pull",)),
-        )
-
-        response = conduct_call(
-            client,
-            "v2.write_manifest_by_tagname",
-            url_for,
-            "PUT",
-            {"repository": repository, "manifest_ref": "multi-platform"},
-            expected_code=201,
-            headers={**headers, "Content-Type": parent_media_type},
-            raw_body=parent["bytes"],
-        )
-        assert response.headers["Docker-Content-Digest"] == parent["canonical_digest"]
-
-        parent_row = Manifest.get(digest=parent["canonical_digest"])
-        Tag.update(lifetime_end_ms=int(time.time() * 1000)).where(
-            Tag.manifest == parent_row, Tag.hidden == True
-        ).execute()
-        conduct_call(
-            client,
-            "v2.delete_manifest_by_digest",
-            url_for,
-            "DELETE",
-            {"repository": repository, "manifest_ref": parent["external_digest"]},
-            expected_code=202,
-            headers=headers.copy(),
-        )
         conduct_call(
             client,
             "v2.fetch_manifest_by_digest",
             url_for,
             "GET",
             {"repository": repository, "manifest_ref": parent["external_digest"]},
-            expected_code=404,
-            headers=headers.copy(),
+            expected_code=200,
+            headers=parent_headers.copy(),
         )
 
     repository_row = model.repository.get_repository("devtable", "simple")
-    parent_row = Manifest.get(
-        repository=repository_row,
-        digest=parent["canonical_digest"],
-    )
-    child_ids = {
+    parent_row = Manifest.get(repository=repository_row, digest=parent["canonical_digest"])
+    child_rows = {
+        child["canonical_digest"]: Manifest.get(
+            repository=repository_row,
+            digest=child["canonical_digest"],
+        )
+        for child in children
+    }
+    assert {
         relationship.child_manifest_id
         for relationship in ManifestChild.select().where(
             ManifestChild.repository == repository_row,
             ManifestChild.manifest == parent_row,
         )
-    }
-    assert child_ids == {
-        Manifest.get(repository=repository_row, digest=sha384_child["canonical_digest"]).id,
-        Manifest.get(repository=repository_row, digest=sha512_child["canonical_digest"]).id,
-        Manifest.get(repository=repository_row, digest=canonical_child["canonical_digest"]).id,
-    }
+    } == {child.id for child in child_rows.values()}
+    assert (
+        Tag.get(repository=repository_row, name=tag_name, lifetime_end_ms=None).manifest
+        == parent_row
+    )
     assert {
         registration.digest
         for registration in RepositoryManifestDigest.select().where(
             RepositoryManifestDigest.repository == repository_row,
             RepositoryManifestDigest.manifest == parent_row,
         )
-    } == {parent["canonical_digest"], parent["external_digest"]}
+    } == {parent["external_digest"]}
+
+    for child in children:
+        child_row = child_rows[child["canonical_digest"]]
+        assert {
+            registration.digest
+            for registration in RepositoryManifestDigest.select().where(
+                RepositoryManifestDigest.repository == repository_row,
+                RepositoryManifestDigest.manifest == child_row,
+            )
+        } == {child["external_digest"]}
+        assert {
+            relationship.blob_id
+            for relationship in ManifestBlob.select().where(
+                ManifestBlob.repository == repository_row,
+                ManifestBlob.manifest == child_row,
+            )
+        } == child["blob_ids"]
+        for blob in child["referenced_blobs"]:
+            blob_row = ImageStorage.get(content_checksum=blob["canonical_digest"])
+            assert {
+                registration.digest
+                for registration in RepositoryBlobDigest.select().where(
+                    RepositoryBlobDigest.repository == repository_row,
+                    RepositoryBlobDigest.image_storage == blob_row,
+                )
+            } == {blob["external_digest"]}
+            assert (
+                ImageStorage.select()
+                .where(ImageStorage.content_checksum == blob["canonical_digest"])
+                .count()
+                == 1
+            )
+            assert (
+                ImageStoragePlacement.select()
+                .where(ImageStoragePlacement.storage == blob_row)
+                .count()
+                == 1
+            )
+
+
+@pytest.mark.parametrize(
+    "parent_media_type",
+    [
+        OCI_IMAGE_INDEX_CONTENT_TYPE,
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+    ],
+)
+@pytest.mark.parametrize(
+    "mismatch_field,expected_field",
+    [("size", "size"), ("mediaType", "media type")],
+)
+def test_story6_parent_descriptor_mismatch_rolls_back_publication(
+    parent_media_type, mismatch_field, expected_field, client, app
+):
+    repository = "devtable/simple"
+    tag_name = f"story6-mismatch-{mismatch_field}-{parent_media_type.split('.')[-2]}"
+    child = _sha512_single_manifest(
+        repository,
+        b"story6 descriptor mismatch child",
+        algorithm="sha384",
+        config_algorithm="sha512",
+        layer_algorithm="sha256",
+    )
+    child.update(
+        media_type=DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE,
+        descriptor_digest=child["external_digest"],
+        architecture="amd64",
+    )
+    parent = _manifest_index([child], media_type=parent_media_type, algorithm="sha512")
+    parent_dict = json.loads(parent["bytes"])
+    if mismatch_field == "size":
+        parent_dict["manifests"][0]["size"] += 1
+    else:
+        parent_dict["manifests"][0]["mediaType"] = (
+            OCI_IMAGE_MANIFEST_CONTENT_TYPE
+            if parent_media_type == OCI_IMAGE_INDEX_CONTENT_TYPE
+            else DOCKER_SCHEMA1_MANIFEST_CONTENT_TYPE
+        )
+    parent["bytes"] = json.dumps(parent_dict, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    parent["canonical_digest"] = "sha256:" + hashlib.sha256(parent["bytes"]).hexdigest()
+    parent["external_digest"] = "sha512:" + hashlib.sha512(parent["bytes"]).hexdigest()
+
+    with patch.dict(
+        realapp.config,
+        {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384", "sha512"]},
+    ):
+        _put_manifest(client, repository, child["external_digest"], child)
+        response = _put_manifest(
+            client,
+            repository,
+            parent["external_digest"],
+            parent,
+            expected_code=400,
+            tag=tag_name,
+        )
+
+    error = response.get_json()["errors"][0]
+    assert error["code"] == "MANIFEST_INVALID"
+    assert error["detail"] == {
+        "digest": child["external_digest"],
+        "reason": "descriptor_mismatch",
+        "field": expected_field,
+    }
+    repository_row = model.repository.get_repository("devtable", "simple")
+    assert (
+        not Manifest.select()
+        .where(
+            Manifest.repository == repository_row,
+            Manifest.digest == parent["canonical_digest"],
+        )
+        .exists()
+    )
+    assert (
+        not RepositoryManifestDigest.select()
+        .where(
+            RepositoryManifestDigest.repository == repository_row,
+            RepositoryManifestDigest.digest == parent["external_digest"],
+        )
+        .exists()
+    )
+    assert (
+        not Tag.select()
+        .where(
+            Tag.repository == repository_row,
+            Tag.name == tag_name,
+            Tag.lifetime_end_ms.is_null(True),
+        )
+        .exists()
+    )
+
+
+def test_story6_parent_registration_conflict_rolls_back_graph_and_tag(client, app):
+    repository = "devtable/simple"
+    tag_name = "story6-parent-conflict"
+    child = _sha512_single_manifest(
+        repository,
+        b"story6 parent conflict child",
+        algorithm="sha384",
+        config_algorithm="sha512",
+        layer_algorithm="sha256",
+    )
+    child.update(
+        media_type=DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE,
+        descriptor_digest=child["external_digest"],
+        architecture="amd64",
+    )
+    parent = _manifest_index([child], algorithm="sha512")
+    repository_row = model.repository.get_repository("devtable", "simple")
+    existing_tag = registry_model.get_repo_tag(
+        registry_model.lookup_repository("devtable", "simple"), "latest"
+    )
+    existing_manifest = Manifest.get_by_id(existing_tag.manifest.id)
+
+    with patch.dict(
+        realapp.config,
+        {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384", "sha512"]},
+    ):
+        _put_manifest(client, repository, child["external_digest"], child)
+        RepositoryManifestDigest.create(
+            repository=repository_row,
+            manifest=existing_manifest,
+            digest=parent["external_digest"],
+        )
+        previous_transaction_factory = db_transaction.obj
+        db_transaction.initialize(lambda: db.transaction())
+        try:
+            response = _put_manifest(
+                client,
+                repository,
+                parent["external_digest"],
+                parent,
+                expected_code=400,
+                tag=tag_name,
+            )
+        finally:
+            db_transaction.initialize(previous_transaction_factory)
+
+    error = response.get_json()["errors"][0]
+    assert error["code"] == "DIGEST_INVALID"
+    assert error["detail"]["reason"] == "conflict"
+    assert (
+        RepositoryManifestDigest.get(
+            repository=repository_row,
+            digest=parent["external_digest"],
+        ).manifest
+        == existing_manifest
+    )
+    assert (
+        not Manifest.select()
+        .where(
+            Manifest.repository == repository_row,
+            Manifest.digest == parent["canonical_digest"],
+        )
+        .exists()
+    )
+    assert (
+        not Tag.select()
+        .where(
+            Tag.repository == repository_row,
+            Tag.name == tag_name,
+            Tag.lifetime_end_ms.is_null(True),
+        )
+        .exists()
+    )
 
 
 def test_manifest_list_rejects_cross_repository_and_unknown_child(client, app):
@@ -2019,6 +2379,7 @@ def test_manifest_list_rejects_cross_repository_and_unknown_child(client, app):
             parent["external_digest"],
             parent,
             expected_code=400,
+            tag="story6-unknown-child",
         )
 
     error = response.get_json()["errors"][0]
@@ -2041,6 +2402,15 @@ def test_manifest_list_rejects_cross_repository_and_unknown_child(client, app):
         .where(
             RepositoryManifestDigest.repository == repository,
             RepositoryManifestDigest.digest == parent["external_digest"],
+        )
+        .exists()
+    )
+    assert (
+        not Tag.select()
+        .where(
+            Tag.repository == repository,
+            Tag.name == "story6-unknown-child",
+            Tag.lifetime_end_ms.is_null(True),
         )
         .exists()
     )
