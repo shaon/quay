@@ -23,13 +23,15 @@ The feature supports repository-visible SHA-256, SHA-384, and SHA-512 identities
 - Branch: `shaon-feature-PQC`
 - Base branch: `master`
 - Base and merge base: `d81004d24669132d45df8fbd1eafc86c149e38fa`
-- Pre-Story 8 HEAD: `294089883c859342c8e7470c94a346bee5b2adad`
-- Pre-Story 8 subject: `NO-ISSUE: docs(registry): compact configurable-digest handoff`
+- Pre-Story 10 HEAD: `229069a0180a43f36f89d25f34a5bd72ad7dab7f`
+- Pre-Story 10 subject: `NO-ISSUE: docs(registry): defer external-registry digest work`
 - Story 7 implementation: `b59c747e7482f174dee81508dd3aca363ef7d7e6`
 - Story 8 implementation: `bc21299727b875af15fa67a689677e69b9f688ff`
-- The external-registry deferral is committed with subject `NO-ISSUE: docs(registry): defer external-registry digest work`. Its hash cannot be embedded in its own Git preimage; use `git rev-parse HEAD` and verify the subject.
-- Expected target status after the deferral commit: clean, with no staged, unstaged, or untracked files.
-- The planning repository had unrelated modified and untracked files before this update. This deferral update changed only the `Deferred` status definition, the Story 9, Story 11, and Story 12 status cells, and the external-registry scope note in `TODO.md`. The planning repository was not committed.
+- External-registry deferral: `229069a0180a43f36f89d25f34a5bd72ad7dab7f`
+- Story 10 changes add endpoint coverage and this handoff; no production file, schema, migration, configuration, proxy, mirror, or import path changed.
+- Story 10 validation is committed with subject `NO-ISSUE: test(registry): validate same-Quay digest copy`. Its hash cannot be embedded in its own Git preimage; use `git rev-parse HEAD` and verify the subject.
+- Expected target status after the Story 10 commit: clean, with no staged, unstaged, or untracked files.
+- The planning repository had unrelated modified and untracked files before this update. This session changed only its current-session `.PITASKS.md` section, Story 10 scope in `PQC-Features.md`, and Story 10 status and evidence in `TODO.md`. The planning repository was not committed.
 
 ## Delivery status
 
@@ -42,7 +44,10 @@ The feature supports repository-visible SHA-256, SHA-384, and SHA-512 identities
 - Story 7: **Done**.
 - Story 8: **Done**.
 - Story 9: **Deferred** by delivery-scope decision; no Story 9 code is present.
-- Recommended next work: **Story 10, limited to copies between repositories managed by this Quay deployment**.
+- Story 10: **Done**, limited to client-mediated copies between normal repositories managed by this Quay deployment.
+- Story 11: **Deferred** with repository and organization mirroring.
+- Story 12: **Deferred** with external image import.
+- Recommended next work: **Story 13, preserve SHA-256 compatibility for legacy registry content**.
 
 Do not change Story 1 or Story 2 merely because later stories depend on their behavior.
 
@@ -59,7 +64,7 @@ Do not change Story 1 or Story 2 merely because later stories depend on their be
 9. Cache invalidation happens only after lifecycle transactions commit.
 10. Mirror-managed repositories retain their existing SHA-256-only ingestion boundary until a later story changes it.
 
-## Completed behavior through Story 8
+## Completed behavior through Story 10
 
 ### Stories 1-6 foundations
 
@@ -96,6 +101,16 @@ Do not change Story 1 or Story 2 merely because later stories depend on their be
 - Fallback-index tag publication resolves only visible digest-derived subject tags and invalidates every visible alias after commit. It invalidates artifact types from both previous and current fallback indexes.
 - Existing SHA-256 discovery, filtering, authorization, publication, pull, and protocol behavior remain intact.
 
+### Story 10 same-Quay copy
+
+- A client can copy a complete mixed-digest image graph between normal repositories on this Quay deployment through standard Registry V2 requests.
+- Source tag resolution selects one deterministic enabled root identity. Digest-addressed child and root publication preserves the identities carried by the selected graph.
+- Cross-repository mounts reuse canonical `ImageStorage` and placements while registering only the requested blob identity at the destination.
+- The copied destination graph retains canonical SHA-256 internally while alternative-only canonical identities remain hidden.
+- Unrelated source manifest and blob aliases are not propagated to the destination.
+- Repeated mount and publication requests are idempotent. Existing authorization, repository isolation, conflict rollback, and hard-disable contracts apply unchanged.
+- Mirror-managed repositories remain SHA-256-only. Mirror workers, external registries, proxy cache, import, and artifact-copy variations are outside Story 10.
+
 ## Story 8 root causes and changed files
 
 The unfinished behavior had six causes:
@@ -122,6 +137,17 @@ Test files changed:
 - `data/cache/test/test_cache.py`
 
 `data/registry_model/datatypes.py` and publication persistence were traced but required no Story 8 change. No schema or migration changed.
+
+## Story 10 result and changed files
+
+No production-code gap was found. The existing blob mount, digest-addressed manifest publication, `OCI-Tag`, graph persistence, and repository-scoped registration paths already compose into a correct same-deployment copy.
+
+Target-worktree files changed:
+
+- `endpoints/v2/test/test_manifest.py`
+- `HANDOFF.md`
+
+The planning repository also received the scoped Story 10 updates described under repository state. No schema or migration changed.
 
 ## Verification evidence
 
@@ -175,6 +201,32 @@ SHA-256 registry protocol push/pull regression:
 
 Result: **3 passed, 1,456 deselected**.
 
+### Story 10 tests
+
+Focused same-Quay copy contract:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py -k story10`
+
+Result: **1 passed, 84 deselected**.
+
+Complete manifest and blob endpoint suites:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py endpoints/v2/test/test_blob.py`
+
+Result: **141 passed**.
+
+Complete registry interface suite:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_interface.py`
+
+Result: **120 passed, 2 skipped**. The skips remain the PostgreSQL-only registration race tests that passed in earlier sessions.
+
+Relevant SHA-256 registry protocol push, pull, and mount coverage:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings test/registry/registry_tests.py -k 'test_basic_push_pull_by_manifest or blob_mount'`
+
+Result: **255 passed, 1,204 deselected**.
+
 ### Static checks
 
 Pre-commit passed over every Story 8 target-worktree file. Earlier passes reformatted Python with Black; the final pass made no changes.
@@ -190,6 +242,8 @@ Compilation and whitespace:
 `.venv/bin/python -m compileall -q data/cache/cache_key.py data/cache/test/test_cache.py data/model/oci/manifest.py data/registry_model/registry_oci_model.py data/registry_model/test/test_interface.py endpoints/v2/manifest.py endpoints/v2/referrers.py endpoints/v2/test/test_manifest.py && git diff --check && git diff --check master`
 
 Result: **passed**.
+
+Story 10 pre-commit passed for `endpoints/v2/test/test_manifest.py` after the first Black pass reformatted the file. Python compilation and `git diff --check` also passed.
 
 ## Live Story 8 validation
 
@@ -224,11 +278,26 @@ Live outcomes:
 
 The first live attempt failed because the temporary script supplied an invalid OCI image config; that was a validation-script defect. The second attempt identified the real 128-character route limit for SHA-512 fallback tags. The final flow passed after the narrow route fix. Live repositories were not deleted because lifecycle cleanup is outside Story 8.
 
+## Live Story 10 validation
+
+The local Quay container was bind-mounted from the target worktree and used `ALLOWED_HASH_ALGORITHMS: ['sha256', 'sha384', 'sha512']`. `regctl` 0.11.5 copied the existing source `localhost:8080/testuser/pqc-story4:sha512` to `localhost:8080/testuser/pqc-story10-1788297397:copy` on the same deployment with forced recursive traversal.
+
+Live outcomes:
+
+- Source and destination returned the same SHA-512 root: `sha512:0bd23dcfecb44322dd952511fc3c392f2eb652f3eb6dac7c352156a43b782a957b8cf23b26633bffc66c56acbdb82e6f805501661cd55b011e01673a4a72963c`.
+- Source and destination root manifest bytes were identical.
+- Independent hashing verified 52 unique objects: one index, 17 child manifests, 17 configurations, and 17 layers.
+- The destination had 18 SHA-512 manifest registrations and 34 SHA-512 blob registrations.
+- Every destination blob registration referenced the same `ImageStorage` row as its source registration. No copied blob required another physical object.
+- The unregistered canonical SHA-256 root and a sampled canonical SHA-256 blob remained inaccessible at the destination.
+
+The first live health probe hung while the long-running local container was otherwise present. Restarting only `quay-quay` restored service. The first read-only database inspection script omitted application initialization and failed before querying; the corrected script passed. These were environment and validation-script issues, not copy failures. The live repository was not deleted because repository cleanup remains later lifecycle work.
+
 ## Active limitations and deferred work
 
 - Proxy cache, repository mirroring, organization mirroring, external image import, and all related external-registry or live interoperability validation are explicitly deferred until reassigned.
 - Story 9 remains unimplemented. A partial Story 9 attempt was fully reverted before this handoff update.
-- Complete-image copy is limited to repositories managed by the same Quay deployment while the external-registry deferral is active.
+- Complete-image copy is supported only between normal repositories managed by the same Quay deployment while the external-registry deferral is active. Artifact-copy and referrer-copy variations remain unvalidated.
 - Builds, Clair, UI, deletion, garbage collection, conformance, and operational tooling remain later stories.
 - Full blob unlink, upload expiration, repository or namespace deletion, registration cleanup, and physical orphan cleanup remain lifecycle work.
 - PostgreSQL registration races passed in earlier sessions; MySQL concurrency remains unrun.
@@ -239,6 +308,6 @@ The first live attempt failed because the temporary script supplied an invalid O
 
 ## Recommended next story
 
-Proceed with **Story 10: preserve digest identities when copying content between repositories**, limited to source and destination repositories managed by the same Quay deployment.
+Proceed with **Story 13: preserve SHA-256 compatibility for legacy registry content**.
 
-Do not include proxy cache, external-registry copy, repository mirroring, organization mirroring, external image import, or live external-registry validation. Those surfaces remain deferred until explicitly reassigned. Preserve Story 8 alias resolution, fallback discovery, cache invalidation, authorization, repository isolation, deterministic descriptor selection, and hidden-canonical behavior.
+Evaluate the existing lazy legacy fallback and registration behavior independently. Preserve enabled legacy SHA-256 pulls and tags, materialize registrations only where required by the agreed contract, keep alternative registrations from hiding historically valid SHA-256 content, and enforce hard-disable without deleting canonical bytes. Do not expand into deletion, garbage collection, schema 1 alternatives, API, UI, Clair, build, mirror, proxy, import, or operational-tool stories.

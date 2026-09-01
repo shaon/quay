@@ -69,6 +69,31 @@ def _manifest_auth_headers(repository, actions=("pull", "push"), username="devta
     return {"Authorization": "Bearer %s" % token}
 
 
+def _copy_auth_headers(source_repository, destination_repository, username="devtable"):
+    user = model.user.get_user(username)
+    context, subject = build_context_and_subject(ValidatedAuthContext(user=user))
+    token = generate_bearer_token(
+        realapp.config["SERVER_HOSTNAME"],
+        subject,
+        context,
+        [
+            {
+                "type": "repository",
+                "name": source_repository,
+                "actions": ["pull"],
+            },
+            {
+                "type": "repository",
+                "name": destination_repository,
+                "actions": ["pull", "push"],
+            },
+        ],
+        600,
+        instance_keys,
+    )
+    return {"Authorization": "Bearer %s" % token}
+
+
 def _store_registered_manifest_blob(repository_name, content, algorithm="sha512"):
     repository = model.repository.get_repository(*repository_name.split("/", 1))
     location = ImageStorageLocation.get(name="local_us")
@@ -2196,6 +2221,372 @@ def test_story6_mixed_digest_multiarchitecture_contract(
                 .count()
                 == 1
             )
+
+
+def test_story10_same_quay_copy_preserves_selected_mixed_digest_identities(client, app):
+    source = "devtable/complex"
+    destination = "devtable/building"
+    unrelated_repository = "devtable/simple"
+    source_tag = "story10-source"
+    destination_tag = "story10-copy"
+    children = []
+    for manifest_algorithm, config_algorithm, layer_algorithm, architecture in [
+        ("sha384", "sha512", "sha256", "amd64"),
+        ("sha512", "sha384", "sha512", "arm64"),
+    ]:
+        child = _sha512_single_manifest(
+            source,
+            f"story10-{architecture}-layer".encode("utf-8"),
+            algorithm=manifest_algorithm,
+            config_algorithm=config_algorithm,
+            layer_algorithm=layer_algorithm,
+        )
+        child.update(
+            media_type=DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE,
+            descriptor_digest=child["external_digest"],
+            architecture=architecture,
+        )
+        children.append(child)
+    parent = _manifest_index(children, algorithm="sha512")
+    source_headers = _manifest_auth_headers(source)
+    destination_headers = _manifest_auth_headers(destination)
+    copy_headers = _copy_auth_headers(source, destination)
+
+    def unrelated_digest(content, selected_digest):
+        algorithm = "sha384" if not selected_digest.startswith("sha384:") else "sha512"
+        return f"{algorithm}:" + hashlib.new(algorithm, content).hexdigest()
+
+    with patch.dict(
+        realapp.config,
+        {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384", "sha512"]},
+    ):
+        for child in children:
+            _put_manifest(client, source, child["external_digest"], child)
+        _put_manifest(
+            client,
+            source,
+            parent["external_digest"],
+            parent,
+            tag=source_tag,
+        )
+
+        source_repository = model.repository.get_repository("devtable", "complex")
+        source_unrelated_digests = []
+        for manifest_info in [parent, *children]:
+            manifest_row = Manifest.get(
+                repository=source_repository,
+                digest=manifest_info["canonical_digest"],
+            )
+            alias = unrelated_digest(manifest_info["bytes"], manifest_info["external_digest"])
+            model.oci.manifest.register_repository_manifest_digest(
+                source_repository.id,
+                manifest_row,
+                alias,
+            )
+            source_unrelated_digests.append(alias)
+        for child in children:
+            for blob in child["referenced_blobs"]:
+                blob_row = ImageStorage.get(content_checksum=blob["canonical_digest"])
+                alias = unrelated_digest(blob["bytes"], blob["external_digest"])
+                model.oci.blob.register_repository_blob_digest(
+                    source_repository,
+                    blob_row,
+                    alias,
+                )
+                source_unrelated_digests.append(alias)
+
+        source_root = conduct_call(
+            client,
+            "v2.fetch_manifest_by_tagname",
+            url_for,
+            "GET",
+            {"repository": source, "manifest_ref": source_tag},
+            expected_code=200,
+            headers={
+                **source_headers,
+                "Accept": OCI_IMAGE_INDEX_CONTENT_TYPE,
+            },
+        )
+        assert source_root.data == parent["bytes"]
+        assert source_root.headers["Docker-Content-Digest"] == parent["external_digest"]
+
+        source_child_responses = []
+        for descriptor in json.loads(source_root.data)["manifests"]:
+            response = conduct_call(
+                client,
+                "v2.fetch_manifest_by_digest",
+                url_for,
+                "GET",
+                {"repository": source, "manifest_ref": descriptor["digest"]},
+                expected_code=200,
+                headers={
+                    **source_headers,
+                    "Accept": descriptor["mediaType"],
+                },
+            )
+            assert len(response.data) == descriptor["size"]
+            assert response.headers["Docker-Content-Digest"] == descriptor["digest"]
+            source_child_responses.append((descriptor, response))
+
+        image_storage_count = ImageStorage.select().count()
+        placement_count = ImageStoragePlacement.select().count()
+        expected_blob_digests = set()
+        for _ in range(2):
+            for child_descriptor, child_response in source_child_responses:
+                child_document = json.loads(child_response.data)
+                for blob_descriptor in [
+                    child_document["config"],
+                    *child_document["layers"],
+                ]:
+                    expected_blob_digests.add(blob_descriptor["digest"])
+                    mounted = conduct_call(
+                        client,
+                        "v2.start_blob_upload",
+                        url_for,
+                        "POST",
+                        {
+                            "repository": destination,
+                            "mount": blob_descriptor["digest"],
+                            "from": source,
+                        },
+                        expected_code=201,
+                        headers=copy_headers.copy(),
+                    )
+                    assert mounted.headers["Docker-Content-Digest"] == blob_descriptor["digest"]
+                    assert mounted.headers["Location"].endswith(
+                        "/blobs/" + blob_descriptor["digest"]
+                    )
+                    assert "Docker-Upload-UUID" not in mounted.headers
+
+                copied_child = _put_manifest(
+                    client,
+                    destination,
+                    child_descriptor["digest"],
+                    {
+                        "bytes": child_response.data,
+                        "media_type": child_descriptor["mediaType"],
+                    },
+                )
+                assert copied_child.headers["Docker-Content-Digest"] == child_descriptor["digest"]
+
+            copied_root = _put_manifest(
+                client,
+                destination,
+                source_root.headers["Docker-Content-Digest"],
+                {
+                    "bytes": source_root.data,
+                    "media_type": source_root.headers["Content-Type"],
+                },
+                tag=destination_tag,
+            )
+            assert copied_root.headers["Docker-Content-Digest"] == parent["external_digest"]
+            assert copied_root.headers.getlist("OCI-Tag") == [destination_tag]
+
+        assert ImageStorage.select().count() == image_storage_count
+        assert ImageStoragePlacement.select().count() == placement_count
+
+        destination_repository = model.repository.get_repository("devtable", "building")
+        copied_manifests = {}
+        for manifest_info in [parent, *children]:
+            manifest_row = Manifest.get(
+                repository=destination_repository,
+                digest=manifest_info["canonical_digest"],
+            )
+            copied_manifests[manifest_info["canonical_digest"]] = manifest_row
+            assert {
+                registration.digest
+                for registration in RepositoryManifestDigest.select().where(
+                    RepositoryManifestDigest.repository == destination_repository,
+                    RepositoryManifestDigest.manifest == manifest_row,
+                )
+            } == {manifest_info["external_digest"]}
+
+        copied_parent = copied_manifests[parent["canonical_digest"]]
+        assert {
+            relationship.child_manifest_id
+            for relationship in ManifestChild.select().where(
+                ManifestChild.repository == destination_repository,
+                ManifestChild.manifest == copied_parent,
+            )
+        } == {copied_manifests[child["canonical_digest"]].id for child in children}
+        assert (
+            Tag.get(
+                repository=destination_repository,
+                name=destination_tag,
+                lifetime_end_ms=None,
+            ).manifest
+            == copied_parent
+        )
+
+        for child in children:
+            child_row = copied_manifests[child["canonical_digest"]]
+            assert {
+                relationship.blob_id
+                for relationship in ManifestBlob.select().where(
+                    ManifestBlob.repository == destination_repository,
+                    ManifestBlob.manifest == child_row,
+                )
+            } == child["blob_ids"]
+            for blob in child["referenced_blobs"]:
+                blob_row = ImageStorage.get(content_checksum=blob["canonical_digest"])
+                assert {
+                    registration.digest
+                    for registration in RepositoryBlobDigest.select().where(
+                        RepositoryBlobDigest.repository == destination_repository,
+                        RepositoryBlobDigest.image_storage == blob_row,
+                    )
+                } == {blob["external_digest"]}
+
+        assert {
+            registration.digest
+            for registration in RepositoryBlobDigest.select().where(
+                RepositoryBlobDigest.repository == destination_repository,
+            )
+        } == expected_blob_digests
+        for alias in source_unrelated_digests:
+            assert (
+                not RepositoryManifestDigest.select()
+                .where(
+                    RepositoryManifestDigest.repository == destination_repository,
+                    RepositoryManifestDigest.digest == alias,
+                )
+                .exists()
+            )
+            assert (
+                not RepositoryBlobDigest.select()
+                .where(
+                    RepositoryBlobDigest.repository == destination_repository,
+                    RepositoryBlobDigest.digest == alias,
+                )
+                .exists()
+            )
+
+        for endpoint, manifest_ref in [
+            ("v2.fetch_manifest_by_tagname", destination_tag),
+            ("v2.fetch_manifest_by_digest", parent["external_digest"]),
+        ]:
+            copied = conduct_call(
+                client,
+                endpoint,
+                url_for,
+                "GET",
+                {"repository": destination, "manifest_ref": manifest_ref},
+                expected_code=200,
+                headers={
+                    **destination_headers,
+                    "Accept": OCI_IMAGE_INDEX_CONTENT_TYPE,
+                },
+            )
+            assert copied.data == parent["bytes"]
+            assert copied.headers["Docker-Content-Digest"] == parent["external_digest"]
+
+        for child_descriptor, child_response in source_child_responses:
+            copied_child = conduct_call(
+                client,
+                "v2.fetch_manifest_by_digest",
+                url_for,
+                "GET",
+                {
+                    "repository": destination,
+                    "manifest_ref": child_descriptor["digest"],
+                },
+                expected_code=200,
+                headers=destination_headers.copy(),
+            )
+            assert copied_child.data == child_response.data
+            assert copied_child.headers["Docker-Content-Digest"] == child_descriptor["digest"]
+            for blob_descriptor in [
+                json.loads(child_response.data)["config"],
+                *json.loads(child_response.data)["layers"],
+            ]:
+                copied_blob = conduct_call(
+                    client,
+                    "v2.download_blob",
+                    url_for,
+                    "GET",
+                    {
+                        "repository": destination,
+                        "digest": blob_descriptor["digest"],
+                    },
+                    expected_code=200,
+                    headers=destination_headers.copy(),
+                )
+                algorithm = blob_descriptor["digest"].partition(":")[0]
+                assert (
+                    f"{algorithm}:" + hashlib.new(algorithm, copied_blob.data).hexdigest()
+                    == blob_descriptor["digest"]
+                )
+
+        hidden_canonical_digests = [
+            manifest_info["canonical_digest"]
+            for manifest_info in [parent, *children]
+            if manifest_info["canonical_digest"] != manifest_info["external_digest"]
+        ]
+        for canonical_digest in hidden_canonical_digests:
+            conduct_call(
+                client,
+                "v2.fetch_manifest_by_digest",
+                url_for,
+                "GET",
+                {"repository": destination, "manifest_ref": canonical_digest},
+                expected_code=404,
+                headers=destination_headers.copy(),
+            )
+        for child in children:
+            for blob in child["referenced_blobs"]:
+                if blob["canonical_digest"] == blob["external_digest"]:
+                    continue
+                conduct_call(
+                    client,
+                    "v2.download_blob",
+                    url_for,
+                    "GET",
+                    {"repository": destination, "digest": blob["canonical_digest"]},
+                    expected_code=404,
+                    headers=destination_headers.copy(),
+                )
+
+        conduct_call(
+            client,
+            "v2.fetch_manifest_by_digest",
+            url_for,
+            "GET",
+            {
+                "repository": unrelated_repository,
+                "manifest_ref": parent["external_digest"],
+            },
+            expected_code=404,
+            headers=_manifest_auth_headers(unrelated_repository, actions=("pull",)),
+        )
+
+        with patch.dict(realapp.config, {"ALLOWED_HASH_ALGORITHMS": ["sha256"]}):
+            disabled = conduct_call(
+                client,
+                "v2.fetch_manifest_by_tagname",
+                url_for,
+                "GET",
+                {"repository": destination, "manifest_ref": destination_tag},
+                expected_code=400,
+                headers=destination_headers.copy(),
+            )
+            assert disabled.get_json()["errors"][0]["detail"] == {
+                "algorithm": "sha512",
+                "reason": "disabled",
+            }
+
+        restored = conduct_call(
+            client,
+            "v2.fetch_manifest_by_tagname",
+            url_for,
+            "GET",
+            {"repository": destination, "manifest_ref": destination_tag},
+            expected_code=200,
+            headers={
+                **destination_headers,
+                "Accept": OCI_IMAGE_INDEX_CONTENT_TYPE,
+            },
+        )
+        assert restored.headers["Docker-Content-Digest"] == parent["external_digest"]
 
 
 @pytest.mark.parametrize(
