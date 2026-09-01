@@ -1686,3 +1686,301 @@ Initial temporary-user cleanup exposed the existing repository lifecycle foreign
 - No live MySQL run was performed. No new PostgreSQL test was needed because this session changed only tests and documentation; existing PostgreSQL-only tests remained skipped in SQLite aggregates.
 - OCI Image Specification 1.1.1 does not register SHA-384. Podman and Skopeo rejected the extension in this environment; ORAS accepted it. External interoperability must be treated client by client.
 - No database migration was added.
+
+## Story 4: Repository-registered digest pulls
+
+**Status: Done under the local definition of done. The implementation was already present; this session added missing regression evidence and delivery documentation only.**
+
+### Static review result
+
+- Manifest digest GET and automatic HEAD strictly parse the requested identity, enforce the active allowlist before cache lookup, authorize repository pull access, resolve only that repository's registration, and return exact persisted bytes with the requested digest.
+- Tag GET and automatic HEAD select a deterministic enabled repository-visible registration. Canonical SHA-256 is preferred only when it is explicitly or historically visible and enabled. Schema conversion returns the digest of the bytes actually served and rechecks the active allowlist.
+- Blob GET and HEAD strictly parse and allowlist-check before cache lookup, resolve repository relationships and registrations, and serve canonical stored bytes while returning the requested registered digest.
+- Legacy SHA-256 fallback is available only while the repository/object pair has no registration. Once an alternative registration exists, hidden canonical SHA-256 no longer resolves unless it is explicitly registered.
+- Manifest cache keys include repository ID and requested digest. Blob cache keys include namespace, repository, requested digest, and cache version. Missing results are not cached. Disabled algorithms are rejected before a positive cache can be used.
+- GET and HEAD share authentication and repository authorization. Flask's automatic manifest HEAD uses the GET handler and strips only the body. Blob HEAD has an explicit handler using the same lookup contract.
+- No accidental canonical fallback, cross-repository lookup, disabled-algorithm cache bypass, GET/HEAD identity mismatch, or served-byte digest mismatch was found.
+- No production file changed.
+
+### Tests added
+
+- `endpoints/v2/test/test_manifest.py`
+  - Added referenced config and layer details to the existing alternative-manifest fixture.
+  - Added a SHA-384/SHA-512 Story 4 graph pull contract covering manifest digest and tag GET/HEAD, referenced config and layer GET/HEAD, independent hashing, hidden canonical rejection, explicit canonical registration, repository isolation, unauthorized requests, primed-cache hard-disable, and re-enable behavior.
+  - Added malformed, unsupported, disabled, and unknown manifest pull GET/HEAD parity.
+- `endpoints/v2/test/test_blob.py`
+  - Extended precise blob lookup errors with matching HEAD status coverage.
+
+### Exact local verification
+
+Baseline focused selection before the new tests:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py::test_alternative_single_manifest_push_pull_tag_and_repository_isolation endpoints/v2/test/test_manifest.py::test_tag_push_pull_and_cleanup_obey_hard_allowlist endpoints/v2/test/test_manifest.py::test_tag_pull_does_not_expose_disabled_canonical_identity endpoints/v2/test/test_manifest.py::test_tag_pull_rejects_disabled_converted_representation endpoints/v2/test/test_manifest.py::test_manifest_cache_is_invalidated_for_alternative_digest_after_tag_retarget endpoints/v2/test/test_manifest.py::test_sha384_manifest_list_lifecycle_with_mixed_child_identities endpoints/v2/test/test_blob.py::test_alternative_chunked_blob_upload_resume_and_pull endpoints/v2/test/test_blob.py::test_blob_lookup_digest_errors_are_precise`
+
+Result: **13 passed**.
+
+New Story 4 selection, run before and after formatting:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py::test_story4_registered_graph_pull_contract endpoints/v2/test/test_manifest.py::test_manifest_pull_digest_errors_are_precise_for_get_and_head endpoints/v2/test/test_blob.py::test_blob_lookup_digest_errors_are_precise`
+
+Result on both runs: **7 passed**.
+
+Complete manifest endpoint file:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py`
+
+Result: **62 passed**.
+
+Complete blob endpoint file:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_blob.py`
+
+Result: **50 passed**.
+
+Digest, OCI manifest model, and registry interface aggregate:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings digest/test/test_digest_tools.py data/model/oci/test/test_oci_manifest.py data/registry_model/test/test_interface.py`
+
+Result: **193 passed, 2 skipped**. The skips are the PostgreSQL-only registration races already covered in earlier handoffs.
+
+Mocked pull-through regression outside deferred schema-1 and external e2e cases:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings -m 'not e2e' endpoints/v2/test/test_manifest_pullthru.py -k 'not busybox_schema1'`
+
+Result: **45 passed, 9 skipped, 30 deselected**.
+
+Existing SHA-256 registry protocol manifest selection:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings test/registry/registry_tests.py -k 'test_basic_push_pull_by_manifest'`
+
+Result: **3 passed, 1,456 deselected**.
+
+Focused pre-commit:
+
+`.venv/bin/pre-commit run --files endpoints/v2/test/test_manifest.py endpoints/v2/test/test_blob.py`
+
+First result: **nonzero because Black reformatted both files**. Every other applicable hook passed. The exact command was rerun and **all applicable hooks passed**.
+
+### Live regctl round trip
+
+- `quay-quay` was running and bind-mounted `/Users/shossain/QuayWorkspace/shaon-feature-PQC` to `/quay-registry`.
+- The live Quay configuration reported `['sha256', 'sha384', 'sha512']`.
+- Only tests and documentation changed, so no source-module restart was required.
+- The existing regctl registry configuration was used. No credentials were printed or added to commands.
+
+Fresh SHA-512 BusyBox graph push:
+
+`regctl image mod busybox:latest --digest-algo sha512 --create localhost:8080/testuser/pqc-story4:sha512`
+
+Result: **passed**, and the command printed `localhost:8080/testuser/pqc-story4:sha512`.
+
+Fresh OCI-layout pull/copy:
+
+`regctl image copy --force-recursive localhost:8080/testuser/pqc-story4:sha512 ocidir:///tmp/pqc-story4-oci-20260901104930:sha512`
+
+Result: **passed**.
+
+The remote root was `sha512:0bd23dcfecb44322dd952511fc3c392f2eb652f3eb6dac7c352156a43b782a957b8cf23b26633bffc66c56acbdb82e6f805501661cd55b011e01673a4a72963c`. An inline Python verifier walked the fresh layout, read every descriptor from `blobs/<algorithm>/<encoded>`, checked descriptor size, and recomputed each digest with `hashlib.new(algorithm, bytes)`. Result: **52 unique objects verified**: 1 index, 17 child manifests, 17 configurations, and 17 layers. Every descriptor algorithm was SHA-512.
+
+The selected normal `linux/amd64` graph used:
+
+- Manifest: `sha512:567ed32d3ecedafbe918adc3785e20c823a59aa1c9c619d33966de13e8c390adbc12ff635e95f6311ab9af24d637e19880bf7cacc99a57daa73d7bc0336f7fe0`
+- Configuration: `sha512:015f0d5f92e7c29aff787ab1e60536fb0144f9033d1caceb29494a4acb88ad141d2ed4d26fff5f3a254b4ecb4a7728f93655c66741b6460b4529a1a6d76a1b5e`
+- Layer: `sha512:8368b4eeaf292a3073dadaf70654ffb71a05679f4d56e17e309b157bcd8012c5be03a8bd7c056e4a4fd388007290ec4d243409e996ef1aefb9ee720477782524`
+
+`regctl manifest get` by tag and root digest returned byte-identical 10,533-byte index content. `regctl manifest head` by tag and root digest returned HTTP success, the OCI index media type, and the registered SHA-512 root in `Docker-Content-Digest`. The selected child manifest GET returned 674 bytes. `regctl blob get` and `regctl blob head` succeeded for its 444-byte configuration and 2,226,327-byte layer and returned their registered SHA-512 identities. Independent SHA-512 recomputation passed for the root index, selected child manifest, configuration, and layer.
+
+The internal canonical SHA-256 values were calculated independently from retrieved bytes but were not registered by this digest-addressed push:
+
+- Root manifest: `sha256:9edfb5319801ada456f67d05aeee6fc8946d09731ff8337e873ec3648255ccb8`
+- Configuration blob: `sha256:b7cadd906362981e134f4ca8ff053e210c0bad92929603d819f48476e374fc10`
+
+`regctl manifest get`, `regctl manifest head`, `regctl blob get`, and `regctl blob head` against those canonical identities each failed as expected with exit 1 and HTTP 404 (`MANIFEST_UNKNOWN` or `BLOB_UNKNOWN`).
+
+### Scope and remaining limits
+
+- Story 4 is complete for configure, push, digest-addressed tagging, pull, and normal SHA-256 compatibility.
+- Story 1 and Story 2 remain independently `In progress` in the delivery tracker.
+- Blob mounts, referrers, proxy cache, mirroring, copying, importing, builds, Clair, UI, lifecycle cleanup, and operational tooling were not changed.
+- Deferred items D1–D8 remain deferred. No deferred item blocked Story 4.
+- No OCI conformance, broad client matrix, MySQL, mixed-version, mixed-region, object-storage, replication, or production packaging claim is made.
+
+## Story 5: Repository-scoped blob mounts
+
+**Status: Done under the local definition of done. The implementation was already present; this session added missing mount regression evidence and delivery documentation only.**
+
+### Static review result
+
+- The destination blob-upload route requires destination push authorization before handler execution. Read-only destination scope returns HTTP 401 and creates no destination link or registration.
+- The externally supplied `mount` value is strictly parsed as lowercase exact-length SHA-256, SHA-384, or SHA-512. Unsupported and disabled algorithms are rejected before source repository lookup or blob cache access. Mirror-managed destinations retain their existing SHA-256-only ingestion boundary.
+- Missing `from`, unknown source repository, unknown valid source digest, a digest registered only in another repository, and inaccessible private source all use the existing normal HTTP 202 upload fallback. Public source reads retain the existing behavior.
+- Source authorization is checked before blob resolution. Private repositories require source pull permission. Public, full-superuser, and global-readonly-superuser handling follows existing permission contracts.
+- Source lookup uses the repository named by `from` and the exact requested digest. The blob cache key contains source namespace, repository name, complete digest including algorithm, and cache version. Missing values are not cached.
+- Repository blob resolution accepts an exact `RepositoryBlobDigest` only when the same repository also references the `ImageStorage` row through `UploadedBlob` or `ManifestBlob`. It does not fall back from an unregistered identity to globally deduplicated canonical content. The historical globally shared empty SHA-256 layer remains an unchanged legacy exception.
+- The resolved source `Blob` carries the canonical `ImageStorage` database ID and SHA-256 checksum. Mounting uses both values in `temp_link_blob_by_id()`, so a globally deduplicated row that was not resolved and authorized in the source cannot be substituted.
+- Destination temporary linking and requested digest registration execute in one outer production transaction. Registration insertion uses a nested `db.atomic()` savepoint. An idempotent uniqueness race does not roll back caller work, while a conflicting destination registration raises without remapping and rolls back the temporary link.
+- A new destination receives only the requested registration. Other source aliases and unregistered canonical SHA-256 remain hidden. Explicit SHA-256 mount creates and resolves SHA-256 normally while enabled.
+- Mount does not read, stream, copy, finalize, or create physical bytes. It reuses the exact canonical `ImageStorage` row and existing placement. Repeated mounts remain client-visible idempotent and keep one immutable destination digest registration; each successful request may refresh reachability through another temporary `UploadedBlob` row under the established mount contract.
+- A successful mount returns HTTP 201, the requested digest in `Docker-Content-Digest`, a destination blob `Location` using that digest, and no `Docker-Upload-UUID`.
+- Destination GET and HEAD strictly parse and allowlist-check before cache lookup, require destination pull access, resolve the destination registration, read canonical SHA-256 storage bytes, and return the requested registered identity. GET and HEAD use the same repository-scoped lookup contract.
+- No production source file changed. The only target-worktree implementation artifact from this session is expanded coverage in `endpoints/v2/test/test_blob.py`.
+
+### Tests added or expanded
+
+`endpoints/v2/test/test_blob.py` now proves:
+
+- Registered SHA-256, SHA-384, and SHA-512 mount success.
+- HTTP 201 response headers and absence of an invented upload UUID.
+- Destination GET and HEAD with exact bytes, content length, requested identity, and independent hashing.
+- Exact source `ImageStorage` row reuse, unchanged global `ImageStorage` count, unchanged placement count, and no physical copy.
+- One requested destination registration and no copied source aliases.
+- Hidden canonical SHA-256 rejection for SHA-384 and SHA-512 mounts, plus normal explicit SHA-256 behavior.
+- Repeated successful mounts with one immutable destination registration.
+- Destination push denial without link or registration state.
+- Source pull denial, wrong-source repository isolation, public-source compatibility, missing `from`, unknown digest, and unknown source repository fallback.
+- Every covered fallback creates a normal upload session that can be canceled through the existing upload endpoint.
+- Disabled-algorithm rejection before a primed blob cache is touched, followed by successful reuse of the same registration after re-enable.
+- Endpoint conflict response without digest remapping. Existing registry-interface coverage proves the temporary destination link rolls back under a real Peewee transaction.
+
+### Exact local verification
+
+The first combined baseline command accidentally supplied two `-k` options:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_blob.py -k 'blob_mounting or alternative_mount or mount_digest_errors' data/registry_model/test/test_interface.py -k 'mount_blob or mount_alternative or mount_rejects_destination_digest_remap'`
+
+Result: **4 passed, 164 deselected**. Pytest applied the final `-k`, so this selected only the four registry-interface mount tests. It was not treated as endpoint evidence.
+
+Unambiguous pre-change endpoint baseline:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_blob.py -k 'blob_mounting or alternative_mount or mount_digest_errors'`
+
+Result: **20 passed, 30 deselected**.
+
+Unambiguous pre-change registry-interface baseline:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_interface.py -k 'mount_blob or mount_alternative or mount_rejects_destination_digest_remap'`
+
+Result: **4 passed, 114 deselected**.
+
+Expanded Story 5 endpoint selection before formatting:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_blob.py -k 'story5 or blob_mounting or alternative_mount or mount_requires_destination or mount_hard_disable or mount_digest_errors'`
+
+Result: **26 passed, 30 deselected**.
+
+Complete blob endpoint file before formatting:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_blob.py`
+
+Result: **56 passed**.
+
+Relevant registry-interface mount, cache, conflict rollback, and race selection:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_interface.py -k 'mount_blob or mount_alternative or mount_rejects_destination_digest_remap or get_cached_repo_blob or repository_digest_registration_live_concurrency'`
+
+Result: **5 passed, 1 skipped, 112 deselected**. The skip is the PostgreSQL-only registration race already covered in earlier handoffs. No production transaction behavior changed in Story 5, so no new live database race was required.
+
+Blob model and uploader regressions:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/test/test_blob.py data/model/test/test_model_blob.py data/registry_model/test/test_blobuploader.py`
+
+Result: **36 passed**.
+
+Existing SHA-256 registry protocol mount coverage:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings test/registry/registry_tests.py -k 'test_blob_mounting'`
+
+Result: **252 passed, 1,207 deselected**.
+
+Focused pre-commit:
+
+`.venv/bin/pre-commit run --files endpoints/v2/test/test_blob.py`
+
+First result: **nonzero because Black reformatted `endpoints/v2/test/test_blob.py`**. Every other applicable hook passed. The exact command was rerun and **all applicable hooks passed**.
+
+Post-format expanded Story 5 endpoint selection:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_blob.py -k 'story5 or blob_mounting or alternative_mount or mount_requires_destination or mount_hard_disable or mount_digest_errors'`
+
+Result: **26 passed, 30 deselected**.
+
+Final complete blob endpoint file:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_blob.py`
+
+Result: **56 passed**.
+
+Strict digest parser and hashing coverage:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings digest/test/test_digest_tools.py`
+
+Result: **54 passed**.
+
+Compilation and whitespace:
+
+`.venv/bin/python -m compileall -q endpoints/v2/test/test_blob.py && git diff --check`
+
+Result: **passed** with no output, both before and after the final complete endpoint run.
+
+Final pre-commit across every modified target-worktree file:
+
+`files=$(git diff --name-only --diff-filter=ACMR) && .venv/bin/pre-commit run --files $files`
+
+Result: **all applicable hooks passed** for `HANDOFF.md`, `endpoints/v2/test/test_blob.py`, and the preserved pre-existing `endpoints/v2/test/test_manifest.py` change.
+
+### Live SHA-512 mount validation
+
+Environment:
+
+- `quay-quay` was bind-mounted from `/Users/shossain/QuayWorkspace/shaon-feature-PQC` to `/quay-registry`.
+- The active allowlist was `['sha256', 'sha384', 'sha512']`.
+- `regctl` 0.11.5 used its existing configuration. No credentials, bearer tokens, passwords, or auth-file contents were printed.
+- Dedicated repositories were `localhost:8080/testuser/pqc-story5-source-01a05e37` and `localhost:8080/testuser/pqc-story5-destination-01a05e37`.
+
+Source graph command:
+
+`regctl image mod busybox:latest --digest-algo sha512 --create localhost:8080/testuser/pqc-story5-source-01a05e37:sha512`
+
+Result: **passed**.
+
+The selected `linux/amd64` configuration blob was:
+
+`sha512:015f0d5f92e7c29aff787ab1e60536fb0144f9033d1caceb29494a4acb88ad141d2ed4d26fff5f3a254b4ecb4a7728f93655c66741b6460b4529a1a6d76a1b5e`
+
+It contained 444 bytes. Independent source SHA-512 verification passed. Its internal canonical identity was `sha256:b7cadd906362981e134f4ca8ff053e210c0bad92929603d819f48476e374fc10`.
+
+An inline Python `requests` command read the existing regctl host credentials in memory, requested only the necessary registry scopes, and sent:
+
+`POST /v2/testuser/pqc-story5-destination-01a05e37/blobs/uploads/?mount=<selected-sha512>&from=testuser/pqc-story5-source-01a05e37`
+
+Result: **HTTP 201**. `Docker-Content-Digest` was the requested SHA-512 value, `Location` ended in the destination blob URL with that value, and `Docker-Upload-UUID` was absent. Repeating the same request returned **HTTP 201** again.
+
+Destination `GET` and `HEAD` for the mounted SHA-512 identity returned **HTTP 200**. GET returned the exact 444 source bytes. HEAD returned the same requested `Docker-Content-Digest`. Exact-byte comparison and independent SHA-512 recomputation passed.
+
+Database and storage inspection after mount found:
+
+- Source `ImageStorage` ID: 36.
+- Destination registration `ImageStorage` ID: 36.
+- Global rows for the canonical SHA-256 identity: 1.
+- Physical placement rows for the canonical storage: 1.
+- Destination aliases for that row: only the requested SHA-512 identity.
+- Repeated mounts created temporary reachability rows only; they did not create a second registration, canonical row, placement, or byte copy.
+
+Destination GET and HEAD through the unregistered canonical SHA-256 identity returned **HTTP 404**. This is required identity isolation, not a defect.
+
+A token with destination pull/push scope but no source pull scope sent the same known mount request. Result: **HTTP 202** with a normal upload UUID and location. Deleting that fallback upload returned **HTTP 204**. The response did not disclose that the private source content existed.
+
+A malformed live `sha512:1234` mount returned **HTTP 400**, code `DIGEST_INVALID`, reason `malformed`, and no upload UUID.
+
+For the hard-disable check, SHA-512 was temporarily removed from `local-dev/stack/config.yaml` and `quay-quay` was restarted. The first attempt was **infrastructure-blocked** because `/v2/auth` returned HTTP 502 while the backend was still becoming ready. The mount endpoint was not reached. The cleanup trap restored the configuration and restarted Quay.
+
+The check was rerun with authenticated readiness polling. With the temporary active allowlist `['sha256', 'sha384']`, the same mount returned **HTTP 400**, code `UNSUPPORTED`, reason `disabled`, and no upload UUID. The original config was restored byte-for-byte, its SHA-256 returned to `4de46dadfc727018452ddd490056beb5f5af736e1d0f5751cb8ddb942430731f`, and the active allowlist returned to `['sha256', 'sha384', 'sha512']`. The same existing destination registration then mounted again with **HTTP 201**.
+
+### Scope and remaining limits
+
+- Story 5 is complete for repository-scoped blob mounts under SHA-256, SHA-384, and SHA-512, including destination pull and normal SHA-256 compatibility.
+- Story 1 and Story 2 remain independently `In progress` in the delivery tracker.
+- Referrers, proxy cache, mirroring, complete-image copies, imports, builds, Clair, UI, deletion, garbage collection, conformance, and operational tooling were not changed.
+- Deferred items D1–D8 remain deferred. No deferred item blocked Story 5.
+- No new PostgreSQL or MySQL run was performed because production mount transaction behavior did not change. Existing production-transaction rollback and prior PostgreSQL registration-race evidence remain applicable.
+- No OCI conformance, broad client matrix, mixed-version, mixed-region, object-storage, replication, or production-readiness claim is made.

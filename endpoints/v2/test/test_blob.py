@@ -19,6 +19,7 @@ from data.database import (
     ImageStorageLocation,
     ImageStoragePlacement,
     RepositoryBlobDigest,
+    UploadedBlob,
 )
 from data.model.storage import get_layer_path
 from data.model.test.test_repo_mirroring import create_mirror_repo_robot
@@ -37,14 +38,19 @@ from util.security.registry_jwt import build_context_and_subject, generate_beare
 HELLO_WORLD_DIGEST = "sha256:f54a58bc1aac5ea1a25d796ae155dc228b3f0e11d046ae276b39c4bf2f13d8c4"
 
 
-def _blob_auth_headers(repository, source_repository=None, username="devtable"):
+def _blob_auth_headers(
+    repository,
+    source_repository=None,
+    username="devtable",
+    destination_actions=("pull", "push"),
+):
     user = model.user.get_user(username)
     context, subject = build_context_and_subject(ValidatedAuthContext(user=user))
     access = [
         {
             "type": "repository",
             "name": repository,
-            "actions": ["pull", "push"],
+            "actions": list(destination_actions),
         }
     ]
     if source_repository is not None:
@@ -241,9 +247,7 @@ class TestBlobPullThroughStorage:
         assert storage.exists(locations, path), f"blob not found in storage at path {path}"
 
     @pytest.mark.parametrize("algorithm,length", [("sha384", 96), ("sha512", 128)])
-    def test_alternative_digest_is_rejected_before_upstream_blob_request(
-        self, algorithm, length
-    ):
+    def test_alternative_digest_is_rejected_before_upstream_blob_request(self, algorithm, length):
         digest = f"{algorithm}:" + "a" * length
         proxy_mock = MagicMock()
 
@@ -256,9 +260,7 @@ class TestBlobPullThroughStorage:
                 "data.registry_model.registry_proxy_model.Proxy",
                 MagicMock(return_value=proxy_mock),
             ),
-            patch(
-                "endpoints.v2.blob.model_cache", NoopDataModelCache(TEST_CACHE_CONFIG)
-            ),
+            patch("endpoints.v2.blob.model_cache", NoopDataModelCache(TEST_CACHE_CONFIG)),
         ):
             response = conduct_call(
                 self.client,
@@ -479,6 +481,14 @@ def test_blob_caching(method, endpoint, expected_count, client, app):
             False,
             202,
         ),
+        # Unknown source repository.
+        (
+            "sha256:" + hashlib.sha256(b"unknown-source").hexdigest(),
+            "devtable/doesnotexist",
+            "devtable",
+            True,
+            202,
+        ),
         # Blob not in repo.
         ("sha256:" + hashlib.sha256(b"a").hexdigest(), "devtable/complex", "devtable", True, 202),
         ("sha256:" + hashlib.sha256(b"a").hexdigest(), "devtable/complex", "devtable", False, 202),
@@ -544,7 +554,7 @@ def test_blob_mounting(
         "Authorization": "Bearer %s" % token,
     }
 
-    conduct_call(
+    response = conduct_call(
         client,
         "v2.start_blob_upload",
         url_for,
@@ -561,22 +571,45 @@ def test_blob_mounting(
         assert model.oci.blob.get_repository_blob_by_digest(repository, mount_digest)
     else:
         assert model.oci.blob.get_repository_blob_by_digest(repository, mount_digest) is None
+        upload_uuid = response.headers["Docker-Upload-UUID"]
+        assert response.headers["Location"].endswith("/blobs/uploads/" + upload_uuid)
+        assert response.headers["Range"]
+        conduct_call(
+            client,
+            "v2.cancel_upload",
+            url_for,
+            "DELETE",
+            {"repository": "devtable/building", "upload_uuid": upload_uuid},
+            expected_code=204,
+            headers=headers,
+        )
 
 
-@pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
-def test_alternative_mount_registers_destination_without_exposing_canonical_digest(
-    algorithm, client, app
-):
+@pytest.mark.parametrize("algorithm", ["sha256", "sha384", "sha512"])
+def test_story5_registered_mount_contract(algorithm, client, app):
     source = "devtable/complex"
     destination = "devtable/building"
-    content = b"alternative mount content"
-    alternative_digest = f"{algorithm}:" + hashlib.new(algorithm, content).hexdigest()
-    _, _, canonical_digest = _store_registered_blob(source, content, alternative_digest)
+    content = b"story 5 registered mount content"
+    requested_digest = f"{algorithm}:" + hashlib.new(algorithm, content).hexdigest()
+    source_repository, source_storage, canonical_digest = _store_registered_blob(
+        source, content, requested_digest
+    )
+    destination_repository = model.repository.get_repository("devtable", "building")
     headers = _blob_auth_headers(destination, source)
+    image_storage_count = ImageStorage.select().count()
+    placement_count = ImageStoragePlacement.select().count()
+    source_placement_count = (
+        ImageStoragePlacement.select()
+        .where(ImageStoragePlacement.storage == source_storage)
+        .count()
+    )
 
     with (
-        patch.dict(realapp.config, {"ALLOWED_HASH_ALGORITHMS": ["sha256", algorithm]}),
-        patch("endpoints.v2.blob.model_cache", NoopDataModelCache(TEST_CACHE_CONFIG)),
+        patch.dict(
+            realapp.config,
+            {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384", "sha512"]},
+        ),
+        patch("endpoints.v2.blob.model_cache", InMemoryDataModelCache(TEST_CACHE_CONFIG)),
     ):
         for _ in range(2):
             response = conduct_call(
@@ -584,45 +617,93 @@ def test_alternative_mount_registers_destination_without_exposing_canonical_dige
                 "v2.start_blob_upload",
                 url_for,
                 "POST",
-                {"repository": destination, "mount": alternative_digest, "from": source},
+                {"repository": destination, "mount": requested_digest, "from": source},
                 expected_code=201,
                 headers=headers.copy(),
             )
-            assert response.headers["Docker-Content-Digest"] == alternative_digest
-            assert response.headers["Location"].endswith("/blobs/" + alternative_digest)
+            assert response.headers["Docker-Content-Digest"] == requested_digest
+            assert response.headers["Location"].endswith("/blobs/" + requested_digest)
             assert "Docker-Upload-UUID" not in response.headers
 
-        response = conduct_call(
+        get_response = conduct_call(
             client,
             "v2.download_blob",
             url_for,
             "GET",
-            {"repository": destination, "digest": alternative_digest},
+            {"repository": destination, "digest": requested_digest},
             expected_code=200,
             headers=headers.copy(),
         )
-        assert response.headers["Docker-Content-Digest"] == alternative_digest
-        assert response.data == content
-
-        conduct_call(
-            client,
-            "v2.download_blob",
-            url_for,
-            "GET",
-            {"repository": destination, "digest": canonical_digest},
-            expected_code=404,
-            headers=headers.copy(),
+        assert get_response.headers["Docker-Content-Digest"] == requested_digest
+        assert get_response.data == content
+        assert (
+            f"{algorithm}:" + hashlib.new(algorithm, get_response.data).hexdigest()
+            == requested_digest
         )
 
-    destination_repository = model.repository.get_repository("devtable", "building")
+        head_response = conduct_call(
+            client,
+            "v2.check_blob_exists",
+            url_for,
+            "HEAD",
+            {"repository": destination, "digest": requested_digest},
+            expected_code=200,
+            headers=headers.copy(),
+        )
+        assert head_response.headers["Docker-Content-Digest"] == requested_digest
+        assert head_response.headers["Content-Length"] == str(len(content))
+        assert head_response.data == b""
+
+        if requested_digest != canonical_digest:
+            for endpoint, method in (
+                ("v2.download_blob", "GET"),
+                ("v2.check_blob_exists", "HEAD"),
+            ):
+                conduct_call(
+                    client,
+                    endpoint,
+                    url_for,
+                    method,
+                    {"repository": destination, "digest": canonical_digest},
+                    expected_code=404,
+                    headers=headers.copy(),
+                )
+
+    destination_links = list(
+        UploadedBlob.select().where(
+            UploadedBlob.repository == destination_repository,
+            UploadedBlob.blob == source_storage,
+        )
+    )
+    assert destination_links
+    assert {link.blob_id for link in destination_links} == {source_storage.id}
+    assert ImageStorage.select().count() == image_storage_count
+    assert ImageStoragePlacement.select().count() == placement_count
+    assert (
+        ImageStoragePlacement.select()
+        .where(ImageStoragePlacement.storage == source_storage)
+        .count()
+        == source_placement_count
+    )
+    assert {
+        registration.digest
+        for registration in RepositoryBlobDigest.select().where(
+            RepositoryBlobDigest.repository == destination_repository,
+            RepositoryBlobDigest.image_storage == source_storage,
+        )
+    } == {requested_digest}
     assert (
         RepositoryBlobDigest.select()
         .where(
             RepositoryBlobDigest.repository == destination_repository,
-            RepositoryBlobDigest.digest == alternative_digest,
+            RepositoryBlobDigest.digest == requested_digest,
         )
         .count()
         == 1
+    )
+    assert (
+        model.oci.blob.get_repository_blob_by_digest(source_repository, requested_digest).id
+        == source_storage.id
     )
 
 
@@ -690,6 +771,120 @@ def test_alternative_mount_enforces_source_authorization_and_repository_boundary
         .count()
         == 0
     )
+
+
+@pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
+def test_mount_requires_destination_push_authorization(algorithm, client, app):
+    source = "devtable/complex"
+    destination = "devtable/building"
+    content = b"destination authorization"
+    requested_digest = f"{algorithm}:" + hashlib.new(algorithm, content).hexdigest()
+    _, source_storage, _ = _store_registered_blob(source, content, requested_digest)
+    destination_repository = model.repository.get_repository("devtable", "building")
+
+    with patch.dict(
+        realapp.config,
+        {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384", "sha512"]},
+    ):
+        conduct_call(
+            client,
+            "v2.start_blob_upload",
+            url_for,
+            "POST",
+            {"repository": destination, "mount": requested_digest, "from": source},
+            expected_code=401,
+            headers=_blob_auth_headers(
+                destination,
+                source,
+                destination_actions=("pull",),
+            ),
+        )
+
+    assert (
+        not UploadedBlob.select()
+        .where(
+            UploadedBlob.repository == destination_repository,
+            UploadedBlob.blob == source_storage,
+        )
+        .exists()
+    )
+    assert (
+        not RepositoryBlobDigest.select()
+        .where(
+            RepositoryBlobDigest.repository == destination_repository,
+            RepositoryBlobDigest.digest == requested_digest,
+        )
+        .exists()
+    )
+
+
+@pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
+def test_mount_hard_disable_precedes_primed_cache_and_reenable(algorithm, client, app):
+    source = "devtable/complex"
+    destination = "devtable/building"
+    content = b"mount hard disable and re-enable"
+    requested_digest = f"{algorithm}:" + hashlib.new(algorithm, content).hexdigest()
+    _store_registered_blob(source, content, requested_digest)
+    test_cache = InMemoryDataModelCache(TEST_CACHE_CONFIG)
+    headers = _blob_auth_headers(destination, source)
+
+    with patch("endpoints.v2.blob.model_cache", test_cache):
+        with patch.dict(
+            realapp.config,
+            {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384", "sha512"]},
+        ):
+            for repository in (source, destination):
+                endpoint = "v2.download_blob" if repository == source else "v2.start_blob_upload"
+                method = "GET" if repository == source else "POST"
+                params = {"repository": repository}
+                if repository == source:
+                    params["digest"] = requested_digest
+                else:
+                    params.update({"mount": requested_digest, "from": source})
+                conduct_call(
+                    client,
+                    endpoint,
+                    url_for,
+                    method,
+                    params,
+                    expected_code=200 if repository == source else 201,
+                    headers=headers.copy(),
+                )
+
+        with (
+            patch.dict(realapp.config, {"ALLOWED_HASH_ALGORITHMS": ["sha256"]}),
+            patch.object(test_cache, "retrieve", wraps=test_cache.retrieve) as cache_retrieve,
+        ):
+            disabled = conduct_call(
+                client,
+                "v2.start_blob_upload",
+                url_for,
+                "POST",
+                {"repository": destination, "mount": requested_digest, "from": source},
+                expected_code=400,
+                headers=headers.copy(),
+            )
+            assert disabled.get_json()["errors"][0]["detail"] == {
+                "algorithm": algorithm,
+                "reason": "disabled",
+            }
+            assert "Docker-Upload-UUID" not in disabled.headers
+            cache_retrieve.assert_not_called()
+
+        with patch.dict(
+            realapp.config,
+            {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384", "sha512"]},
+        ):
+            remounted = conduct_call(
+                client,
+                "v2.start_blob_upload",
+                url_for,
+                "POST",
+                {"repository": destination, "mount": requested_digest, "from": source},
+                expected_code=201,
+                headers=headers.copy(),
+            )
+            assert remounted.headers["Docker-Content-Digest"] == requested_digest
 
 
 @pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
@@ -1360,6 +1555,23 @@ def test_blob_lookup_digest_errors_are_precise(client, app):
     assert malformed_sha384.get_json()["errors"][0]["detail"]["reason"] == "malformed"
     assert disabled_sha384.get_json()["errors"][0]["detail"]["reason"] == "disabled"
     assert unsupported.get_json()["errors"][0]["detail"]["reason"] == "unsupported"
+
+    for digest, expected_code in [
+        (unknown_digest, 404),
+        ("sha256:1234", 400),
+        ("sha384:" + "a" * 95, 400),
+        ("sha384:" + "a" * 96, 400),
+        ("sha999:" + "a" * 96, 400),
+    ]:
+        conduct_call(
+            client,
+            "v2.check_blob_exists",
+            url_for,
+            "HEAD",
+            {"repository": repository, "digest": digest},
+            expected_code=expected_code,
+            headers=headers.copy(),
+        )
 
 
 def test_blob_upload_offset(client, app):
