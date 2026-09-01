@@ -2131,7 +2131,7 @@ def test_registry_publication_accepts_registered_artifact_and_subject_identities
     cache.invalidate.assert_called()
 
 
-def test_native_referrers_select_visible_sha256_and_omit_alternative_only(
+def test_native_referrers_select_deterministic_enabled_visible_identities(
     initialized_db, registry_model
 ):
     repository_ref = registry_model.lookup_repository("devtable", "simple")
@@ -2177,10 +2177,21 @@ def test_native_referrers_select_visible_sha256_and_omit_alternative_only(
         RepositoryManifestDigest.digest == alternative_only.digest,
     ).execute()
 
-    found = registry_model.lookup_referrers_for_manifest(repository_ref, subject)
-    assert {referrer.id for referrer in found} == {mixed.id, sha256_only.id}
-    assert {referrer.digest for referrer in found} == {mixed.digest, sha256_only.digest}
-    assert all(referrer.digest.startswith("sha256:") for referrer in found)
+    found = registry_model.lookup_referrers_for_manifest(
+        repository_ref,
+        subject,
+        allowed_algorithms=["sha256", "sha384", "sha512"],
+    )
+    assert {referrer.id for referrer in found} == {
+        mixed.id,
+        alternative_only.id,
+        sha256_only.id,
+    }
+    assert {referrer.digest for referrer in found} == {
+        mixed.digest,
+        alternative_only_digest,
+        sha256_only.digest,
+    }
     assert all(
         registry_model.lookup_manifest_by_digest(
             repository_ref, referrer.digest, allow_hidden=True
@@ -2193,9 +2204,13 @@ def test_native_referrers_select_visible_sha256_and_omit_alternative_only(
         repository_ref,
         subject,
         artifact_type="application/vnd.example.signature",
+        allowed_algorithms=["sha256", "sha384", "sha512"],
     )
-    assert [referrer.id for referrer in signatures] == [mixed.id]
-    assert signatures[0].digest == mixed.digest
+    assert [referrer.id for referrer in signatures] == [mixed.id, alternative_only.id]
+    assert [referrer.digest for referrer in signatures] == [
+        mixed.digest,
+        alternative_only_digest,
+    ]
 
     assert RepositoryManifestDigest.get(
         repository=repository_ref.id,
@@ -2220,7 +2235,7 @@ def test_native_referrers_select_visible_sha256_and_omit_alternative_only(
     )
 
 
-def test_fallback_referrers_match_native_sha256_selection(initialized_db, registry_model):
+def test_fallback_referrers_select_enabled_visible_identities(initialized_db, registry_model):
     repository_ref = registry_model.lookup_repository("devtable", "simple")
     subject_impl = _create_oci_manifest_with_blobs("devtable", "simple").build()
     subject, _ = registry_model.create_manifest_and_retarget_tag(
@@ -2287,10 +2302,21 @@ def test_fallback_referrers_match_native_sha256_selection(initialized_db, regist
         raise_on_error=True,
     )
 
-    found = registry_model.lookup_referrers_for_manifest(repository_ref, subject)
-    assert {referrer.id for referrer in found} == {mixed.id, sha256_only.id}
-    assert {referrer.digest for referrer in found} == {mixed.digest, sha256_only.digest}
-    assert all(referrer.digest.startswith("sha256:") for referrer in found)
+    found = registry_model.lookup_referrers_for_manifest(
+        repository_ref,
+        subject,
+        allowed_algorithms=["sha256", "sha384", "sha512"],
+    )
+    assert {referrer.id for referrer in found} == {
+        mixed.id,
+        alternative_only.id,
+        sha256_only.id,
+    }
+    assert {referrer.digest for referrer in found} == {
+        mixed.digest,
+        alternative_only_digest,
+        sha256_only.digest,
+    }
     assert all(
         registry_model.lookup_manifest_by_digest(
             repository_ref, referrer.digest, allow_hidden=True
@@ -2303,12 +2329,225 @@ def test_fallback_referrers_match_native_sha256_selection(initialized_db, regist
         repository_ref,
         subject,
         artifact_type="application/vnd.example.signature",
+        allowed_algorithms=["sha256", "sha384", "sha512"],
     )
-    assert [referrer.id for referrer in signatures] == [mixed.id]
-    assert signatures[0].digest == mixed.digest
+    assert [referrer.id for referrer in signatures] == [mixed.id, alternative_only.id]
+    assert [referrer.digest for referrer in signatures] == [
+        mixed.digest,
+        alternative_only_digest,
+    ]
 
 
-def test_cached_alternative_referrer_descriptor_is_defensively_omitted(
+def test_referrers_search_subject_alias_fallbacks_and_deduplicate(initialized_db, registry_model):
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+    subject_impl = _create_oci_manifest_with_blobs("devtable", "simple").build()
+    subject, _ = registry_model.create_manifest_and_retarget_tag(
+        repository_ref,
+        subject_impl,
+        "alias-fallback-subject",
+        storage,
+        requested_digest=subject_impl.digest,
+        raise_on_error=True,
+    )
+    subject_sha384 = _add_manifest_registration(repository_ref, subject, "sha384")
+    subject_sha512 = _add_manifest_registration(repository_ref, subject, "sha512")
+    RepositoryManifestDigest.delete().where(
+        RepositoryManifestDigest.repository == repository_ref.id,
+        RepositoryManifestDigest.manifest == subject.id,
+        RepositoryManifestDigest.digest == subject.digest,
+    ).execute()
+    queried_subjects = [
+        registry_model.lookup_manifest_by_digest(
+            repository_ref,
+            digest,
+            allow_hidden=True,
+            raise_on_error=True,
+        )
+        for digest in (subject_sha384, subject_sha512)
+    ]
+
+    native_impl = _build_referrer_manifest(
+        "devtable",
+        "simple",
+        "native-alias-referrer",
+        subject=queried_subjects[0],
+        artifact_type="application/vnd.example.signature",
+    )
+    native, _ = registry_model.create_manifest_and_retarget_tag(
+        repository_ref,
+        native_impl,
+        "native-alias-referrer",
+        storage,
+        requested_digest=native_impl.digest,
+        raise_on_error=True,
+    )
+    native_sha384 = _add_manifest_registration(repository_ref, native, "sha384")
+    RepositoryManifestDigest.delete().where(
+        RepositoryManifestDigest.repository == repository_ref.id,
+        RepositoryManifestDigest.manifest == native.id,
+        RepositoryManifestDigest.digest == native.digest,
+    ).execute()
+
+    fallback_impl = _build_referrer_manifest(
+        "devtable",
+        "simple",
+        "fallback-only-referrer",
+        artifact_type="application/vnd.example.signature",
+    )
+    fallback, _ = registry_model.create_manifest_and_retarget_tag(
+        repository_ref,
+        fallback_impl,
+        "fallback-only-referrer",
+        storage,
+        requested_digest=fallback_impl.digest,
+        raise_on_error=True,
+    )
+    fallback_sha512 = _add_manifest_registration(repository_ref, fallback, "sha512")
+    RepositoryManifestDigest.delete().where(
+        RepositoryManifestDigest.repository == repository_ref.id,
+        RepositoryManifestDigest.manifest == fallback.id,
+        RepositoryManifestDigest.digest == fallback.digest,
+    ).execute()
+
+    hidden_impl = _build_referrer_manifest(
+        "devtable",
+        "simple",
+        "hidden-canonical-fallback-referrer",
+        artifact_type="application/vnd.example.signature",
+    )
+    hidden, _ = registry_model.create_manifest_and_retarget_tag(
+        repository_ref,
+        hidden_impl,
+        "hidden-canonical-fallback-referrer",
+        storage,
+        requested_digest=hidden_impl.digest,
+        raise_on_error=True,
+    )
+
+    def create_fallback_index(tag_digest, manifests):
+        index_builder = OCIIndexBuilder()
+        for referrer, descriptor_digest in manifests:
+            index_builder.add_manifest_digest(
+                descriptor_digest,
+                len(referrer.internal_manifest_bytes.as_encoded_str()),
+                referrer.media_type,
+                None,
+                None,
+            )
+        index = index_builder.build()
+        registry_model.create_manifest_and_retarget_tag(
+            repository_ref,
+            index,
+            "-".join(tag_digest.split(":", 1)),
+            storage,
+            requested_digest=index.digest,
+            raise_on_error=True,
+        )
+
+    create_fallback_index(
+        subject_sha384,
+        [(native, native_sha384), (fallback, fallback_sha512)],
+    )
+    create_fallback_index(
+        subject_sha512,
+        [(fallback, fallback_sha512), (native, native_sha384)],
+    )
+    create_fallback_index(subject.digest, [(hidden, hidden.digest)])
+
+    for queried_subject in queried_subjects:
+        found = registry_model.lookup_referrers_for_manifest(
+            repository_ref,
+            queried_subject,
+            allowed_algorithms=["sha256", "sha384", "sha512"],
+        )
+        assert [referrer.id for referrer in found] == [native.id, fallback.id]
+        assert [referrer.digest for referrer in found] == [native_sha384, fallback_sha512]
+        assert hidden.id not in {referrer.id for referrer in found}
+
+
+def test_referrer_publication_invalidates_every_subject_alias_cache(initialized_db, registry_model):
+    test_cache = InMemoryDataModelCache(TEST_CACHE_CONFIG)
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+    subject_impl = _create_oci_manifest_with_blobs("devtable", "simple").build()
+    subject, _ = registry_model.create_manifest_and_retarget_tag(
+        repository_ref,
+        subject_impl,
+        "alias-cache-subject",
+        storage,
+        requested_digest=subject_impl.digest,
+        raise_on_error=True,
+    )
+    subject_sha384 = _add_manifest_registration(repository_ref, subject, "sha384")
+    subject_sha512 = _add_manifest_registration(repository_ref, subject, "sha512")
+    subjects = [
+        registry_model.lookup_manifest_by_digest(
+            repository_ref,
+            digest,
+            allow_hidden=True,
+            raise_on_error=True,
+        )
+        for digest in (subject.digest, subject_sha384, subject_sha512)
+    ]
+    artifact_type = "application/vnd.example.signature"
+    allowed_algorithms = ["sha256", "sha384", "sha512"]
+
+    for queried_subject in subjects:
+        assert (
+            registry_model.lookup_cached_referrers_for_manifest(
+                test_cache,
+                repository_ref,
+                queried_subject,
+                allowed_algorithms=allowed_algorithms,
+            )
+            == []
+        )
+        assert (
+            registry_model.lookup_cached_referrers_for_manifest(
+                test_cache,
+                repository_ref,
+                queried_subject,
+                artifact_type=artifact_type,
+                allowed_algorithms=allowed_algorithms,
+            )
+            == []
+        )
+
+    artifact_impl = _build_referrer_manifest(
+        "devtable",
+        "simple",
+        "alias-cache-referrer",
+        subject=subjects[1],
+        artifact_type=artifact_type,
+    )
+    artifact = registry_model.create_manifest_with_temp_tag(
+        repository_ref,
+        artifact_impl,
+        300,
+        storage,
+        model_cache=test_cache,
+        requested_digest=artifact_impl.digest,
+        raise_on_error=True,
+    )
+
+    for queried_subject in subjects:
+        unfiltered = registry_model.lookup_cached_referrers_for_manifest(
+            test_cache,
+            repository_ref,
+            queried_subject,
+            allowed_algorithms=allowed_algorithms,
+        )
+        filtered = registry_model.lookup_cached_referrers_for_manifest(
+            test_cache,
+            repository_ref,
+            queried_subject,
+            artifact_type=artifact_type,
+            allowed_algorithms=allowed_algorithms,
+        )
+        assert [referrer.id for referrer in unfiltered] == [artifact.id]
+        assert [referrer.id for referrer in filtered] == [artifact.id]
+
+
+def test_cached_referrer_descriptor_is_reselected_from_active_registrations(
     initialized_db, registry_model
 ):
     repository_ref = registry_model.lookup_repository("devtable", "simple")
@@ -2358,10 +2597,170 @@ def test_cached_alternative_referrer_descriptor_is_defensively_omitted(
     stale_cache.cache_config = TEST_CACHE_CONFIG
     stale_cache.retrieve.return_value = [stale_dict]
 
-    assert (
-        registry_model.lookup_cached_referrers_for_manifest(stale_cache, repository_ref, subject)
-        == []
+    enabled = registry_model.lookup_cached_referrers_for_manifest(
+        stale_cache,
+        repository_ref,
+        subject,
+        allowed_algorithms=["sha256", "sha384", "sha512"],
     )
+    disabled = registry_model.lookup_cached_referrers_for_manifest(
+        stale_cache,
+        repository_ref,
+        subject,
+        allowed_algorithms=["sha256", "sha384"],
+    )
+
+    assert [referrer.digest for referrer in enabled] == [alternative_digest]
+    assert disabled == []
+
+
+def test_fallback_tag_publication_invalidates_every_subject_alias_cache(
+    initialized_db, registry_model
+):
+    test_cache = InMemoryDataModelCache(TEST_CACHE_CONFIG)
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+    subject_impl = _create_oci_manifest_with_blobs("devtable", "simple").build()
+    subject, _ = registry_model.create_manifest_and_retarget_tag(
+        repository_ref,
+        subject_impl,
+        "fallback-cache-subject",
+        storage,
+        requested_digest=subject_impl.digest,
+        raise_on_error=True,
+    )
+    subject_sha512 = _add_manifest_registration(repository_ref, subject, "sha512")
+    queried_subjects = [
+        subject,
+        registry_model.lookup_manifest_by_digest(
+            repository_ref,
+            subject_sha512,
+            allow_hidden=True,
+            raise_on_error=True,
+        ),
+    ]
+    artifact_type = "application/vnd.example.sbom"
+    allowed_algorithms = ["sha256", "sha384", "sha512"]
+    for queried_subject in queried_subjects:
+        assert (
+            registry_model.lookup_cached_referrers_for_manifest(
+                test_cache,
+                repository_ref,
+                queried_subject,
+                allowed_algorithms=allowed_algorithms,
+            )
+            == []
+        )
+        assert (
+            registry_model.lookup_cached_referrers_for_manifest(
+                test_cache,
+                repository_ref,
+                queried_subject,
+                artifact_type=artifact_type,
+                allowed_algorithms=allowed_algorithms,
+            )
+            == []
+        )
+
+    artifact_impl = _build_referrer_manifest(
+        "devtable",
+        "simple",
+        "fallback-cache-referrer",
+        artifact_type=artifact_type,
+    )
+    artifact, _ = registry_model.create_manifest_and_retarget_tag(
+        repository_ref,
+        artifact_impl,
+        "fallback-cache-referrer",
+        storage,
+        requested_digest=artifact_impl.digest,
+        raise_on_error=True,
+    )
+    index_builder = OCIIndexBuilder()
+    index_builder.add_manifest_digest(
+        artifact.digest,
+        len(artifact.internal_manifest_bytes.as_encoded_str()),
+        artifact.media_type,
+        None,
+        None,
+    )
+    index = index_builder.build()
+    registry_model.create_manifest_and_retarget_tag(
+        repository_ref,
+        index,
+        "-".join(subject_sha512.split(":", 1)),
+        storage,
+        requested_digest=index.digest,
+        model_cache=test_cache,
+        raise_on_error=True,
+    )
+
+    for queried_subject in queried_subjects:
+        unfiltered = registry_model.lookup_cached_referrers_for_manifest(
+            test_cache,
+            repository_ref,
+            queried_subject,
+            allowed_algorithms=allowed_algorithms,
+        )
+        filtered = registry_model.lookup_cached_referrers_for_manifest(
+            test_cache,
+            repository_ref,
+            queried_subject,
+            artifact_type=artifact_type,
+            allowed_algorithms=allowed_algorithms,
+        )
+        assert [referrer.id for referrer in unfiltered] == [artifact.id]
+        assert [referrer.id for referrer in filtered] == [artifact.id]
+
+
+def test_referrers_cache_preserves_disabled_artifacts_for_reenable(initialized_db, registry_model):
+    test_cache = InMemoryDataModelCache(TEST_CACHE_CONFIG)
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+    subject_impl = _create_oci_manifest_with_blobs("devtable", "simple").build()
+    subject, _ = registry_model.create_manifest_and_retarget_tag(
+        repository_ref,
+        subject_impl,
+        "reenable-cache-subject",
+        storage,
+        requested_digest=subject_impl.digest,
+        raise_on_error=True,
+    )
+    artifact_impl = _build_referrer_manifest(
+        "devtable",
+        "simple",
+        "reenable-cache-referrer",
+        subject=subject,
+        artifact_type="application/vnd.example.signature",
+    )
+    artifact, _ = registry_model.create_manifest_and_retarget_tag(
+        repository_ref,
+        artifact_impl,
+        "reenable-cache-referrer",
+        storage,
+        requested_digest=artifact_impl.digest,
+        raise_on_error=True,
+    )
+    artifact_sha512 = _add_manifest_registration(repository_ref, artifact, "sha512")
+    RepositoryManifestDigest.delete().where(
+        RepositoryManifestDigest.repository == repository_ref.id,
+        RepositoryManifestDigest.manifest == artifact.id,
+        RepositoryManifestDigest.digest == artifact.digest,
+    ).execute()
+
+    disabled = registry_model.lookup_cached_referrers_for_manifest(
+        test_cache,
+        repository_ref,
+        subject,
+        allowed_algorithms=["sha256", "sha384"],
+    )
+    reenabled = registry_model.lookup_cached_referrers_for_manifest(
+        test_cache,
+        repository_ref,
+        subject,
+        allowed_algorithms=["sha256", "sha384", "sha512"],
+    )
+
+    assert disabled == []
+    assert [referrer.digest for referrer in reenabled] == [artifact_sha512]
 
 
 def test_referrers_cache_artifact_type_isolation(initialized_db, registry_model):

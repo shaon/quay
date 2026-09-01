@@ -81,8 +81,11 @@ logger = logging.getLogger(__name__)
 BASE_MANIFEST_ROUTE = '/<repopath:repository>/manifests/<regex("{0}"):manifest_ref>'
 MANIFEST_DIGEST_ROUTE = BASE_MANIFEST_ROUTE.format(digest_tools.DIGEST_PATTERN)
 MANIFEST_TAGNAME_ROUTE = BASE_MANIFEST_ROUTE.format(VALID_TAG_PATTERN)
+SHA512_REFERRERS_TAG_PATTERN = r"sha512-[a-f0-9]{128}"
+SHA512_REFERRERS_TAG_ROUTE = BASE_MANIFEST_ROUTE.format(SHA512_REFERRERS_TAG_PATTERN)
 
 
+@v2_bp.route(SHA512_REFERRERS_TAG_ROUTE, methods=["GET"])
 @v2_bp.route(MANIFEST_TAGNAME_ROUTE, methods=["GET"])
 @disallow_for_account_recovery_mode
 @parse_repository_name()
@@ -92,6 +95,7 @@ MANIFEST_TAGNAME_ROUTE = BASE_MANIFEST_ROUTE.format(VALID_TAG_PATTERN)
 @anon_protect
 @inject_registry_model()
 def fetch_manifest_by_tagname(namespace_name, repo_name, manifest_ref, registry_model):
+    _validate_referrers_tag_algorithm(manifest_ref)
     try:
         repository_ref = registry_model.lookup_repository(
             namespace_name,
@@ -330,6 +334,7 @@ def _doesnt_accept_schema_v1():
     )
 
 
+@v2_bp.route(SHA512_REFERRERS_TAG_ROUTE, methods=["PUT"])
 @v2_bp.route(MANIFEST_TAGNAME_ROUTE, methods=["PUT"])
 @disallow_for_account_recovery_mode
 @parse_repository_name()
@@ -341,6 +346,7 @@ def _doesnt_accept_schema_v1():
 @check_readonly
 @check_pushes_disabled
 def write_manifest_by_tagname(namespace_name, repo_name, manifest_ref):
+    _validate_referrers_tag_algorithm(manifest_ref)
     # A tag-addressed PUT carries no client-selected digest algorithm. Its historical external
     # identity is canonical SHA-256, so reject the request rather than choosing another enabled
     # algorithm implicitly.
@@ -507,9 +513,20 @@ def write_manifest_by_digest(namespace_name, repo_name, manifest_ref):
 def _requested_manifest_tags():
     tags = list(dict.fromkeys(request.args.getlist("tag")))
     for tag in tags:
-        if re.fullmatch(VALID_TAG_PATTERN, tag) is None:
+        if (
+            re.fullmatch(VALID_TAG_PATTERN, tag) is None
+            and re.fullmatch(SHA512_REFERRERS_TAG_PATTERN, tag) is None
+        ):
             raise TagInvalid(detail={"tag": tag})
+        _validate_referrers_tag_algorithm(tag)
     return tags
+
+
+def _validate_referrers_tag_algorithm(tag):
+    for algorithm, encoded_length in digest_tools.DIGEST_ALGORITHM_LENGTHS.items():
+        if re.fullmatch(rf"{algorithm}-[a-f0-9]{{{encoded_length}}}", tag):
+            _validate_manifest_digest_algorithm(algorithm)
+            return
 
 
 def _parse_manifest_reference(manifest_ref):

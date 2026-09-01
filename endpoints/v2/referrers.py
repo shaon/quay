@@ -54,7 +54,11 @@ def list_manifest_referrers(namespace_name, repo_name, manifest_ref, registry_mo
     artifact_type = request.args.get("artifactType", None)
 
     referrers = registry_model.lookup_cached_referrers_for_manifest(
-        model_cache, repository_ref, manifest, artifact_type
+        model_cache,
+        repository_ref,
+        manifest,
+        artifact_type,
+        allowed_algorithms=app.config.get("ALLOWED_HASH_ALGORITHMS", ["sha256"]),
     )
     index = _build_referrers_index_for_manifests(referrers)
     headers = {"Content-Type": index.media_type}
@@ -98,11 +102,6 @@ def _validate_manifest_reference(manifest_ref):
             },
         )
 
-    # Alternative-digest referrer discovery is intentionally deferred to Demo 8. Keep this
-    # capability boundary ahead of the global allowlist so enabled alternative algorithms still
-    # report "unsupported" for this API.
-    if parsed.hash_alg != "sha256":
-        raise DigestUnsupported(parsed.hash_alg)
     if parsed.hash_alg not in app.config.get("ALLOWED_HASH_ALGORITHMS", ["sha256"]):
         raise DigestDisabled(parsed.hash_alg)
     return str(parsed)

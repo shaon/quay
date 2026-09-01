@@ -307,10 +307,11 @@ class OCIModel(RegistryDataInterface):
             digest=manifest_digest,
         )
 
-    def _repository_sha256_referrers(self, repository_ref, referrers):
+    def _repository_visible_referrers(self, repository_ref, referrers, allowed_algorithms=None):
         selected = []
+        selected_ids = set()
         for referrer in referrers:
-            if referrer is None:
+            if referrer is None or referrer.id in selected_ids:
                 continue
 
             referrer_row = database.Manifest.get_or_none(
@@ -323,7 +324,7 @@ class OCIModel(RegistryDataInterface):
             digest = oci.manifest.get_repository_manifest_digest(
                 repository_ref._db_id,
                 referrer_row,
-                allowed_algorithms=["sha256"],
+                allowed_algorithms=allowed_algorithms,
             )
             if digest is None:
                 continue
@@ -335,15 +336,23 @@ class OCIModel(RegistryDataInterface):
                     digest=digest,
                 )
             )
+            selected_ids.add(referrer_row.id)
         return selected
 
     def lookup_cached_referrers_for_manifest(
-        self, model_cache, repository_ref, manifest, artifact_type=None
+        self,
+        model_cache,
+        repository_ref,
+        manifest,
+        artifact_type=None,
+        allowed_algorithms=None,
     ):
         def load_referrers():
             cacheable_referrers = []
             for referrer in self.lookup_referrers_for_manifest(
-                repository_ref, manifest, artifact_type
+                repository_ref,
+                manifest,
+                artifact_type,
             ):
                 referrer_dict = referrer.asdict()
                 referrer_dict["internal_manifest_bytes"] = referrer_dict[
@@ -365,19 +374,32 @@ class OCIModel(RegistryDataInterface):
         )
         result = model_cache.retrieve(referrers_cache_key, load_referrers)
         try:
+            cached_referrers = []
             for referrer_dict in result:
-                referrer_dict["internal_manifest_bytes"] = Bytes.for_string_or_unicode(
+                hydrated_referrer = dict(referrer_dict)
+                hydrated_referrer["inputs"] = dict(referrer_dict["inputs"])
+                hydrated_referrer["internal_manifest_bytes"] = Bytes.for_string_or_unicode(
                     referrer_dict["internal_manifest_bytes"]
                 )
-            cached_referrers = [Manifest.from_dict(referrer_dict) for referrer_dict in result]
-            # Cached descriptors may predate the Demo 1 boundary. Rebuild every cache hit from the
-            # current repository rows so a stale alternative or hidden canonical digest cannot be
-            # exposed.
-            return self._repository_sha256_referrers(repository_ref, cached_referrers)
+                cached_referrers.append(Manifest.from_dict(hydrated_referrer))
+            # Rebuild every cache hit from current repository registrations and the active
+            # allowlist so stale, disabled, cross-repository, or hidden identities are not exposed.
+            return self._repository_visible_referrers(
+                repository_ref,
+                cached_referrers,
+                allowed_algorithms=allowed_algorithms,
+            )
         except FromDictionaryException:
-            return self.lookup_referrers_for_manifest(repository_ref, manifest, artifact_type)
+            return self.lookup_referrers_for_manifest(
+                repository_ref,
+                manifest,
+                artifact_type,
+                allowed_algorithms=allowed_algorithms,
+            )
 
-    def lookup_referrers_for_manifest(self, repository_ref, manifest, artifact_type=None):
+    def lookup_referrers_for_manifest(
+        self, repository_ref, manifest, artifact_type=None, allowed_algorithms=None
+    ):
         """
         Looks up the referrers of a manifest under a repository.
         Returns a manifest index.
@@ -389,42 +411,67 @@ class OCIModel(RegistryDataInterface):
             )
         )
 
-        referrers_manifests = self._repository_sha256_referrers(repository_ref, referrers)
+        referrers_manifests = self._repository_visible_referrers(
+            repository_ref,
+            referrers,
+            allowed_algorithms=allowed_algorithms,
+        )
         referrer_ids = {referrer.id for referrer in referrers}
 
-        # Check for existing image indices with referrers tag schema
-        referrers_tag_schema_index = self.lookup_referrers_for_tag_schema(manifest)
-        if referrers_tag_schema_index:
-            for m in referrers_tag_schema_index:
-                if m is None or (
-                    m.id in referrer_ids
-                    or artifact_type is not None
-                    and artifact_type != m.artifact_type
-                ):
-                    continue
-                referrers_manifests.extend(self._repository_sha256_referrers(repository_ref, [m]))
+        # Check every repository-visible subject identity for the referrers tag schema. Multiple
+        # aliases and native discovery can identify the same canonical artifact, so deduplicate by
+        # manifest ID before selecting an external descriptor identity.
+        fallback_referrers = []
+        for fallback_referrer in self.lookup_referrers_for_tag_schema(manifest):
+            if fallback_referrer is None or fallback_referrer.id in referrer_ids:
+                continue
+            if artifact_type is not None and artifact_type != fallback_referrer.artifact_type:
+                continue
+            referrer_ids.add(fallback_referrer.id)
+            fallback_referrers.append(fallback_referrer)
 
+        referrers_manifests.extend(
+            self._repository_visible_referrers(
+                repository_ref,
+                fallback_referrers,
+                allowed_algorithms=allowed_algorithms,
+            )
+        )
         return referrers_manifests
 
     def lookup_referrers_for_tag_schema(self, manifest):
-        retriever = RepositoryContentRetriever(manifest.repository._db_id, None)
-
-        referrers_tag_schema_tag = oci.tag.get_tag(
-            manifest.repository._db_id,
-            "-".join(manifest.digest.split(":", 1)),
+        repository_id = manifest.repository._db_id
+        subject_row = database.Manifest.get_or_none(
+            database.Manifest.id == manifest.id,
+            database.Manifest.repository == repository_id,
         )
+        if subject_row is None:
+            return []
 
-        if (
-            referrers_tag_schema_tag
-            and referrers_tag_schema_tag.manifest.media_type.name == OCI_IMAGE_INDEX_CONTENT_TYPE
+        retriever = RepositoryContentRetriever(repository_id, None)
+        referrers = []
+        for subject_digest in oci.manifest.get_repository_manifest_digests(
+            repository_id, subject_row
         ):
-            tag_schema_index = ManifestIndex.for_manifest_index(
-                referrers_tag_schema_tag.manifest, self._legacy_image_id_handler
+            referrers_tag_schema_tag = oci.tag.get_tag(
+                repository_id,
+                "-".join(subject_digest.split(":", 1)),
             )
-            if tag_schema_index:
-                return tag_schema_index.manifests(retriever, self._legacy_image_id_handler)
+            if (
+                referrers_tag_schema_tag
+                and referrers_tag_schema_tag.manifest.media_type.name
+                == OCI_IMAGE_INDEX_CONTENT_TYPE
+            ):
+                tag_schema_index = ManifestIndex.for_manifest_index(
+                    referrers_tag_schema_tag.manifest,
+                    self._legacy_image_id_handler,
+                )
+                if tag_schema_index:
+                    referrers.extend(
+                        tag_schema_index.manifests(retriever, self._legacy_image_id_handler)
+                    )
 
-        return []
+        return referrers
 
     def create_manifest_label(self, manifest, key, value, source_type_name, media_type_name=None):
         """
@@ -650,6 +697,33 @@ class OCIModel(RegistryDataInterface):
                 )
             )
 
+    def _invalidate_referrers_cache_for_subject(
+        self, repository_ref, subject_manifest, artifact_types, model_cache
+    ):
+        if model_cache is None:
+            return
+
+        subject_cache_digests = oci.manifest.get_repository_manifest_digests(
+            repository_ref._db_id, subject_manifest
+        )
+        for visible_digest in subject_cache_digests:
+            model_cache.invalidate(
+                cache_key.for_manifest_referrers(
+                    repository_ref._db_id,
+                    visible_digest,
+                    model_cache.cache_config,
+                )
+            )
+            for artifact_type in artifact_types:
+                model_cache.invalidate(
+                    cache_key.for_manifest_referrers(
+                        repository_ref._db_id,
+                        visible_digest,
+                        model_cache.cache_config,
+                        artifact_type=artifact_type,
+                    )
+                )
+
     def _invalidate_referrers_cache_for_manifest(
         self, repository_ref, manifest_interface_instance, model_cache
     ):
@@ -663,27 +737,67 @@ class OCIModel(RegistryDataInterface):
             subject_digest,
             unknown_exception=oci.manifest.ManifestSubjectUnknownException,
         )
-        subject_cache_digests = set(
-            oci.manifest.get_repository_manifest_digests(repository_ref._db_id, subject_manifest)
+        artifact_type = manifest_interface_instance.artifact_type
+        self._invalidate_referrers_cache_for_subject(
+            repository_ref,
+            subject_manifest,
+            [artifact_type] if artifact_type is not None else [],
+            model_cache,
         )
-        # Internal wrappers use the canonical digest as their cache key even when that identity is
-        # not externally visible. Invalidating it does not expose it.
-        subject_cache_digests.add(subject_manifest.digest)
-        for visible_digest in subject_cache_digests:
-            unfiltered_key = cache_key.for_manifest_referrers(
-                repository_ref._db_id, visible_digest, model_cache.cache_config
-            )
-            model_cache.invalidate(unfiltered_key)
 
-            artifact_type = manifest_interface_instance.artifact_type
-            if artifact_type is not None:
-                filtered_key = cache_key.for_manifest_referrers(
-                    repository_ref._db_id,
-                    visible_digest,
-                    model_cache.cache_config,
-                    artifact_type=artifact_type,
-                )
-                model_cache.invalidate(filtered_key)
+    def _invalidate_referrers_cache_for_fallback_tags(
+        self, repository_ref, tag_names, index_manifests, model_cache
+    ):
+        if model_cache is None:
+            return
+
+        repository_id = repository_ref._db_id
+        index_ids = {
+            manifest.id
+            for manifest in index_manifests
+            if manifest is not None
+            and (
+                database.Manifest.media_type.get_name(manifest.media_type_id)
+                == OCI_IMAGE_INDEX_CONTENT_TYPE
+            )
+        }
+        if not index_ids:
+            return
+
+        child_ids = {
+            relationship.child_manifest_id
+            for relationship in ManifestChild.select(ManifestChild.child_manifest).where(
+                ManifestChild.repository == repository_id,
+                ManifestChild.manifest.in_(index_ids),
+            )
+        }
+        artifact_types = {
+            manifest.artifact_type
+            for manifest in database.Manifest.select(database.Manifest.artifact_type).where(
+                database.Manifest.repository == repository_id,
+                database.Manifest.id.in_(child_ids),
+                database.Manifest.artifact_type.is_null(False),
+            )
+        }
+
+        invalidated_subject_ids = set()
+        for tag_name in tag_names:
+            subject_digest = tag_name.replace("-", ":", 1)
+            subject_manifest = oci.manifest.lookup_manifest(
+                repository_id,
+                subject_digest,
+                allow_dead=True,
+                allow_hidden=True,
+            )
+            if subject_manifest is None or subject_manifest.id in invalidated_subject_ids:
+                continue
+            invalidated_subject_ids.add(subject_manifest.id)
+            self._invalidate_referrers_cache_for_subject(
+                repository_ref,
+                subject_manifest,
+                artifact_types,
+                model_cache,
+            )
 
     def create_manifest_and_retarget_tag(
         self,
@@ -732,6 +846,12 @@ class OCIModel(RegistryDataInterface):
             )
             self._invalidate_referrers_cache_for_manifest(
                 repository_ref, manifest_interface_instance, model_cache
+            )
+            self._invalidate_referrers_cache_for_fallback_tags(
+                repository_ref,
+                list(dict.fromkeys([tag_name, *(additional_tag_names or [])])),
+                [*previous_manifests, current_manifest],
+                model_cache,
             )
         return result
 

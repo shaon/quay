@@ -247,6 +247,17 @@ def _put_manifest(
     )
 
 
+def _register_manifest_alias(repository_name, canonical_digest, content, algorithm):
+    repository = model.repository.get_repository(*repository_name.split("/", 1))
+    manifest = Manifest.get(
+        Manifest.repository == repository,
+        Manifest.digest == canonical_digest,
+    )
+    alias = f"{algorithm}:" + hashlib.new(algorithm, content).hexdigest()
+    model.oci.manifest.register_repository_manifest_digest(repository.id, manifest, alias)
+    return alias
+
+
 def _repository_publication_state(repository_name):
     repository = model.repository.get_repository(*repository_name.split("/", 1))
     return {
@@ -2417,15 +2428,12 @@ def test_manifest_list_rejects_cross_repository_and_unknown_child(client, app):
 
 
 @pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
-def test_alternative_referrer_subject_query_is_unsupported_when_enabled(algorithm, client, app):
+def test_alternative_referrer_subject_query_is_disabled_when_not_allowed(algorithm, client, app):
     repository = "devtable/simple"
     digest = f"{algorithm}:" + "a" * hashlib.new(algorithm).digest_size * 2
 
     with (
-        patch.dict(
-            realapp.config,
-            {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384", "sha512"]},
-        ),
+        patch.dict(realapp.config, {"ALLOWED_HASH_ALGORITHMS": ["sha256"]}),
         toggle_feature("REFERRERS_API", True),
     ):
         response = conduct_call(
@@ -2440,8 +2448,8 @@ def test_alternative_referrer_subject_query_is_unsupported_when_enabled(algorith
 
     assert response.get_json()["errors"][0] == {
         "code": "UNSUPPORTED",
-        "message": "digest algorithm is unsupported",
-        "detail": {"algorithm": algorithm, "reason": "unsupported"},
+        "message": "digest algorithm is disabled by registry configuration",
+        "detail": {"algorithm": algorithm, "reason": "disabled"},
     }
 
 
@@ -2477,6 +2485,37 @@ def test_referrer_subject_query_parses_strictly_before_capability_check(
     error = response.get_json()["errors"][0]
     assert error["code"] == expected_code
     assert error["detail"]["reason"] == expected_reason
+
+
+@pytest.mark.parametrize(
+    "digest,allowed_algorithms,expected_reason",
+    [
+        ("sha384:" + "a" * 95, ["sha256", "sha384"], "malformed"),
+        ("sha999:" + "a" * 96, ["sha256", "sha384", "sha512"], "unsupported"),
+        ("sha512:" + "a" * 128, ["sha256", "sha384"], "disabled"),
+    ],
+)
+def test_story8_referrer_digest_rejection_precedes_repository_lookup(
+    digest, allowed_algorithms, expected_reason, client, app
+):
+    repository = "devtable/simple"
+    with (
+        patch.dict(realapp.config, {"ALLOWED_HASH_ALGORITHMS": allowed_algorithms}),
+        patch.object(registry_model, "lookup_repository") as lookup_repository,
+        toggle_feature("REFERRERS_API", True),
+    ):
+        response = conduct_call(
+            client,
+            "v2.list_manifest_referrers",
+            url_for,
+            "GET",
+            {"repository": repository, "manifest_ref": digest},
+            expected_code=400,
+            headers=_manifest_auth_headers(repository, actions=("pull",)),
+        )
+
+    lookup_repository.assert_not_called()
+    assert response.get_json()["errors"][0]["detail"]["reason"] == expected_reason
 
 
 @pytest.mark.parametrize(
@@ -2799,6 +2838,309 @@ def test_story7_subject_descriptor_validation_prevents_artifact_publication(
             "field": expected_field,
         }
     assert _repository_publication_state(repository) == before
+
+
+@pytest.mark.parametrize(
+    "subject_algorithm,artifact_algorithm,publication",
+    [
+        ("sha256", "sha384", "digest"),
+        ("sha384", "sha512", "digest"),
+        ("sha512", "sha256", "digest"),
+        ("sha512", "sha384", "tag"),
+    ],
+)
+def test_story8_discovers_registered_referrers(
+    subject_algorithm, artifact_algorithm, publication, client, app
+):
+    repository = "devtable/simple"
+    subject = _sha512_single_manifest(
+        repository,
+        f"story8 {subject_algorithm} subject".encode(),
+        algorithm=subject_algorithm,
+    )
+    subject["media_type"] = DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE
+    artifact = _oci_artifact(
+        repository,
+        subject,
+        layer_bytes=f"story8 {artifact_algorithm} {publication} artifact".encode(),
+        algorithm=artifact_algorithm,
+    )
+    pull_headers = _manifest_auth_headers(repository, actions=("pull",))
+    test_cache = InMemoryDataModelCache(TEST_CACHE_CONFIG)
+
+    with (
+        patch.dict(
+            realapp.config,
+            {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384", "sha512"]},
+        ),
+        patch("endpoints.v2.manifest.model_cache", test_cache),
+        patch("endpoints.v2.referrers.model_cache", test_cache),
+        toggle_feature("REFERRERS_API", True),
+    ):
+        _put_manifest(client, repository, subject["external_digest"], subject)
+        if publication == "digest":
+            _put_manifest(client, repository, artifact["external_digest"], artifact)
+            expected_artifact_digest = artifact["external_digest"]
+        else:
+            conduct_call(
+                client,
+                "v2.write_manifest_by_tagname",
+                url_for,
+                "PUT",
+                {"repository": repository, "manifest_ref": "story8-artifact"},
+                expected_code=201,
+                headers={
+                    **_manifest_auth_headers(repository),
+                    "Content-Type": OCI_IMAGE_MANIFEST_CONTENT_TYPE,
+                },
+                raw_body=artifact["bytes"],
+            )
+            expected_artifact_digest = artifact["canonical_digest"]
+
+        response = conduct_call(
+            client,
+            "v2.list_manifest_referrers",
+            url_for,
+            "GET",
+            {
+                "repository": repository,
+                "manifest_ref": subject["external_digest"],
+                "artifactType": "application/vnd.example.signature",
+            },
+            headers=pull_headers.copy(),
+        )
+        pulled = conduct_call(
+            client,
+            "v2.fetch_manifest_by_digest",
+            url_for,
+            "GET",
+            {
+                "repository": repository,
+                "manifest_ref": expected_artifact_digest,
+            },
+            headers={
+                **pull_headers,
+                "Accept": OCI_IMAGE_MANIFEST_CONTENT_TYPE,
+            },
+        )
+
+    assert response.headers["OCI-Filters-Applied"] == "artifactType"
+    descriptors = response.get_json()["manifests"]
+    assert descriptors == [
+        {
+            "artifactType": "application/vnd.example.signature",
+            "digest": expected_artifact_digest,
+            "mediaType": OCI_IMAGE_MANIFEST_CONTENT_TYPE,
+            "size": len(artifact["bytes"]),
+        }
+    ]
+    assert pulled.data == artifact["bytes"]
+    assert pulled.headers["Docker-Content-Digest"] == expected_artifact_digest
+
+
+@pytest.mark.parametrize("publication", ["tag-route", "digest-tag-parameter"])
+def test_story8_sha512_fallback_tag_route(publication, client, app):
+    repository = "devtable/simple"
+    subject = _sha512_single_manifest(
+        repository,
+        f"story8 sha512 fallback subject {publication}".encode(),
+        algorithm="sha512",
+    )
+    subject["media_type"] = DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE
+    artifact = _oci_artifact(
+        repository,
+        subject,
+        layer_bytes=f"story8 sha512 fallback artifact {publication}".encode(),
+        algorithm="sha512",
+    )
+    fallback_index = _manifest_index(
+        [
+            {
+                "media_type": OCI_IMAGE_MANIFEST_CONTENT_TYPE,
+                "bytes": artifact["bytes"],
+                "descriptor_digest": artifact["external_digest"],
+                "architecture": "amd64",
+            }
+        ],
+        algorithm="sha256",
+    )
+    fallback_tag = subject["external_digest"].replace(":", "-", 1)
+
+    with patch.dict(
+        realapp.config,
+        {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384", "sha512"]},
+    ):
+        _put_manifest(client, repository, subject["external_digest"], subject)
+        _put_manifest(client, repository, artifact["external_digest"], artifact)
+        if publication == "tag-route":
+            conduct_call(
+                client,
+                "v2.write_manifest_by_tagname",
+                url_for,
+                "PUT",
+                {"repository": repository, "manifest_ref": fallback_tag},
+                expected_code=201,
+                headers={
+                    **_manifest_auth_headers(repository),
+                    "Content-Type": OCI_IMAGE_INDEX_CONTENT_TYPE,
+                },
+                raw_body=fallback_index["bytes"],
+            )
+        else:
+            _put_manifest(
+                client,
+                repository,
+                fallback_index["external_digest"],
+                fallback_index,
+                tag=fallback_tag,
+            )
+        pulled = conduct_call(
+            client,
+            "v2.fetch_manifest_by_tagname",
+            url_for,
+            "GET",
+            {"repository": repository, "manifest_ref": fallback_tag},
+            headers={
+                **_manifest_auth_headers(repository, actions=("pull",)),
+                "Accept": OCI_IMAGE_INDEX_CONTENT_TYPE,
+            },
+        )
+
+    with patch.dict(
+        realapp.config,
+        {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384"]},
+    ):
+        disabled = conduct_call(
+            client,
+            "v2.fetch_manifest_by_tagname",
+            url_for,
+            "GET",
+            {"repository": repository, "manifest_ref": fallback_tag},
+            expected_code=400,
+            headers=_manifest_auth_headers(repository, actions=("pull",)),
+        )
+
+    assert len(fallback_tag) == 135
+    assert pulled.data == fallback_index["bytes"]
+    assert disabled.get_json()["errors"][0]["detail"] == {
+        "algorithm": "sha512",
+        "reason": "disabled",
+    }
+
+
+def test_story8_aliases_cache_hard_disable_and_repository_isolation(client, app):
+    repository = "devtable/simple"
+    other_repository = "devtable/complex"
+    subject = _sha512_single_manifest(
+        repository,
+        b"story8 multi-alias subject",
+        algorithm="sha512",
+    )
+    subject["media_type"] = DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE
+    artifact = _oci_artifact(
+        repository,
+        subject,
+        layer_bytes=b"story8 multi-alias artifact",
+        algorithm="sha512",
+    )
+    headers = _manifest_auth_headers(repository, actions=("pull",))
+    other_headers = _manifest_auth_headers(other_repository, actions=("pull",))
+    test_cache = InMemoryDataModelCache(TEST_CACHE_CONFIG)
+
+    with (
+        patch("endpoints.v2.manifest.model_cache", test_cache),
+        patch("endpoints.v2.referrers.model_cache", test_cache),
+        toggle_feature("REFERRERS_API", True),
+    ):
+        with patch.dict(
+            realapp.config,
+            {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384", "sha512"]},
+        ):
+            _put_manifest(client, repository, subject["external_digest"], subject)
+            _put_manifest(client, repository, artifact["external_digest"], artifact)
+            subject_sha384 = _register_manifest_alias(
+                repository,
+                subject["canonical_digest"],
+                subject["bytes"],
+                "sha384",
+            )
+            artifact_sha384 = _register_manifest_alias(
+                repository,
+                artifact["canonical_digest"],
+                artifact["bytes"],
+                "sha384",
+            )
+
+            for subject_digest in (subject["external_digest"], subject_sha384):
+                response = conduct_call(
+                    client,
+                    "v2.list_manifest_referrers",
+                    url_for,
+                    "GET",
+                    {"repository": repository, "manifest_ref": subject_digest},
+                    headers=headers.copy(),
+                )
+                assert response.get_json()["manifests"][0]["digest"] == artifact["external_digest"]
+
+            for rejected_repository, rejected_digest, rejected_headers in (
+                (repository, subject["canonical_digest"], headers),
+                (other_repository, subject_sha384, other_headers),
+                (repository, "sha384:" + "0" * 96, headers),
+            ):
+                rejected = conduct_call(
+                    client,
+                    "v2.list_manifest_referrers",
+                    url_for,
+                    "GET",
+                    {
+                        "repository": rejected_repository,
+                        "manifest_ref": rejected_digest,
+                    },
+                    expected_code=400,
+                    headers=rejected_headers.copy(),
+                )
+                assert rejected.get_json()["errors"][0]["code"] == "MANIFEST_INVALID"
+
+            conduct_call(
+                client,
+                "v2.list_manifest_referrers",
+                url_for,
+                "GET",
+                {"repository": repository, "manifest_ref": subject_sha384},
+                expected_code=401,
+            )
+
+        with patch.dict(
+            realapp.config,
+            {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384"]},
+        ):
+            enabled_alias = conduct_call(
+                client,
+                "v2.list_manifest_referrers",
+                url_for,
+                "GET",
+                {"repository": repository, "manifest_ref": subject_sha384},
+                headers=headers.copy(),
+            )
+            disabled_alias = conduct_call(
+                client,
+                "v2.list_manifest_referrers",
+                url_for,
+                "GET",
+                {
+                    "repository": repository,
+                    "manifest_ref": subject["external_digest"],
+                },
+                expected_code=400,
+                headers=headers.copy(),
+            )
+
+    assert enabled_alias.get_json()["manifests"][0]["digest"] == artifact_sha384
+    assert disabled_alias.get_json()["errors"][0] == {
+        "code": "UNSUPPORTED",
+        "message": "digest algorithm is disabled by registry configuration",
+        "detail": {"algorithm": "sha512", "reason": "disabled"},
+    }
 
 
 def test_sha256_referrer_query_and_artifact_type_filter_continue_working(client, app):

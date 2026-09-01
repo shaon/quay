@@ -395,7 +395,7 @@ def lookup_manifest_referrers(repository_id, manifest_digest, artifact_type=None
     if artifact_type is not None:
         query = query.where(Manifest.artifact_type == artifact_type)
 
-    return query
+    return query.order_by(Manifest.id)
 
 
 @overload

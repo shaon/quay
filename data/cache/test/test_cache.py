@@ -162,8 +162,8 @@ def test_manifest_referrers_cache_key_scopes_and_sanitizes_artifact_type():
         14, "sha256:subject", TEST_CACHE_CONFIG, artifact_type="application/example"
     )
 
-    assert unfiltered.key == "manifest_referrers__14_sha256:subject"
-    assert filtered.key.startswith("manifest_referrers__14_sha256:subject_artifact_type_")
+    assert unfiltered.key == "manifest_referrers_v2__14_sha256:subject"
+    assert filtered.key.startswith("manifest_referrers_v2__14_sha256:subject_artifact_type_")
     assert "application/example" not in filtered.key
     assert len(filtered.key.rsplit("_", 1)[-1]) == 64
 

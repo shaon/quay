@@ -113,7 +113,7 @@ def for_manifest_referrers(repository_id, manifest_digest, cache_config, artifac
     filtered and unfiltered queries use separate cache entries.
     """
     cache_ttl = cache_config.get("manifest_referrers_cache_ttl", "60s")
-    key = f"manifest_referrers__{repository_id}_{manifest_digest}"
+    key = f"manifest_referrers_v2__{repository_id}_{manifest_digest}"
     if artifact_type is not None:
         artifact_type_hash = hashlib.sha256(artifact_type.encode("utf-8")).hexdigest()
         key = f"{key}_artifact_type_{artifact_type_hash}"
