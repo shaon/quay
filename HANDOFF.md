@@ -1,2464 +1,280 @@
-# Quay Multi-Algorithm Digest Handoff
+# Quay Configurable-Digest Handoff
+
+## Purpose
+
+This file is the current operational snapshot for the next implementation session. It is not a cumulative execution log. Detailed history remains in Git.
+
+The feature goal is to support repository-visible SHA-256, SHA-384, and SHA-512 identities for selected Registry V2 operations while keeping SHA-256 as Quay's canonical internal storage, deduplication, manifest, and graph identity.
 
 ## Start here
 
 1. Work only in `/Users/shossain/QuayWorkspace/shaon-feature-PQC`.
-2. Read `AGENTS.md` and `IMPLEMENTATION_PLAN.md` completely.
-3. Read `agent_docs/api.md`, `agent_docs/database.md`, `agent_docs/architecture.md`, and `agent_docs/testing.md`.
-4. Inspect the branch and uncommitted diff before changing anything.
-5. Continue the existing work. Do not discard, overwrite, commit, or revert it.
+2. Use branch `shaon-feature-PQC`.
+3. Read `AGENTS.md`, `IMPLEMENTATION_PLAN.md`, and the relevant `agent_docs/` files completely.
+4. Recheck branch, HEAD, merge base, status, staging, untracked files, worktrees, recent history, and `master...HEAD` before changing files.
+5. Continue the existing implementation. Do not reset, rebase, restore, discard, overwrite, or replace work.
+6. Do not access or modify `/Users/shossain/QuayWorkspace/11537-pqc-schema`.
+7. Do not push, alter remotes, update pull requests, or modify another worktree.
+8. Before modifying files, update only the current session's `.PITASKS.md` section.
 
-## Strict constraints
+## Repository state
 
-- Use branch `shaon-feature-PQC`.
-- Do not modify another worktree.
-- Do not update PR #6917 or PR #6918.
-- Do not open a PR, push, commit, or alter remote branches.
-- SHA-256 remains Quay's canonical internal identity.
-- Alternative digests remain repository-scoped external identities.
-
-## Current repository state
-
-- Integration worktree: `/Users/shossain/QuayWorkspace/shaon-feature-PQC`
-- Integration branch: `shaon-feature-PQC`
+- Worktree: `/Users/shossain/QuayWorkspace/shaon-feature-PQC`
+- Branch: `shaon-feature-PQC`
 - Base branch: `master`
-- Base commit and merge base: `d81004d24669132d45df8fbd1eafc86c149e38fa`
-- Current committed HEAD: `9352a3d42478d2aa696df4b76805e5dbbe9a8290`
-- HEAD subject: `Merge PR #6918 into shaon-feature-PQC`
-- PR #6917 local merge: `7b27d59b3acdf5e9172f3ef25720655a667b5852`
-- PR #6918 local merge: `9352a3d42478d2aa696df4b76805e5dbbe9a8290`
-- Nothing is staged or committed for Handoff 1, Handoff 2, Handoff 3, or Handoff 4.
-- There are 27 modified tracked files with 4,569 insertions and 332 deletions relative to HEAD before the final Handoff 4 documentation update.
-- `.PITASKS.md`, `HANDOFF.md`, and `IMPLEMENTATION_PLAN.md` are untracked.
-- No other worktree, PR, remote branch, or commit was modified.
-
-## Handoff status
-
-### Handoff 1
-
-**Alternative-digest blob lifecycle** remains implemented in the working tree.
-
-Enabled SHA-512 blobs can be uploaded monolithically or in chunks, resumed, validated against the uploaded bytes, registered as repository-scoped external identities, and retrieved through `GET` and `HEAD`. SHA-256 remains the canonical storage identity.
-
-### Handoff 2
-
-**Blob compatibility and mount behavior is complete and has passed final verification and review.**
-
-Completed implementation and focused tests cover:
-
-- Cross-repository SHA-512 mounts through source and destination repository registrations.
-- Exact source-blob mounting by database ID and canonical digest.
-- Source pull authorization, destination push authorization, public-source behavior, and repository isolation.
-- Transactional destination linking and registration.
-- Idempotent repeated mounts and uploads.
-- Destination registration-conflict rejection without remapping the digest.
-- Preservation of legacy SHA-256 mounts and lookups.
-- Prevention of unintended destination SHA-256 visibility for alternative-only mounts.
-- Hintless chunked SHA-512 compatibility without storage readback.
-- Legacy, mixed-version, and mixed-configuration upload-session behavior.
-- Explicit PATCH rejection when the stored algorithm is disabled on the current worker.
-- Final SHA-256 completion of an alternative session because the final digest is authoritative.
-- Precise malformed, unsupported, disabled, unknown, mismatched, and conflict errors.
-- Upload UUID, digest header, and location checks for chunked, resumed, monolithic, mounted, and repeated operations.
-- A real two-connection PostgreSQL registration race test.
-- A real savepoint around registration insertion so an idempotent uniqueness race cannot roll back the caller's canonical link work.
-- Explicit cache verification after an alternative mount and rollback verification for destination mount conflicts.
-
-The complete Handoff 1 and Handoff 2 diff has passed final security, transaction, compatibility, and repository-isolation review.
-
-### Handoff 3
-
-**Transactional repository-scoped single-manifest lifecycle is complete and has passed final verification and review.**
-
-Completed implementation and focused tests cover:
-
-- Strict SHA-256 and SHA-512 parsing for manifest digest `GET`, automatic `HEAD`, `PUT`, and `DELETE` routes.
-- Exact-request-byte digest verification before persistence.
-- SHA-256 as the canonical `Manifest.digest` identity and `RepositoryManifestDigest` as the repository-scoped external identity.
-- Alternative-only manifests that do not expose their internal canonical SHA-256 identity.
-- Explicit canonical registration when a manifest is pushed by tag or SHA-256 digest.
-- Preservation of historically visible SHA-256 identities before the first alternative registration.
-- Idempotent retries and immutable registration conflicts.
-- Repository-boundary enforcement for both manifest registrations and every local config/layer descriptor.
-- Descriptor resolution through repository-scoped blob registrations, including mixed external digest descriptors.
-- Atomic graph, registration, quota, and tag changes, with rollback on conflicts and quota rejection.
-- Durable quota-error notifications after lifecycle rollback.
-- Persisted `ManifestBlob` graph reads instead of reinterpreting external descriptor identities.
-- Alternative digest tag assignment, `GET`, `HEAD`, `DELETE`, response headers, and locations.
-- Cache invalidation for every registered identity when tags are moved or deleted.
-- Proxy-cache registration for a single manifest fetched by an alternative digest.
-- Precise malformed, unsupported, disabled, mismatched, conflicting, and unknown-descriptor errors.
-- A real two-connection PostgreSQL manifest-registration race with caller transaction work preserved.
-- Explicit rejection of alternative manifest-list identities, which remained Handoff 4 scope at Handoff 3 completion.
-
-### Handoff 4
-
-**Repository-scoped multi-algorithm OCI graph support is complete and has passed final verification and adversarial review.**
-
-SHA-512 OCI indexes and Docker manifest lists, mixed child identities, artifacts, subjects, referrers, nested availability, transactional graph/tag registration, descendant cache invalidation, proxy-cache mixed indexes, and manifest-registration GC are implemented. Exact outcomes and remaining secondary-ingestion limits are documented below.
-
-## Design decisions and contracts
-
-### Identity and registration
-
-- `ImageStorage.content_checksum` remains canonical SHA-256.
-- `RepositoryBlobDigest` remains the repository-scoped external identity.
-- A new alternative-only upload or mount receives only its alternative registration.
-- Its internal SHA-256 identity is not exposed through registry lookup.
-- If a repository/blob pair already had legacy SHA-256 visibility before its first alternative registration, SHA-256 is first preserved as an explicit registration.
-- Mounting SHA-256 explicitly creates a destination SHA-256 registration.
-- Registrations are idempotent for the same repository, digest, and canonical content.
-- A digest cannot be remapped to different canonical content in the same repository.
-
-### Mount behavior and authorization
-
-- The `mount` digest is strictly parsed and checked against `ALLOWED_HASH_ALGORITHMS` before source lookup.
-- The destination route requires write permission.
-- A private source requires an exact source pull grant. Public sources retain existing public-read behavior.
-- Superuser and global read-only superuser source reads follow the existing feature contracts.
-- Source lookup occurs only in the repository named by `from`.
-- The exact authorized source `ImageStorage` row is linked into the destination.
-- The requested external digest is registered in the destination in the same transaction as the temporary link.
-- Unknown source repositories, inaccessible private sources, unknown valid source digests, and omitted `from` continue to fall back to a normal `202` upload response. This preserves Distribution mount fallback behavior without revealing private source contents.
-- Malformed, unsupported, and disabled mount digests fail immediately with a registry error instead of falling back.
-- A destination digest conflict returns `DIGEST_INVALID` and does not remap the existing registration.
-
-### Hintless uploads and persisted state
-
-- When exactly one supported non-SHA-256 algorithm is configured, currently SHA-512, a hintless upload tracks it from byte zero in parallel with canonical SHA-256.
-- This permits a hintless multi-request upload to finalize as SHA-256 or SHA-512 without reading uploaded bytes back from storage.
-- The persisted JSON envelope contains the algorithm, architecture, byte order, byte count, origin (`hint` or `hintless`), format version, and base64 native state.
-- Restoration validates the persisted byte count against `BlobUpload.byte_count`. This detects chunks accepted by an older worker that did not update the alternative state.
-- No pickle or other unsafe deserialization is used.
-- An invalid or stale explicit state rejects resume.
-- An invalid, stale, incompatible-architecture, or unsupported hintless state degrades to legacy SHA-256 behavior. It cannot later finalize with the discarded alternative identity.
-- Legacy sessions with null requested-digest fields remain SHA-256 sessions.
-- A legacy empty session may infer an enabled alternative algorithm from its final request because all bytes arrive after inference.
-- A legacy session with prior bytes cannot switch to an untracked alternative algorithm.
-
-### Rolling configuration and final digest
-
-- PATCH rejects an explicitly requested algorithm if it is disabled on the current worker. No bytes are accepted.
-- Status and cancellation do not restore hash state and remain available when an algorithm is disabled or state is corrupt.
-- Hintless alternative tracking may continue internally on a worker where the alternative is disabled. This prevents rolling configuration from breaking legacy SHA-256 clients.
-- Finalization still rejects an alternative digest disabled on the current worker.
-- A final SHA-256 digest can complete a session originally hinted as SHA-512, even if SHA-512 is now disabled. The final digest is authoritative.
-
-### Registry errors
-
-- Malformed digest: `DIGEST_INVALID`, HTTP 400, detail reason `malformed`.
-- Unsupported algorithm: `UNSUPPORTED`, HTTP 400, detail reason `unsupported`.
-- Disabled algorithm: `UNSUPPORTED`, HTTP 400, detail reason `disabled`.
-- Uploaded-content mismatch or registration conflict: `DIGEST_INVALID`, HTTP 400.
-- Unknown valid blob: `BLOB_UNKNOWN`, HTTP 404.
-- Unknown upload UUID or wrong repository: `BLOB_UPLOAD_UNKNOWN`, HTTP 404.
-- Invalid or incompatible persisted explicit state: `BLOB_UPLOAD_INVALID`, HTTP 400.
-
-### Response contract
-
-- Upload start returns `202`, `Docker-Upload-UUID`, upload `Location`, and `Range`.
-- PATCH returns `202`, the same upload UUID, current upload `Location`, and `Range`.
-- Upload status returns `204`, the same upload UUID, current upload `Location`, and `Range`.
-- Successful finalization returns `201`, the authoritative external digest, and blob `Location`.
-- Successful mount returns `201`, the mounted external digest, and destination blob `Location`.
-- Successful monolithic and repeated finalizations do not invent an upload UUID response header.
-- Alternative `GET` and `HEAD` return the requested registered external digest.
-
-### Single-manifest identity and descriptors
-
-- A manifest digest route is parsed strictly before model lookup. Only lowercase, exact-length SHA-256 and SHA-512 values are accepted.
-- A digest `PUT` hashes the exact request bytes with the requested algorithm. The body is never normalized before this validation.
-- `Manifest.digest` remains the canonical SHA-256 identity used by Quay's internal graph.
-- `RepositoryManifestDigest` maps one repository-scoped external digest to that canonical manifest. The registration helper rejects cross-repository manifest rows and digest remapping.
-- A new alternative-only manifest receives no canonical registration. A tag push or explicit SHA-256 digest push intentionally registers SHA-256.
-- A legacy canonical identity that was already visible is explicitly preserved before the first alternative registration.
-- Every config and layer descriptor is strictly parsed, checked against the enabled algorithm set, and resolved through that repository's blob registrations before graph writes.
-- Unknown or cross-repository descriptors return `MANIFEST_BLOB_UNKNOWN` with the descriptor digest.
-- `ManifestBlob` stores canonical blob relationships. Later graph reads use those persisted relationships rather than re-resolving external descriptor strings.
-
-### Single-manifest transactions, cache, and proxy behavior
-
-- Manifest graph creation, external registration, quota accounting, and tag assignment run in one production transaction.
-- Registration insertion uses a nested Peewee `atomic()` savepoint. An idempotent unique-index race does not roll back the caller's work.
-- Quota rejection rolls back graph, registration, quota, and tag rows. Its durable error notification is created after rollback.
-- Cache invalidation covers the canonical digest and every repository registration for both the old and new manifest when tags move, and for affected manifests when tags are deleted.
-- Proxy-cache digest pulls register the requested identity only after the single-manifest placeholder graph and temporary tag exist. A previously visible canonical identity is preserved when necessary.
-- Alternative manifest-list identities are rejected until Handoff 4 supplies complete child identity and graph traversal semantics.
-
-### Manifest response and error contract
-
-- Successful digest `PUT` returns `201`, the requested digest in `Docker-Content-Digest`, and a digest `Location` using that same identity.
-- Digest `GET` and automatic `HEAD` return the exact persisted manifest bytes, original media type, and requested registered identity.
-- Tag `PUT` and tag `GET` continue to return canonical SHA-256.
-- Malformed manifest references or descriptors return `DIGEST_INVALID` with reason `malformed`.
-- Unsupported and disabled algorithms return `UNSUPPORTED` with reasons `unsupported` and `disabled` respectively.
-- Exact-byte mismatch and registration conflict return `DIGEST_INVALID` with reasons `mismatch` and `conflict`.
-- An unknown valid manifest identity returns `MANIFEST_UNKNOWN`. An unknown local descriptor returns `MANIFEST_BLOB_UNKNOWN`.
-
-## Files changed
-
-### Handoff 1 and shared implementation
-
-- `requirements.txt`
-- `mypy.ini`
-- `digest/digest_tools.py`
-- `digest/test/test_digest_tools.py`
-- `data/model/__init__.py`
-- `data/model/blob.py`
-- `data/model/oci/blob.py`
-- `data/registry_model/blobuploader.py`
-- `data/registry_model/datatypes.py`
-- `data/registry_model/interface.py`
-- `data/registry_model/registry_oci_model.py`
-- `data/registry_model/test/test_blobuploader.py`
-- `data/registry_model/test/test_interface.py`
-- `endpoints/v2/blob.py`
-- `endpoints/v2/test/test_blob.py`
-
-### Added to the tracked diff during Handoff 2
-
-- `endpoints/v2/errors.py`
-
-### Added to the tracked diff during Handoff 3
-
-- `data/model/oci/manifest.py`
-- `data/model/oci/test/test_oci_manifest.py`
-- `data/registry_model/registry_proxy_model.py`
-- `data/registry_model/test/test_registry_proxy_model.py`
-- `endpoints/test/shared.py`
-- `endpoints/v2/manifest.py`
-- `endpoints/v2/test/test_manifest.py`
-
-Handoff 3 also extends shared files already modified by Handoff 1 and Handoff 2: `data/model/__init__.py`, `data/registry_model/interface.py`, `data/registry_model/registry_oci_model.py`, `data/registry_model/test/test_interface.py`, `digest/digest_tools.py`, and `digest/test/test_digest_tools.py`.
-
-### Local planning and task state
-
-- `.PITASKS.md`
-- `HANDOFF.md`
-- `IMPLEMENTATION_PLAN.md`
-
-No schema or migration file was changed during Handoff 2.
-
-## Verification completed in Handoff 2
-
-### Focused SQLite behavior suite
-
-Command:
-
-`TEST=true PYTHONPATH=. .venv/bin/pytest digest/test/test_digest_tools.py data/registry_model/test/test_blobuploader.py data/registry_model/test/test_interface.py endpoints/v2/test/test_blob.py -q --tb=short`
-
-Result: **201 passed, 1 skipped**.
-
-The skipped test is intentionally PostgreSQL-only live concurrency coverage. It was run separately against PostgreSQL and passed.
-
-### Broad blob, proxy-cache, migration, field, and configuration regression suite
-
-Command:
-
-`TEST=true PYTHONPATH=. .venv/bin/pytest digest/test/test_digest_tools.py data/model/test/test_blob.py data/model/test/test_model_blob.py data/registry_model/test/test_blobuploader.py data/registry_model/test/test_interface.py endpoints/v2/test/test_blob.py data/migrations/test/test_repository_digest_registration.py data/test/test_fields.py util/config/test/test_schema.py -q --tb=short`
-
-Result: **283 passed, 1 skipped** with existing deprecation warnings.
-
-The skip is the PostgreSQL-only live race test. Migration upgrade/downgrade coverage passed as part of this command.
-
-### Live PostgreSQL concurrency test
-
-Infrastructure: existing local `quay-db` PostgreSQL container on `localhost:5432`. The test fixture created an isolated PostgreSQL schema.
-
-Command:
-
-`TEST=true SKIP_DB_SCHEMA=true PYTHONPATH=. TEST_DATABASE_URI='postgresql://quay:quay@localhost:5432/quay' .venv/bin/pytest data/registry_model/test/test_interface.py::test_repository_digest_registration_live_concurrency -q --tb=short`
-
-Result: **1 passed**.
-
-This is a real two-connection PostgreSQL unique-index race. Both workers passed the initial absence check before insertion. One insert won and the other resolved the unique conflict idempotently through the transaction/savepoint path. Both workers also wrote an outer-transaction marker before registration, and both markers survived, proving that the losing registration savepoint did not roll back caller work. This is not simulated concurrency.
-
-No live MySQL race was run.
-
-### Registry protocol regressions
-
-Command:
-
-`TEST=true PYTHONPATH=. .venv/bin/pytest test/registry/registry_tests.py -k 'test_chunked_blob_uploading or test_blob_mounting' -q --tb=short`
-
-Result: **268 passed, 1191 deselected** with existing warnings.
-
-This covered existing SHA-256 chunking and mount behavior across the registry protocol fixtures.
-
-### Pre-commit
-
-First command:
-
-`.venv/bin/pre-commit run --files requirements.txt mypy.ini digest/digest_tools.py digest/test/test_digest_tools.py data/model/__init__.py data/model/blob.py data/model/oci/blob.py data/registry_model/blobuploader.py data/registry_model/datatypes.py data/registry_model/interface.py data/registry_model/registry_oci_model.py data/registry_model/test/test_blobuploader.py data/registry_model/test/test_interface.py endpoints/v2/blob.py endpoints/v2/errors.py endpoints/v2/test/test_blob.py`
-
-Initial result: Black reformatted six files and isort reformatted one test file, so the command exited nonzero as expected for modifying hooks. Flake8 and all other applicable hooks passed.
-
-The exact same command was rerun.
-
-Final result: **all applicable hooks passed**.
-
-The exact command was run again after the final review fixes. Result: **all applicable hooks passed** without modifying files.
-
-### Mypy
-
-Command:
-
-`.venv/bin/mypy digest/digest_tools.py data/model/blob.py data/model/oci/blob.py data/registry_model/blobuploader.py data/registry_model/datatypes.py data/registry_model/registry_oci_model.py endpoints/v2/blob.py endpoints/v2/errors.py`
-
-Result: **passed**, no issues in eight source files.
-
-### Compilation and whitespace
-
-Command:
-
-`.venv/bin/python -m compileall -q digest/digest_tools.py data/model/blob.py data/model/oci/blob.py data/registry_model endpoints/v2/blob.py endpoints/v2/errors.py && git diff --check`
-
-Result: **passed**.
-
-A later standalone `git diff --check` also passed before this handoff update.
-
-### Go validation
-
-Command:
-
-`go test ./...`
-
-Result: **platform failure on macOS**. Every package except `internal/migrate` passed. The only failing test was `internal/migrate.TestInPostgresNetworkNamespace`, because `/proc/self/ns/net` does not exist on macOS. The same result was confirmed after the final edits. This is not a product failure.
-
-Fallback command:
-
-`go test ./internal/migrate -skip '^TestInPostgresNetworkNamespace$'`
-
-Result: **passed**.
-
-Command:
-
-`go vet ./...`
-
-Result: **passed** with no output. The same result was confirmed after the final edits.
-
-## Verification completed in Handoff 3
-
-### Focused manifest, model, interface, and proxy-cache suite
-
-Command:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q digest/test/test_digest_tools.py data/model/oci/test/test_oci_manifest.py data/registry_model/test/test_interface.py data/registry_model/test/test_registry_proxy_model.py endpoints/v2/test/test_manifest.py`
-
-Result: **239 passed, 2 skipped**. The skips were the two PostgreSQL-only registration race tests, which passed separately against live PostgreSQL.
-
-A final endpoint/proxy rerun after strict `DELETE` handling and proxy-cache review passed: **72 passed**. The complete SHA-512 manifest lifecycle test, including alternative digest deletion, also passed independently after its final change.
-
-### Broad blob, quota, migration, GC, and proxy regressions
-
-Commands and results:
-
-- Blob endpoint, uploader, and digest migration suite: **58 passed**.
-- Quota enforcement and garbage collection suite: **48 passed, 2 expected failures, 1 expected-pass result**.
-- Full registry proxy model coverage was included in the focused suite and passed.
-- Existing registry protocol manifest selection: **55 passed, 1,404 deselected**.
-
-The quota regression includes the revised transactional rejection contract: a quota-rejected push leaves no manifest graph, registration, or tag, while its quota-error notification is created after rollback.
-
-### Live PostgreSQL migrations and concurrency
-
-Infrastructure: an existing local PostgreSQL 18 server on `127.0.0.1:5432`. The session created the isolated temporary database `quay_handoff3_01a03548`, enabled `pg_trgm`, upgraded it through Alembic head, ran the tests, and dropped the database.
-
-Result: **2 passed**:
-
-- `test_repository_digest_registration_live_concurrency`
-- `test_repository_manifest_digest_registration_live_concurrency`
-
-Both tests used two real database connections, synchronized both workers after the initial absence check, raced the unique insert, and verified that both caller-transaction markers survived. This proves that the losing idempotent registration uses a savepoint rather than rolling back caller work.
-
-The first manifest-race attempt correctly exposed an invalid test fixture that selected a manifest outside the tested repository. The fixture now selects a manifest from the target repository, and the real race passes. No live MySQL race was run.
-
-### Static checks
-
-- Pre-commit on all Handoff 3 files: **all applicable hooks passed** after Black and isort's initial formatting pass.
-- Mypy on the digest, manifest model, registry interface/model, proxy model, and endpoint sources: **passed**, no issues.
-- Python compilation and `git diff --check`: **passed**.
-
-### Go validation
-
-- `go vet ./...`: **passed** with no output.
-- `go test ./...`: every package except `internal/migrate` passed. The sole failure was the existing macOS-only absence of `/proc/self/ns/net` in `TestInPostgresNetworkNamespace`.
-- `go test ./internal/migrate -skip '^TestInPostgresNetworkNamespace$'`: **passed**.
-
-## Intermediate failures already resolved
-
-These are not current product failures:
-
-- An early focused test run failed two legacy mount cases because those fixtures used the malformed string `sha256:unknown` to represent an unknown digest. The implementation correctly returned the new malformed-digest error. The tests now use a valid unknown SHA-256 digest and preserve the required `202` fallback.
-- One new stale-hintless-state test exposed use of `_replace` on Quay's custom datatype. The manager now rebuilds the datatype through its supported dictionary representation. The focused suite passes.
-- The first pre-commit invocation reformatted files. The second invocation passed fully.
-- A new SQLite rollback assertion initially failed because Quay's SQLite test configuration deliberately uses `FakeTransaction`. The test now temporarily uses the production transaction factory and proves the mount link rolls back. This was a test-harness artifact, not a product failure.
-- Final review found that `register_repository_blob_digest()` used nested `db.transaction()` while claiming savepoint behavior. Peewee rolls back the entire outer transaction on an inner uniqueness error. The insertion now uses `db.atomic()`, and the strengthened live PostgreSQL race proves both workers' outer transaction markers survive.
-- Two focused-suite attempts failed during collection because isort had moved `test.fixtures` below `data.registry_model` in `test_blobuploader.py`, exposing a circular app-initialization dependency. The test now initializes `app` explicitly. The file alone and the exact focused suite pass. This was test code, not a runtime product failure.
-
-## Final full-diff review
-
-The complete uncommitted diff was reviewed against the required invariants:
-
-- **Authorization:** destination writes remain protected by `require_repo_write`; private source mounts require the exact source pull grant; public, superuser, and global read-only source-read behavior follows existing permission contracts.
-- **Repository isolation:** alternative lookups include the repository ID and require an `UploadedBlob` or `ManifestBlob` link in that same repository. Upload UUID lookup, update, deletion, and commit also verify repository identity.
-- **Transactions and conflicts:** mount linking and destination registration share one transaction; conflict tests prove the existing mapping is unchanged and the temporary source link rolls back. Registration insertion now uses a true nested savepoint, remains idempotent, and cannot remap a digest.
-- **Rolling uploads:** legacy null fields remain SHA-256 compatible; stale explicit state fails closed; stale hintless state degrades to SHA-256; unsupported future implicit state is discarded; disabled explicit PATCH requests accept no bytes.
-- **Final digest:** the final request digest determines validation and registration. A final SHA-256 digest can complete a previously SHA-512-hinted session when SHA-512 is disabled.
-- **SHA-256 and proxy cache:** legacy SHA-256 lookup and protocol tests pass. Existing SHA-256 visibility is preserved before adding an alternative registration. A proxy-fetched single manifest is registered under the requested alternative digest without exposing a new canonical identity. Alternative descriptor ingestion through proxy cache remains deferred.
-- **Identity exposure:** new alternative-only uploads and mounts register only the external digest. Canonical SHA-256 remains internal and does not resolve unless legacy visibility existed or SHA-256 was explicitly requested.
-- **Persisted state safety:** state uses a validated JSON/base64 envelope and native fixed-format hash state. No pickle or general object deserialization is used. Algorithm, format, architecture, byte order, origin, and byte count are checked before restoration.
-- **Cache behavior:** repository blob cache keys include repository and digest. Missing values are not cached, so new registrations are immediately visible. Positive mappings are immutable because remapping is rejected.
-
-- **Manifest transactions:** descriptor resolution precedes graph writes. Canonical graph rows, external registration, quota accounting, and tag changes share a production transaction. Conflict and quota tests prove rollback. Quota-error notification persistence occurs after rollback.
-- **Manifest responses and errors:** `PUT`, `GET`, `HEAD`, tag assignment, and `DELETE` preserve requested/canonical header contracts. Strict parser failures are distinguished from unknown valid identities and unknown descriptors.
-- **Manifest cache behavior:** tag retarget and deletion invalidate canonical and all registered external identity keys. Proxy-cache single-manifest registration is immediately resolvable.
-
-No unresolved blocking finding remains for Handoff 3.
-
-## Handoff 4 completion
-
-**Repository-scoped multi-algorithm OCI graph support is implemented and has passed final verification and adversarial review.**
-
-### Behavior and contracts
-
-- SHA-512 OCI indexes and Docker schema 2 manifest lists are accepted by digest after exact request-byte verification. SHA-256 remains the canonical `Manifest.digest`.
-- Parent, child, and subject identities resolve through `RepositoryManifestDigest` in the same repository. A registration in another repository never satisfies a descriptor.
-- Mixed SHA-256 and SHA-512 child descriptors are supported. Child and subject descriptor size and media type are checked before graph persistence.
-- Unknown blobs, children, and subjects fail before parent graph or registration visibility. Descriptor mismatches return a manifest-invalid error. Registration conflicts cannot remap an identity.
-- `ManifestChild`, `ManifestBlob`, canonical subject, repository registration, quota work, and tag assignment share the production lifecycle transaction. Existing rows are repaired idempotently when retrying an interrupted or raced write.
-- Subject digests are stored canonically internally. Referrer descriptors use a deterministic repository-visible identity and do not expose an unregistered canonical SHA-256.
-- Referrer cache invalidation covers every registered subject alias plus the internal canonical cache key. Filtered and unfiltered referrer caches remain separate.
-- Manifest availability walks the complete ancestor graph, including nested indexes. Tag retarget and deletion invalidate all registered identities for the affected parent and every descendant.
-- Digest `GET`, `HEAD`, tag assignment, and deletion preserve the requested external identity in response headers and locations while returning exact stored bytes.
-- Proxy-cache digest ingestion validates the requested parent digest. Mixed indexes may use an alternative child only after that child is cached and registered in the repository. Tag-based proxy insertion explicitly registers canonical identity. Existing SHA-256 placeholder behavior remains compatible.
-- GC explicitly removes `RepositoryManifestDigest` rows before deleting a manifest. This is safe on migrated production schemas and on test/development schemas that do not reproduce the migration's cascade.
-- Cache invalidation runs only after the lifecycle transaction commits, preventing another request from repopulating pre-commit state.
-
-### Handoff 4 files
-
-- `data/model/oci/manifest.py`
-- `data/model/oci/retriever.py`
-- `data/model/gc.py`
-- `data/registry_model/datatypes.py`
-- `data/registry_model/registry_oci_model.py`
-- `data/registry_model/registry_proxy_model.py`
-- `endpoints/v2/manifest.py`
-- `endpoints/v2/referrers.py`
-- `data/model/test/test_gc.py`
-- `data/registry_model/test/test_registry_proxy_model.py`
-- `endpoints/v2/test/test_manifest.py`
-
-### Verification completed in Handoff 4
-
-- Consolidated digest, manifest-model, registry-interface, proxy-cache, and endpoint suite: **245 passed, 2 skipped**. The two skips were the PostgreSQL-only races run separately.
-- Full manifest endpoint suite after final transaction and cache changes: **25 passed**.
-- Full registry proxy model suite after final proxy compatibility changes: **53 passed**.
-- Full GC suite after registration cleanup changes: **41 passed**.
-- Repository digest migration tests: **2 passed**.
-- Quota and namespace-quota regressions: **31 passed**.
-- Registry protocol manifest selection: **55 passed, 1,404 deselected**.
-- Live PostgreSQL two-connection registration races: **2 passed** against isolated database `quay_handoff4_01a03581`; the database was dropped afterward. Both blob and manifest registration races preserved both caller-transaction markers and produced one registration.
-- Pre-commit across all 27 modified tracked files: **passed**. Black and isort reformatted files on the first invocation; the final invocation passed every applicable hook.
-- Targeted mypy over digest, manifest, GC, datatype, interface/model, proxy, and endpoint sources: **passed**, no issues.
-- Python compilation, `git diff --check`, branch, HEAD, merge-base, staging, status, and worktree checks: **passed**.
-- `go vet ./...`: **passed**.
-- `go test ./...`: all packages except `internal/migrate` passed. The only failure was the existing macOS absence of `/proc/self/ns/net` in `TestInPostgresNetworkNamespace`.
-- `go test ./internal/migrate -skip '^TestInPostgresNetworkNamespace$'`: **passed**.
-
-### Adversarial review findings resolved
-
-- Child retrieval originally bypassed repository registrations. It now resolves through the repository-scoped manifest lookup.
-- Subjects originally retained the external digest in the canonical database field. They now resolve and store canonical identity.
-- Referrer descriptors originally exposed canonical SHA-256. They now use repository-visible identities.
-- Availability and cache invalidation originally handled one graph level. Both now traverse nested graphs completely and protect against cycles.
-- Cache invalidation originally occurred before the outer tag transaction committed. It now runs after commit.
-- Duplicate previous/current manifest inputs caused query-count regressions. Cache traversal now deduplicates each level.
-- Proxy-cache tag ingestion did not explicitly register canonical identity and did not validate alternative child descriptors. Both are fixed while retaining historical SHA-256 placeholder compatibility.
-- Development/test schemas could retain manifest registrations during GC. GC now deletes them explicitly and has focused coverage.
-- The legacy GC repository-scope test constructed a cross-repository subject through the normal write API. New writes correctly reject it; the test now inserts the legacy/corrupt row directly and continues to verify defensive repository scoping.
-
-No unresolved blocking Handoff 4 finding remains.
-
-## Known limitations and unresolved risks
-
-- The live race test covers PostgreSQL idempotent registration concurrency and preservation of caller transaction work. It does not cover MySQL, concurrent conflicting-content registration, concurrent mounts, or mount rollback races.
-- Hintless multi-algorithm tracking currently relies on there being exactly one configured supported alternative algorithm. Quay currently supports only SHA-512 as the alternative. A future configuration with multiple alternatives will require an explicit hint or a multi-state persistence design.
-- A corrupt or incompatible hintless alternative state deliberately falls back to SHA-256 compatibility. It cannot later produce an alternative registration.
-- A corrupt or incompatible explicit alternative state is rejected.
-- Persisted native hash state is architecture-specific. Explicit sessions cannot resume across incompatible architectures.
-- The native `resumablehash` dependency remains pinned to Git commit `94242192899e91306271b2cd8be7d66a570e92b7`. Production builders require Git and a native-extension toolchain unless packaging changes later.
-- Direct-push manifest lists, OCI indexes, artifacts, subjects, referrers, nested traversal, proxy-cache mixed indexes, and manifest-registration GC are implemented.
-- Proxy cache fails closed when an alternative child has not already been cached and registered. Coordinated upstream child fetching, mirroring, imports, copy paths, background repair, and scanner-facing external identities remain Handoff 5 work.
-- Existing SHA-256 proxy placeholders retain historical permissive size behavior for compatibility. Newly supported alternative proxy children require exact cached descriptor size and media type.
-- MySQL concurrency was not run. The live race coverage used PostgreSQL 18 and the SQLite suite.
-- Wide or deeply nested graphs require additional database queries during availability checks and cache invalidation. The common directly tagged manifest path retains its one-query availability behavior, and the legacy endpoint query-count test passes.
-- Full blob unlink, repository/namespace deletion, upload cancellation, concurrent deletion, and all remaining registration cleanup paths remain Handoff 6 work.
-- No Playwright test was added. The affected behavior is registry protocol API behavior and is covered by endpoint and registry protocol suites.
-
-## Recommended next starting point
-
-### Start Handoff 5 in a new session
-
-Handoff 4 is closed. Handoff 5 is **secondary ingestion paths**. Start with:
-
-1. Repository mirroring and proxy-cache orchestration that fetches alternative children before a parent index.
-2. Cross-repository copy operations and import paths.
-3. Background ingestion and repair jobs.
-4. Security-scanner interactions that pass externally visible digest identities.
-5. Retry and failure behavior that cannot create conflicting or partial registrations.
-
-Reuse the Handoff 4 repository-scoped descriptor resolvers and canonical graph persistence. Do not make canonical SHA-256 externally visible unless it is explicitly registered, historically visible, or created through a tag/SHA-256 path. Preserve the fail-closed proxy rule for uncached alternative children until coordinated child ingestion is transactional.
-
-## Handoff 5 implementation status
-
-**Secondary ingestion support is implemented, but the post-compaction adversarial re-review below supersedes the earlier completion verdict. Confirmed correctness and reliability gaps remain.**
-
-### Behavior and contracts
-
-- Proxy cache validates fetched manifest bytes against the exact requested or upstream-advertised digest. Disabled, malformed, mismatched, or unavailable identities fail before graph persistence.
-- A proxy root with a directly visible alternative manifest, blob, child, or subject identity triggers full descendant-first fetching. Descendants and blobs are validated and registered before the parent is exposed.
-- Coordinated proxy registration, graph rows, temporary or visible tags, quota accounting, and any quota-driven pruning run in one outer database transaction. A failed descendant cannot expose a partial parent graph or lifecycle side effect. Storage bytes left by a failed transaction are unreferenced and remain eligible for normal cleanup.
-- Existing all-SHA-256 proxy roots retain historical lazy child behavior. This avoids forcing eager downloads for legacy indexes. A directly visible alternative child remains fail-closed and coordinated.
-- Proxy blob lookups and the proxy blob worker resolve alternative identities only through repository-local registrations. Another repository's alias or a global canonical checksum cannot satisfy the request.
-- When an existing tagged SHA-256 manifest later gains an upstream alternative alias, both its historically visible SHA-256 identity and the validated new alias are explicitly registered. The alias cannot hide the old identity or remap to another manifest.
-- Skopeo mirror copies now use `--preserve-digests` for complete and filtered copy paths. Destination authorization, digest validation, registration, and graph persistence continue through the registry API. All mirror worker command expectations cover the flag.
-- Legacy manifest-builder import explicitly supplies the manifest's SHA-256 requested identity. Hintless and cross-repository copy behavior continues through the Handoff 1–4 upload, mount, and registry API contracts rather than bypassing registration logic.
-- Scanner indexing, report lookup, report caching, and V2 indexing use a stable repository-visible manifest identity. Alternative-only content is not sent to Clair under hidden canonical SHA-256.
-- Scanner report existence checks understand repository digest registrations. GC removes reports for registered identities and uses canonical fallback only for legacy manifests with no registrations, so cleanup does not disclose a hidden canonical identity.
-- Subject backfill resolves the descriptor in the manifest's repository and stores only canonical subject identity internally. Unknown or cross-repository subjects remain pending for retry.
-- Digest lookup datatypes retain the requested repository-visible identity. Referrer model queries canonicalize that identity repository-locally before matching the internal subject field, preserving external response identity without breaking canonical graph lookup.
-- Scanner layer enumeration verifies that resolved blobs are actually connected to the candidate manifest. An unrelated repository blob cannot make an incomplete manifest appear indexable.
-
-### Handoff 5 files
-
-- `data/model/gc.py`
-- `data/model/oci/manifest.py`
-- `data/model/test/test_gc.py`
-- `data/registry_model/manifestbuilder.py`
-- `data/registry_model/registry_oci_model.py`
-- `data/registry_model/registry_proxy_model.py`
-- `data/registry_model/test/test_registry_proxy_model.py`
-- `data/secscan_model/secscan_v4_model.py`
-- `data/secscan_model/secscan_v4_model_v2.py`
-- `data/secscan_model/test/test_secscan_v4_model.py`
-- `util/repomirror/skopeomirror.py`
-- `util/test/test_skopeomirror.py`
-- `workers/manifestsubjectbackfillworker.py`
-- `workers/proxycacheblobworker.py`
-- `workers/repomirrorworker/test/test_repomirrorworker.py`
-- `workers/test/test_manifestsubjectbackfillworker.py`
-
-### Verification completed in Handoff 5
-
-- Consolidated digest, manifest model, registry interface, proxy, and manifest endpoint suite: **250 passed, 2 skipped**. The skips are the PostgreSQL-only races run separately.
-- Full proxy model suite: **58 passed** after the final alias, quota, and formatting changes.
-- Clair V4 and V4 V2 suites: **107 passed**.
-- Mirror worker suite: **53 passed**. Skopeo unit coverage excluding external integration calls: **10 passed, 1 skipped, 2 deselected**.
-- Secondary worker, mirror, proxy worker, subject backfill, and legacy manifest builder aggregate: **78 passed, 1 skipped, 2 deselected**.
-- GC and quota aggregate: **72 passed**. Focused scanner-cleanup identity coverage also passed.
-- Blob uploader and endpoint unit run reached **54 passing tests**; two `@pytest.mark.e2e` Docker Hub pull-through tests failed because the local external-storage/network setup could not retrieve the remote blob. They are not unit regressions and were excluded from completion results.
-- The two live PostgreSQL registration races passed against PostgreSQL 18 in isolated database `quay_handoff5_01a03717`. Alembic upgraded through `a2f338ee672c`; the database was dropped afterward.
-- Pre-commit across all modified tracked files passed after Black reformatted four files.
-- Targeted mypy passed with no issues in 20 source files. Python compilation and `git diff --check` passed.
-- `go vet ./...` passed. `go test ./...` passed except for the existing macOS-only `TestInPostgresNetworkNamespace`, where `/proc/self/ns/net` does not exist. `go test ./internal/migrate -skip '^TestInPostgresNetworkNamespace$'` passed.
-- External Skopeo integration tests were not run because `/usr/bin/skopeo` is absent. Command construction and all mirror worker paths are covered with mocks.
-
-### Adversarial review findings resolved
-
-- Initial proxy coordination eagerly fetched every SHA-256 index child and broke historical lazy behavior. Coordination now starts only when the root directly exposes an alternative identity, while coordinated graphs still traverse fully.
-- A stale tag could add an alternative registration and unintentionally disable legacy SHA-256 fallback. The transition now explicitly preserves the historically visible canonical registration.
-- Digest lookup began returning the external identity, exposing that referrer queries compared external identity directly with canonical internal subject fields. Referrer lookup now canonicalizes repository-locally before querying.
-- Scanner layer resolution could accept an unrelated repository blob after a `ManifestBlob` link was removed. Layer lookup now requires linkage to the candidate manifest.
-- Scanner GC initially included canonical SHA-256 unconditionally. It now sends only registered identities, using canonical fallback solely for legacy manifests with no registrations.
-- Coordinated proxy ingestion initially bypassed proxy quota checks. Quota checks and pruning now execute inside the graph transaction.
-- V2 scanner tests patch the local `ManifestDataType` symbol. The compatibility import remains while scanner wrapping is shared through the repository-visible identity helper.
-
-### Remaining limits and Handoff 6 starting point
-
-- A SHA-256 root remains lazy. Alternative identities hidden only inside a not-yet-fetched SHA-256 child are coordinated when that child is requested; they are not discoverable from the parent descriptor alone.
-- Mirror synchronization across multiple independent tags is not globally atomic. Each destination registry push is transactional under the existing registry lifecycle contract.
-- Failed proxy storage writes can leave unreferenced canonical bytes after database rollback. No graph, registration, quota row, or visible tag points to them; normal upload expiration and GC handle physical cleanup.
-- MySQL concurrency was not run. SQLite coverage and live PostgreSQL two-connection races passed.
-- Handoff 6 should audit unlink, upload cancellation and expiration, repository and namespace deletion, concurrent deletion/GC, and physical orphan cleanup for both blob and manifest registrations.
-
-
-## Handoff 5 post-compaction adversarial re-review
-
-The post-compaction adversarial review is in progress. Static inspection and focused dynamic reproduction are complete. Six behavior defects and the coordinated-ingestion coverage gap were confirmed. Implementation fixes have not been applied.
-
-Do not treat the earlier Handoff 5 completion statement as the final review verdict. The current recommendation is **Request changes** because material proxy, cache, referrer, and mirroring gaps remain.
-
-No implementation files were changed during the re-review or this document consolidation. Dynamic reproductions were created only under `/tmp`.
-
-## Repository state pinned for review
-
-- Worktree: `/Users/shossain/QuayWorkspace/shaon-feature-PQC`
-- Branch: `shaon-feature-PQC`
-- HEAD: `9352a3d42478d2aa696df4b76805e5dbbe9a8290`
-- Merge base: `d81004d24669132d45df8fbd1eafc86c149e38fa`
-- Staged files: none
-- The intentionally uncommitted Handoffs 1–5 diff remains present.
-- No commit, push, rebase, reset, remote change, or worktree change was performed.
-
-The Handoff 4 baseline was reconstructed by applying `/tmp/shaon-feature-PQC-handoff1-4.diff` to HEAD in `/tmp/pqc-handoff4-baseline`. The current Handoff 5 delta was then compared against that reconstructed baseline.
-
-## Dynamic reproduction evidence
-
-- Existing proxy baseline: `TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short data/registry_model/test/test_registry_proxy_model.py` — **58 passed**.
-- Temporary coordinated-ingestion reproductions: `TEST=true PYTHONPATH=. .venv/bin/python -m pytest --rootdir=. -q --tb=short /tmp/test_pqc_handoff5_repro.py` — **4 failed as expected**, confirming placeholder promotion failure, blob download inside the transaction, duplicate child fetches, and absent model-cache propagation.
-- The placeholder path raised `InvalidImageException` before `_download_blob`; this refines the static explanation. The repository resolver does not return usable placeholder content because `get_storage_by_uuid` requires a placement.
-- A depth-1,100 temporary graph failed with raw `RecursionError` instead of a controlled limit error.
-- Actual proxy artifact persistence made a referrer visible through an uncached lookup, while a primed empty referrer cache remained empty.
-- An actual SHA-512 subject alias failed to find an OCI fallback index tagged under its visible canonical SHA-256 alias.
-- The sparse mirror root helper made only a tag-addressed manifest PUT; it did not first register the source SHA-512 root identity.
-- Local PostgreSQL 18 is available on port 5432 for transaction-sensitive follow-up. `/usr/bin/skopeo` is absent, so real full-copy Skopeo behavior remains infrastructure-blocked.
-
-## Static review scope
-
-The Handoff 5 delta contains these implementation and test paths:
-
-- `data/model/gc.py`
-- `data/model/oci/manifest.py`
-- `data/model/test/test_gc.py`
-- `data/registry_model/manifestbuilder.py`
-- `data/registry_model/registry_oci_model.py`
-- `data/registry_model/registry_proxy_model.py`
-- `data/registry_model/test/test_registry_proxy_model.py`
-- `data/secscan_model/secscan_v4_model.py`
-- `data/secscan_model/secscan_v4_model_v2.py`
-- `data/secscan_model/test/test_secscan_v4_model.py`
-- `util/repomirror/skopeomirror.py`
-- `util/test/test_skopeomirror.py`
-- `workers/manifestsubjectbackfillworker.py`
-- `workers/proxycacheblobworker.py`
-- `workers/repomirrorworker/test/test_repomirrorworker.py`
-- `workers/test/test_manifestsubjectbackfillworker.py`
-
-The review also traced relevant unchanged callers and callees in:
-
-- `data/model/oci/blob.py`
-- `data/registry_model/registry_oci_model.py`
-- `endpoints/v2/manifest.py`
-- `endpoints/v2/referrers.py`
-- `workers/repomirrorworker/__init__.py`
-- `util/repomirror/skopeomirror.py`
-- Proxy, scanner, referrer, mirror, and registry model tests
-
-## Provisional verdict
-
-- Recommendation: **Request changes**
-- Confidence: high for the dynamically reproduced findings
-- Final verdict: request changes pending implementation fixes and regression verification
-- quay.io applicability: conditional on proxy cache, repository mirroring, referrers, or Clair being enabled
-- OCI Distribution impact: yes
-- Database impact: yes; no new Handoff 5 schema, but transaction duration, graph visibility, cache state, and repository registrations are affected
-- Security impact: tenant isolation is generally preserved, but synchronous unbounded upstream traversal creates a denial-of-service risk
-
-## Findings
-
-### Medium: Coordinated proxy ingestion cannot promote a repository-local placeholder
-
-Locations:
-
-- `data/registry_model/registry_proxy_model.py:556-567`
-- `data/model/oci/blob.py:14-30`
-- `data/model/storage.py:291-299,402-408`
-
-Evidence:
-
-A temporary test created an `ImageStorage` row and repository-local `ManifestBlob` link without an `ImageStoragePlacement`, matching the lazy proxy placeholder state. `oci.blob.get_repository_blob_by_digest` found the linked row but then called `get_storage_by_uuid`, which requires a placement and raised `InvalidImageException`. `_ingest_proxy_manifest_graph` did not treat this as missing content and never called `_download_blob`.
-
-Impact:
-
-A graph first seen through the historical lazy SHA-256 proxy path can contain placeholders. Later coordinated alternative-digest ingestion fails before filling those placeholders, and retries repeat the same failure. A stale-tag shortcut can also register an alternative alias while referenced content remains lazy.
-
-Required remediation:
-
-Check placement or readable storage availability, not only repository identity, before skipping download. Add a regression test that creates a repository-local placeholder, promotes the same content through coordinated alternative ingestion, and proves the placement and graph become available.
-
-### Medium: Upstream blob downloads run inside the graph database transaction
-
-Location:
-
-- `data/registry_model/registry_proxy_model.py:556-579`
-
-Evidence:
-
-The outer `db_transaction` starts before quota checks, upstream blob streaming, storage writes, upload state changes, manifest registration, and graph persistence. A multi-platform graph can download many large blobs while the transaction and database connection remain open.
-
-Impact:
-
-Slow or stalled upstream storage can hold transactions and connections for minutes. This increases lock duration, deadlock risk, pool exhaustion, replication lag, and request latency. The risk applies to a synchronous registry request path.
-
-Required remediation:
-
-Fetch and verify content before opening the short graph/tag transaction. Keep repository registration, graph rows, quota accounting, pruning, and visible tag changes atomic. Treat pre-fetched storage as unreferenced temporary content until the final transaction commits.
-
-### Medium: Coordinated proxy traversal is unbounded and repeats duplicate fetches
-
-Location:
-
-- `data/registry_model/registry_proxy_model.py:467-542`
-
-Evidence:
-
-The recursive traversal has no maximum depth, descriptor count, total manifest bytes, or total graph size. Child manifests are fetched before the visited check can reject duplicate descriptors. A manifest list containing repeated descriptors can therefore cause repeated upstream requests even when persistence is deduplicated.
-
-Impact:
-
-A user pulling a tag from a configured upstream can synchronously consume a request worker with a wide, deep, repeated, or slow graph. Python recursion depth can also terminate the request without a controlled registry error.
-
-Required remediation:
-
-Use iterative traversal with explicit limits. Track requested descriptor digests before fetching. Enforce maximum graph depth, node count, manifest response size, and aggregate work. Return a controlled fail-closed error when limits are exceeded.
-
-### Medium: Proxy artifact ingestion does not invalidate referrer caches
-
-Locations:
-
-- `data/registry_model/registry_proxy_model.py:583-599`
-- `data/registry_model/registry_oci_model.py:607-640`
-- `endpoints/v2/referrers.py:48-60`
-
-Evidence:
-
-The coordinated proxy path calls the base create methods without a `model_cache`. Proxy lookup methods also do not accept or retain the endpoint model cache. The base referrer invalidation helper returns immediately when `model_cache` is `None`.
-
-Impact:
-
-If a subject's referrer response was cached as empty, proxy-ingesting an artifact can persist the artifact while the referrer API continues returning stale data until cache expiry. This contradicts the stated post-commit cache contract.
-
-Required remediation:
-
-Propagate the model cache into proxy ingestion and invalidate every visible subject identity only after the outer transaction commits. Add a test that primes an empty referrer cache, proxy-ingests an artifact, and immediately observes the referrer.
-
-### Medium: Mirror root alternative identity is not proven and is lost in the filtered path
-
-Locations:
-
-- `util/repomirror/skopeomirror.py:130-138`
-- `workers/repomirrorworker/__init__.py:849-861`
-- `workers/repomirrorworker/__init__.py:1060-1090`
-
-Evidence:
-
-Adding `--preserve-digests` preserves bytes and prevents conversion, but the filtered architecture path pushes the root manifest list directly to `/manifests/{tag}`. A tag PUT carries no upstream digest algorithm or alias. Quay therefore computes canonical SHA-256 and cannot know that the source tag was advertised as SHA-512. Child descriptors copied by digest can retain their identities, but the root alias is not registered by this direct tag push.
-
-The new Skopeo unit test checks only command arguments. It does not prove destination root registration.
-
-Impact:
-
-Mirrored content can have correct bytes and child graph while failing lookup by the source repository's SHA-512 root identity. This does not meet the Handoff 5 completion requirement that supported ingestion paths produce equivalent repository-visible registrations.
-
-Required remediation:
-
-Capture the source root digest and perform a destination digest-addressed registration before or atomically with tag creation. Add destination registry tests for full and architecture-filtered mirrors with SHA-512 roots and mixed children. Full Skopeo behavior remains an unresolved assumption until tested with a real binary.
-
-### Medium: Alternative lookup can miss legacy referrer fallback tags
-
-Locations:
-
-- `data/registry_model/registry_oci_model.py:280-287`
-- `data/registry_model/registry_oci_model.py:363-381`
-
-Evidence:
-
-`lookup_manifest_by_digest` now wraps the manifest with the requested external alias. `lookup_referrers_for_tag_schema` constructs exactly one fallback tag by replacing the colon in `manifest.digest`. If the same subject has a historically visible canonical SHA-256 identity and an added SHA-512 alias, a SHA-512 request searches only the SHA-512 fallback tag and can miss an existing `sha256-...` fallback index.
-
-Impact:
-
-Legacy Cosign-style referrers can disappear depending on which registered alias the client uses, even though both aliases resolve to the same canonical manifest.
-
-Required remediation:
-
-Search fallback tags for all repository-visible subject registrations, plus canonical identity only when it is historically or explicitly visible. Deduplicate returned referrers. Add canonical-tag/SHA-512-query and SHA-512-tag/canonical-query tests.
-
-### Medium: New tests do not exercise coordinated persistence or failure behavior
-
-Locations:
-
-- `data/registry_model/test/test_registry_proxy_model.py:1169-1267`
-- `util/test/test_skopeomirror.py:94-112`
-
-Evidence:
-
-The coordinated proxy tests call `_build_proxy_ingestion_plan` and exact manifest validation. They do not call `_ingest_proxy_manifest_graph`. There is no new test proving blob placement repair, complete nested graph persistence, parent invisibility on failure, registration conflict rollback, quota/pruning rollback, post-commit cache invalidation, or retry convergence.
-
-The mirror test checks only the Skopeo argument prefix.
-
-Impact:
-
-The previous green suites did not execute the highest-risk Handoff 5 behavior. They cannot disprove the defects above.
-
-Required remediation:
-
-Add end-to-end model tests around the coordinated ingestion method and destination registry behavior. Use production transaction semantics or live PostgreSQL where SQLite's fake transaction behavior differs.
-
-## Additional observations
-
-- Repository-local proxy worker resolution is an improvement and appears to preserve tenant isolation.
-- Exact upstream manifest digest verification is correct for an advertised or digest-addressed identity.
-- Scanner identity selection is stable because the first repository registration remains the report key. Historical canonical visibility is preserved before adding a new alias.
-- Scanner GC no longer sends an unregistered canonical digest when registrations exist.
-- Subject backfill now resolves repository-locally, clears an unsafe stale external subject, and leaves unresolved rows pending.
-- Subject backfill can retry permanent malformed or cross-repository rows indefinitely and rewrite `subject=NULL` each pass. This is an operability concern, but it is lower priority than the findings above.
-- Scanner identity lookup adds per-manifest registration queries during indexing. This may reduce Clair indexing throughput at scale and should be measured or batch-prefetched.
-- No Handoff 5 dependency, CI, executable, symlink, submodule, migration, or generated-file change was found.
-- No authorization bypass or cross-repository digest resolution was found in the reviewed Handoff 5 delta.
-
-## Earlier verification evidence
-
-The prior implementation session recorded these results before this re-review:
-
-- Consolidated manifest lifecycle suite: 250 passed, 2 PostgreSQL-only skips
-- Full proxy model suite: 58 passed
-- Clair V4 and V4 V2 suites: 107 passed
-- Mirror worker suite: 53 passed
-- Secondary worker aggregate: 78 passed, 1 skipped, 2 deselected
-- GC and quota aggregate: 72 passed
-- Live PostgreSQL registration races: 2 passed
-- Pre-commit: passed
-- Targeted mypy: passed
-- Python compilation and `git diff --check`: passed
-- `go vet ./...`: passed
-- Go tests passed with the documented macOS `/proc/self/ns/net` exclusion
-
-These results remain useful regression evidence. They did not cover the proxy placement, transaction duration, traversal bounds, proxy referrer cache, mirror root alias, or fallback-tag defects subsequently reproduced above.
-
-## Remaining Handoff 5 verification and fix work
-
-1. Fix placeholder promotion and prove retry convergence.
-2. Move remote downloads and cryptographic verification before the final short database transaction. Keep graph rows, registrations, quota accounting, pruning, and tags atomic.
-3. Replace recursive graph traversal with bounded iterative traversal and deduplicate descriptors before fetch.
-4. Propagate the model cache through proxy ingestion and invalidate referrer caches only after final commit.
-5. Search referrer fallback tags across repository-visible subject aliases without exposing hidden canonical SHA-256.
-6. Preserve and test alternative root registration for full and architecture-filtered mirrors. Run real Skopeo integration only if a trusted local binary becomes available.
-7. Add permanent coordinated-ingestion persistence, rollback, quota, pruning, retry, cache-timing, traversal-limit, and destination-mirror regression tests.
-8. Use live PostgreSQL for graph rollback and concurrency behavior where SQLite cannot prove production semantics.
-9. Run focused and broad Handoff 5 suites, pre-commit, targeted mypy, Python compilation, `git diff --check`, and relevant Go checks after fixes.
-10. Recheck branch, HEAD, merge base, staging, worktrees, and the complete Handoffs 1–5 diff before the final verdict.
-
-## Constraints for continuation
-
-- Work only in `/Users/shossain/QuayWorkspace/shaon-feature-PQC` on branch `shaon-feature-PQC`.
-- Preserve the intentionally uncommitted Handoffs 1–5 diff.
-- Do not stage, commit, push, rebase, reset, change remotes, alter pull requests, discard changes, or touch another worktree.
-- Keep alternative identities repository-scoped.
-- Do not expose hidden canonical SHA-256.
-- Keep registration, graph persistence, quota accounting, pruning, and visible references transactional and idempotent.
-- Do not expose a proxy parent before required alternative descendants are validated and registered.
-- Invalidate caches only after the final outer transaction commits.
-- Treat upstream registry responses and manifest graphs as untrusted and bounded input.
-
-## Handoff 5 Session 1: Proxy placeholder promotion and retry convergence
-
-**Status: Session 1 is implemented and verified. Handoff 5 is not complete. The complete proxy transaction refactor remains Session 2 work.**
-
-This section supersedes item 1 in the earlier remaining-work list. It does not change the status or scope of the transaction, traversal-limit, referrer-cache, fallback-alias, or mirroring findings.
-
-### Confirmed root cause
-
-The earlier theory that coordinated ingestion silently accepted a placeholder as downloaded content was incorrect. Dynamic reproduction confirmed this path:
-
-1. A lazy SHA-256 proxy path had created an `ImageStorage` row and repository-local `ManifestBlob` relationship without an `ImageStoragePlacement`.
-2. Coordinated alternative-root ingestion called `oci.blob.get_repository_blob_by_digest()` for that repository-local descriptor.
-3. The identity lookup found the correct `ImageStorage` row, but the same function immediately called `get_storage_by_uuid()`.
-4. `get_storage_by_uuid()` requires a placement and raised `InvalidImageException`.
-5. `_ingest_proxy_manifest_graph()` never reached `_download_blob()`, so every retry failed at the same point.
-
-Repository identity and authorization, placement existence, physical readability, and complete blob retrieval were coupled in one lookup. Placeholder promotion requires repository-scoped identity resolution without treating an unplaced row as complete.
-
-### Implementation changes
-
-- `data/model/oci/blob.py`
-  - Added `lookup_repository_blob_by_digest()` to resolve only repository-local registrations or legacy SHA-256 relationships without requiring a placement.
-  - Kept `get_repository_blob_by_digest()` as the complete placed-blob API. Existing callers that need readable content still pass through `get_storage_by_uuid()`.
-  - The raw lookup selects the full `ImageStorage` row so placement and CAS-path checks have the required fields.
-  - Alternative registrations remain repository-scoped and must also have an `UploadedBlob` or `ManifestBlob` relationship in that repository.
-- `data/model/storage.py`
-  - Added `StorageContentStatus` with distinct `MISSING_PLACEMENT`, `MISSING_CONTENT`, `READ_ERROR`, and `READABLE` states.
-  - Added `get_storage_content_status()` to inspect every database placement and prove physical readability through the configured storage backend.
-  - Any backend probe exception fails closed as `READ_ERROR`; another readable placement still satisfies the blob.
-- `data/registry_model/registry_proxy_model.py`
-  - Coordinated ingestion now resolves repository identity without requiring placement, downloads on absent identity, absent placement, stale physical content, or a read error, and verifies that promotion produced repository-local readable content before graph persistence continues.
-  - Direct proxy blob lookup uses the same status helper. An unknown direct request still returns `None`; it does not use a global checksum or another repository's registration to authorize a download.
-  - Download, digest validation, placement creation, and repository registration continue through the existing blob uploader.
-- `workers/proxycacheblobworker.py`
-  - Placeholder and alternative identity lookup now uses the repository-scoped raw resolver.
-  - Download decisions use the same placement/readability status helper as coordinated and direct proxy lookup.
-  - Manifest security status resets now require every linked repository blob to be physically readable, not merely to have a placement row.
-- `data/registry_model/test/test_registry_proxy_model.py`
-  - Added real coordinated-ingestion tests around mocked upstream bytes and the configured local test storage.
-- `workers/test/test_proxycacheblobworker.py`
-  - Added no-placement worker coverage and corrected old completeness fixtures to use valid digests and real physical bytes.
-
-No schema, migration, feature flag, endpoint, remote, or transaction-boundary change was made in Session 1.
-
-### Permanent test coverage
-
-The tests now prove:
-
-1. A repository-local placeholder without placement is downloaded, validated, placed, registered, connected to the graph, and physically readable.
-2. A placement whose physical bytes are absent is repaired.
-3. Existing physically readable content is not downloaded again.
-4. An alternative blob identity resolves through the current repository registration and relationship only.
-5. Another repository's valid alternative registration and readable canonical content cannot satisfy the current repository; coordinated ingestion still fetches, validates, links, and registers it locally.
-6. A blob digest mismatch creates no requested registration, placement, or root manifest registration.
-7. The same state succeeds on a later retry with valid upstream bytes.
-8. Repeated successful ingestion creates no duplicate registration or graph relationship and performs no second download.
-9. Alternative-only blob and manifest paths do not expose their internal canonical SHA-256 identities.
-10. The existing all-SHA-256 root remains lazy and does not fetch children while building its ingestion plan.
-11. Direct proxy lookup and the worker repair missing physical bytes and treat backend probe exceptions as requiring repair.
-
-### Exact verification outcomes
-
-Expected failing regression before the production change:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short data/registry_model/test/test_registry_proxy_model.py::TestRegistryProxyCoordinatedIngestion::test_promotes_repository_placeholder_during_coordinated_ingestion`
-
-Result: **1 failed as expected**. The traceback showed `InvalidImageException` from `get_storage_by_uuid()` before `_download_blob()`.
-
-Focused coordinated-ingestion class after the fix:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_registry_proxy_model.py::TestRegistryProxyCoordinatedIngestion`
-
-Result: **9 passed**.
-
-Full proxy registry model file before final formatting:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_registry_proxy_model.py`
-
-Result: **63 passed**.
-
-Proxy blob worker file:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings workers/test/test_proxycacheblobworker.py`
-
-Result: **11 passed**.
-
-Blob uploader and blob model files:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_blobuploader.py data/model/test/test_blob.py data/model/test/test_model_blob.py`
-
-Result: **26 passed**.
-
-OCI manifest model file:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/oci/test/test_oci_manifest.py`
-
-Result: **21 passed**.
-
-Explicit lazy SHA-256 and proxy blob lookup selection:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_registry_proxy_model.py -k 'all_sha256_root_preserves_lazy_child_fetch or create_temp_tags_for_newly_created_sub_manifests_on_manifest_list or get_repo_blob_by_digest'`
-
-Result: **2 passed, 61 deselected**. The full 63-test proxy run covered the remaining proxy behavior.
-
-Mocked endpoint pull-through storage coverage:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_blob.py::TestBlobPullThroughStorage`
-
-Result: **2 passed**. No production registry was contacted.
-
-Final post-format proxy and worker aggregate:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_registry_proxy_model.py workers/test/test_proxycacheblobworker.py`
-
-Result: **74 passed**.
-
-Final relevant uploader, blob model, OCI manifest, and endpoint aggregate:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_blobuploader.py data/model/test/test_blob.py data/model/test/test_model_blob.py data/model/oci/test/test_oci_manifest.py endpoints/v2/test/test_blob.py::TestBlobPullThroughStorage`
-
-Result: **49 passed**.
-
-Pre-commit command over all 39 tracked files modified by the complete uncommitted Handoffs 1–5 diff:
-
-`files=$(git diff --name-only --diff-filter=ACMR) && .venv/bin/pre-commit run --files $files`
-
-Initial result: **nonzero because hooks modified files**. Black reformatted `workers/test/test_proxycacheblobworker.py`, `data/registry_model/registry_proxy_model.py`, and `data/registry_model/test/test_registry_proxy_model.py`. Isort adjusted the proxy model and worker test. Every other applicable hook passed.
-
-The exact command was rerun and then run once more after the final storage-exception review fix. Final result: **all applicable hooks passed**.
-
-Targeted mypy:
-
-`.venv/bin/mypy data/model/oci/blob.py data/model/storage.py data/registry_model/blobuploader.py data/registry_model/registry_proxy_model.py workers/proxycacheblobworker.py`
-
-Result: **passed**, no issues in five source files.
-
-Compilation and whitespace:
-
-`.venv/bin/python -m compileall -q data/model/oci/blob.py data/model/storage.py data/registry_model/blobuploader.py data/registry_model/registry_proxy_model.py data/registry_model/test/test_registry_proxy_model.py workers/proxycacheblobworker.py workers/test/test_proxycacheblobworker.py && git diff --check`
-
-Result: **passed** with no output.
-
-Live PostgreSQL was **not run**. Session 1 did not change transaction behavior or schema, and SQLite plus mocked local storage covered the placeholder state and retry convergence. Production transaction shortening remains Session 2 scope.
-
-### Focused adversarial review
-
-- **Tenant isolation:** The raw resolver filters registrations and legacy relationships by the requested repository. A registration in another repository and globally deduplicated canonical bytes do not authorize or satisfy the current repository. The cross-repository coordinated test proves an upstream download still occurs and only then creates the current repository relationship and registration.
-- **Digest mismatch:** The uploader hashes the exact mocked upstream bytes before storage finalization and registration. Mismatch leaves no placement, requested blob registration, or root manifest registration. A valid retry converges.
-- **Canonical SHA-256 leakage:** Alternative-only blob lookup by the hidden canonical digest returns `None`. Alternative-root manifest lookup by hidden canonical digest also returns `None`. SHA-256 becomes visible only when explicitly used by a descriptor or the established tag/legacy contract requires it.
-- **Missing and stale placements:** Missing placement, missing physical bytes, backend read failure, and readable content are separate states. Every proxy promotion/repair decision uses the shared status helper.
-- **Physical storage failures:** Any exception from a backend `exists()` probe fails closed into repair. A readable alternate placement wins over a failed or stale placement.
-- **Retry convergence:** Failed uploads are canceled by `complete_when_uploaded`; no valid registration or root graph becomes visible. The next valid attempt promotes the existing placeholder row successfully.
-- **Idempotency:** A readable successful promotion is skipped on repetition. Registration and manifest-blob uniqueness remain unchanged, and the permanent test proves one registration and one graph relationship.
-- **Lazy SHA-256 compatibility:** Coordination gating is unchanged. An all-SHA-256 root still returns the historical one-node lazy plan without child fetches. Existing proxy, endpoint, uploader, and blob tests pass.
-
-No blocking Session 1 finding remains. quay.io applicability is conditional on proxy cache. OCI blob availability and retry behavior are impacted. Database queries and rows are impacted, but schema and transaction boundaries are unchanged. No new flag is appropriate because the fix restores integrity rather than introducing optional behavior.
-
-### Remaining risks and Session 2 boundary
-
-- `_ingest_proxy_manifest_graph()` still opens its outer database transaction before upstream blob downloads and cryptographic verification. **The complete proxy transaction refactor remains Handoff 5 Session 2 work.** Session 1 deliberately did not move downloads or alter graph/tag/quota transaction semantics.
-- The bounded iterative traversal, duplicate fetch prevention, referrer cache propagation, fallback alias search, and mirror-root registration findings remain later-session work and were not modified.
-- The shared physical-readability check performs backend `exists()` probes. Eventual consistency or transient backend failure can trigger a redundant repair download; digest validation and idempotent registration keep that retry fail-closed.
-- Worker manifest-completeness checks now prove physical readability for each linked blob. This is more expensive than the prior placement-only query and should be observed at proxy-cache scale, but it prevents stale placements from re-enabling scanning.
-- A failure after validated physical finalization but before database registration can still leave unreferenced canonical bytes. This was an existing Handoff 5 limitation and belongs with Session 2 transaction/failure work and later lifecycle cleanup.
-- No live PostgreSQL or MySQL run was needed for this non-transactional scope. Session 2 must use PostgreSQL where SQLite cannot prove production transaction behavior.
-
-## Handoff 5 Session 2: Coordinated proxy ingestion transaction refactor
-
-**Status: Session 2 is implemented and verified. Handoff 5 is not complete. Traversal limits, duplicate manifest fetch prevention, referrer-cache propagation, fallback aliases, and mirroring remain later-session work.**
-
-### Confirmed transaction root cause
-
-`ProxyModel._ingest_proxy_manifest_graph()` previously opened its outer `db_transaction()` before quota checks, upstream blob reads, chunk streaming, digest hashing and validation, storage finalization, blob placement/link/registration, manifest graph persistence, quota updates, pruning, and tag changes. Production `DB_TRANSACTION_FACTORY` returns `db.transaction()`. `CloseForLongOperation` only disconnects before a slow operation when no testing override is active; it does not end or shorten an already-open logical transaction. The normal SQLite fixture uses `FakeTransaction`, which hid the production lock and connection lifetime.
-
-The permanent pre-change regression recorded transaction depth 1 during upstream read, storage streaming, digest validation, and config storage validation, against baseline depth 0.
-
-### Transaction boundaries before and after
-
-Before:
-
-1. Open the final graph transaction.
-2. Run quota checks and pruning.
-3. Read each upstream blob.
-4. Stream and hash bytes.
-5. Validate the exact requested digest.
-6. Finalize physical storage.
-7. Create placement, repository link, and digest registration.
-8. Persist manifests, relationships, registrations, quota, and tags.
-9. Commit.
-
-After:
-
-1. Outside the final graph transaction, resolve repository-local identity with the Session 1 helper and prove placement/readability with `get_storage_content_status()`.
-2. Outside the final graph transaction, download only missing, placeholder, or stale content; stream, hash, validate the exact descriptor digest, and finalize canonical CAS bytes.
-3. Outside the final graph transaction, read required config content and validate manifests and child-label data through an in-memory ingestion retriever. No repository blob link or digest registration is created by this prefetch.
-4. Open one short final graph transaction and acquire a repository-scoped transaction advisory lock.
-5. Perform database-only blob placement metadata, repository links, and exact digest registrations.
-6. Run quota checks and quota-driven pruning.
-7. Persist `Manifest`, `ManifestBlob`, `ManifestChild`, canonical subject relationships, repository manifest registrations, quota accounting, temporary tags, and visible tag changes.
-8. Commit atomically. On failure, roll back every database-visible lifecycle change and delete restored pending upload rows without deleting finalized content-addressed bytes.
-
-### Implementation changes
-
-- `data/registry_model/blobuploader.py`
-  - Split finalization into `prefetch_to_storage()` and `commit_prefetched_blob()`.
-  - `prefetch_to_storage()` validates the exact requested digest and finalizes CAS bytes without creating repository links or registrations.
-  - `commit_prefetched_blob()` performs only database metadata, link, registration, and upload-row work.
-  - Existing `commit_to_blob()` composes both phases, preserving direct upload and direct proxy behavior.
-  - Cancellation preserves already-finalized CAS bytes after a later database failure while removing the pending upload row.
-- `data/registry_model/registry_proxy_model.py`
-  - Added a prefetch content retriever for validated manifest/config reads outside the graph transaction.
-  - Added `_prefetch_blob()` and `_prepare_proxy_manifest_graph()`.
-  - Coordinated ingestion now prefetches, hashes, validates, finalizes, and prevalidates manifests before opening the final transaction.
-  - Existing readable content still uses the Session 1 repository-scoped identity and storage-readability helpers and is not downloaded again.
-  - The final transaction performs database-only blob registration, graph persistence, quota/pruning, and tag work.
-  - A repository-scoped PostgreSQL advisory transaction lock serializes concurrent final promotion without serializing downloads.
-- `data/model/oci/manifest.py`
-  - Added an internal prevalidated persistence mode. It performs repository-scoped blob, child, and subject resolution and normal graph/quota/registration persistence without repeating storage reads.
-  - Preserved child-label intersection for manifest-list tag expiration and immutability behavior by carrying prevalidated child labels into persistence.
-- `data/registry_model/registry_oci_model.py`
-  - Passed the internal prevalidated manifest and child-label state through existing manifest/tag creation APIs. Default direct-push behavior is unchanged.
-- `data/registry_model/test/test_blobuploader.py`
-  - Added focused proof that physical prefetch creates neither an `UploadedBlob` link nor a `RepositoryBlobDigest`, and that the database-only commit creates visibility.
-- `data/registry_model/test/test_registry_proxy_model.py`
-  - Added production-transaction depth, mismatch, rollback, retry, quota, pruning, and live PostgreSQL visibility tests.
-
-No schema, migration, endpoint, feature flag, referrer cache, fallback alias, mirroring, traversal, scanner, copy, import, or lifecycle-cleanup change was made in Session 2.
-
-### Permanent Session 2 coverage
-
-The new and retained tests prove:
-
-1. Upstream reads, storage streaming, digest validation, storage finalization, and required config reads run at baseline transaction depth, outside the final graph transaction.
-2. Prefetched bytes do not create repository links or digest registrations.
-3. A PostgreSQL observer connection cannot see blob registrations, manifest registrations, or graph rows before final commit.
-4. A later blob mismatch starts no quota/pruning phase and leaves no graph, registration, placement, quota, upload, or visible-tag state.
-5. A database failure after successful prefetch rolls back blob placement/link/registration, manifest graph, quota, and tags.
-6. Failed mismatch and database attempts retry successfully.
-7. Repeated success remains idempotent and does not redownload readable content.
-8. Repository-local placeholder promotion and missing physical-content repair remain successful.
-9. Another repository's registration and globally deduplicated canonical bytes cannot satisfy the current repository.
-10. Alternative-only content does not expose hidden canonical SHA-256.
-11. All-SHA-256 roots retain historical lazy behavior.
-12. Quota rejection rolls back all prefetched database lifecycle state.
-13. Quota-driven pruning rolls back on a later database failure and succeeds atomically on retry.
-14. The final PostgreSQL transaction executes the repository-scoped advisory lock and rolls back all observer-visible state on forced failure.
-
-### Exact verification outcomes
-
-Expected failing regression before the implementation change:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings --show-capture=no data/registry_model/test/test_registry_proxy_model.py::TestRegistryProxyCoordinatedIngestion::test_prefetch_and_storage_validation_run_outside_graph_transaction`
-
-Result: **1 failed as expected**. Upstream read, storage stream, digest validation, and storage validation all ran at transaction depth 1 instead of baseline depth 0.
-
-Smallest regression after the change: the same command — **1 passed**.
-
-Focused coordinated-ingestion class after final changes:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_registry_proxy_model.py::TestRegistryProxyCoordinatedIngestion`
-
-Result: **14 passed, 1 skipped**. The skip is the PostgreSQL-only observer test run separately below.
-
-Final full proxy registry model file:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_registry_proxy_model.py`
-
-Result: **68 passed, 1 skipped**. The skip is the PostgreSQL-only observer test.
-
-Proxy blob worker:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings workers/test/test_proxycacheblobworker.py`
-
-Result: **11 passed**.
-
-Blob uploader and blob models:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_blobuploader.py data/model/test/test_blob.py data/model/test/test_model_blob.py`
-
-Result: **27 passed**. A later final full blob-uploader-only run was **22 passed**.
-
-OCI manifest model:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/oci/test/test_oci_manifest.py`
-
-Result: **21 passed**.
-
-Quota and namespace-quota models:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/test/test_quota.py data/model/test/test_namespacequota.py`
-
-Result: **31 passed**.
-
-Manifest endpoint suite:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py`
-
-Result: **25 passed**.
-
-Mocked direct proxy blob endpoint coverage:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_blob.py::TestBlobPullThroughStorage`
-
-Result: **2 passed**. No external registry was contacted.
-
-Registry interface suite:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_interface.py`
-
-Result: **109 passed, 2 skipped**. The skips are PostgreSQL-only registration races previously covered in Handoff 5.
-
-Pre-commit over every one of the 39 modified tracked files:
-
-`files=$(git diff --name-only --diff-filter=ACMR) && .venv/bin/pre-commit run --files $files`
-
-Initial Session 2 result: **nonzero because hooks modified files**. Black reformatted the proxy model and both modified test files; isort adjusted the proxy test. All other applicable hooks passed. After the advisory-lock review change, Black reformatted the proxy model once more. The final exact command passed every applicable hook.
-
-Targeted mypy:
-
-`.venv/bin/mypy data/model/oci/manifest.py data/registry_model/blobuploader.py data/registry_model/registry_oci_model.py data/registry_model/registry_proxy_model.py workers/proxycacheblobworker.py`
-
-Result: **passed**, no issues in five source files.
-
-Compilation and whitespace:
-
-`.venv/bin/python -m compileall -q data/model/oci/manifest.py data/registry_model/blobuploader.py data/registry_model/registry_oci_model.py data/registry_model/registry_proxy_model.py data/registry_model/test/test_registry_proxy_model.py data/registry_model/test/test_blobuploader.py workers/proxycacheblobworker.py && git diff --check`
-
-Result: **passed** with no output.
-
-### Live PostgreSQL setup and results
-
-Infrastructure: local PostgreSQL on `127.0.0.1:5432`. The session created isolated database `quay_handoff5_s2_01a044a6`, enabled `pg_trgm`, migrated through Alembic head `a2f338ee672c`, ran the tests, terminated no remaining sessions, and dropped the database.
-
-The first Alembic invocation omitted `PYTHONPATH=.` and failed with `ModuleNotFoundError: No module named 'app'`. The corrected command with `TEST=true PYTHONPATH=. TEST_DATABASE_URI=...` passed.
-
-An intermediate four-test PostgreSQL command produced **3 passed, 1 failed**. The failed quota-pruning assertion ran inside the test fixture's pre-existing outer transaction; forcing a nested production `db.transaction()` rolled back the fixture setup tag as well. This was a test-harness transaction artifact, not product behavior. The quota tests now use real `db.atomic()` rollback semantics under the fixture, while the dedicated observer test runs the production `db.transaction()` on a separate connection with committed setup.
-
-Final PostgreSQL test command:
-
-`TEST=true SKIP_DB_SCHEMA=true PYTHONPATH=. TEST_DATABASE_URI='postgresql://quay:quay@127.0.0.1:5432/quay_handoff5_s2_01a044a6' .venv/bin/python -m pytest -q --tb=short --disable-warnings --show-capture=no data/registry_model/test/test_registry_proxy_model.py::TestRegistryProxyCoordinatedIngestion::test_prefetch_and_storage_validation_run_outside_graph_transaction data/registry_model/test/test_registry_proxy_model.py::TestRegistryProxyCoordinatedIngestion::test_live_postgresql_hides_graph_until_commit_and_rolls_back`
-
-Result: **2 passed**.
-
-The first test proves network, stream, hash, and storage validation phases stay outside the production transaction. The second uses a separate PostgreSQL connection while the graph transaction is paused after its writes. The observer sees no repository blob registration, manifest registration, or manifest row. A forced failure then rolls back all of that state. A retry succeeds and makes the registrations visible.
-
-### Focused adversarial review
-
-- **External calls and slow storage:** Upstream reads, chunk streaming, digest hashing, CAS finalization, physical readability probes, and config reads occur before the final transaction. The prevalidated persistence path performs database queries and writes only.
-- **Premature visibility:** A prefetched upload has physical bytes and a pending upload row but no `UploadedBlob`, `RepositoryBlobDigest`, manifest registration, graph row, quota update, pruning, or tag. PostgreSQL observer coverage proves uncommitted final state is not visible.
-- **Tenant isolation:** Reuse begins with `lookup_repository_blob_by_digest(repo_id, requested_digest)` and the Session 1 readability helper. Another repository's alias or global canonical row is never used to authorize the current repository. Exact validated prefetch is required before the final local registration.
-- **Digest mismatch:** Exact descriptor hashing completes before storage finalization and before quota/pruning. A later mismatch cancels pending uploads and starts no final transaction.
-- **Canonical SHA-256 leakage:** Final registration uses the requested descriptor identity. Canonical SHA-256 is preserved only under the established explicit or historical visibility contract. Alternative-only tests remain green.
-- **Placeholder and stale placement:** Missing placement, missing bytes, and storage probe failure still enter Session 1 promotion/repair. Existing readable content remains a no-download path.
-- **Quota and pruning:** Both execute inside the final transaction after database-only blob registration. Rejection or a later graph failure rolls back registrations, graph, quota totals, pruning, and tags. Successful retry applies pruning and graph visibility together.
-- **Partial storage/database failure:** Failures before finalization cancel temporary storage. Failures after finalization preserve unreferenced content-addressed bytes, roll back all database-visible lifecycle state, and remove pending upload rows. A later retry converges.
-- **Retry and idempotency:** Mismatch and database-failure retries pass. Repeated successful ingestion creates one registration and one graph relationship and performs no second download.
-- **Concurrent promotion:** Downloads remain outside locks. The short final phase takes a repository-scoped transaction advisory lock, preventing concurrent coordinated manifest uniqueness races from rolling back earlier blob work. Registration helpers retain savepoint-based idempotency.
-- **PostgreSQL behavior:** A real second connection proved pre-commit invisibility and rollback. SQLite `FakeTransaction` was not relied on for that claim.
-- **Lazy SHA-256 compatibility:** Coordination gating and the all-SHA-256 one-node plan are unchanged. Full proxy and endpoint regressions pass.
-
-quay.io applicability is **conditional** on proxy cache and enabled alternative digest algorithms. OCI Distribution behavior is impacted through pull-through cache ingestion. Database behavior is impacted through shorter transaction and connection lifetime but no schema change. No feature flag is appropriate because the change restores transactional and availability invariants.
-
-### Remaining risks and later-session boundaries
-
-- Final graph transactions are serialized per repository, not globally. Downloads remain parallel. PostgreSQL advisory-lock contention should be observed at proxy-cache scale.
-- A failed attempt after CAS finalization can leave unreferenced content-addressed bytes. They expose no repository identity or graph and are safe to remove. Broader physical orphan discovery and lifecycle cleanup remain Handoff 6 work.
-- Storage eventual consistency can still trigger a redundant repair download. Exact validation and idempotent final registration keep this fail-closed.
-- MySQL concurrency was not run. SQLite behavior and live PostgreSQL transaction visibility/rollback passed.
-- No external proxy, Docker Hub, quay.io, or real Skopeo test was run.
-- **Traversal limits and iterative traversal remain later-session work.**
-- **Duplicate child or manifest fetch prevention remains later-session work.**
-- **Referrer-cache propagation remains later-session work.**
-- **Fallback-tag alias lookup remains later-session work.**
-- **Mirror root registration and mirroring remain later-session work.**
-- **Handoff 6 lifecycle cleanup remains later work.**
-
-Session 2 closes only the coordinated proxy ingestion transaction finding. Do not claim Handoff 5 complete until the remaining findings above and the other unresolved Handoff 5 findings are resolved.
-
-## Handoff 5 Session 3: Bounded iterative proxy graph traversal
-
-**Status: Session 3 is implemented and verified. Handoff 5 is not complete. Referrer-cache propagation, fallback-tag alias lookup, mirror-root registration and mirroring remain later Handoff 5 work. Handoff 6 lifecycle cleanup remains later work.**
-
-### Confirmed traversal and duplicate-fetch root causes
-
-`ProxyModel._build_proxy_ingestion_plan()` previously used recursive depth-first traversal. It had no maximum graph depth, distinct manifest or descriptor count, individual manifest response size, or aggregate manifest-byte bound. A depth-1,100 regression reached Python's recursion limit and raised raw `RecursionError`.
-
-The recursive code called `_pull_upstream_manifest()` before entering `visit()`. The visited check therefore ran only after child or subject bytes had already been requested. Duplicate descriptors in one index, repeated subjects, a descriptor used as both child and subject, and cycle-closing edges could all issue duplicate upstream manifest requests even though later database persistence deduplicated relationships.
-
-`Proxy.get_manifest()` also read `requests.Response.content` in one unbounded operation. `_pull_upstream_manifest()` parsed that materialized body before applying any size check.
-
-### Internal limits and rationale
-
-Session 3 adds fixed internal limits for coordinated synchronous proxy traversal:
-
-- Maximum graph depth: **32 edges**, with the supplied root at depth 0. A graph containing 33 manifests on one path is allowed; the next distinct edge fails.
-- Maximum distinct graph descriptors: **256**, including the root requested identity, distinct child and subject manifest identities, and distinct blob descriptor identities. Child and subject uses of the same validated requested identity count once. Blob and manifest contracts remain separate descriptor kinds.
-- Maximum individual upstream manifest response: **4 MiB** (`4 * 1024 * 1024` bytes).
-- Maximum aggregate bytes across distinct fetched manifests, including the root: **16 MiB** (`16 * 1024 * 1024` bytes).
-
-The existing `REPO_MIRROR_MAX_MANIFEST_LIST_SIZE` and `REPO_MIRROR_MAX_MANIFEST_ENTRIES` settings were not reused. They govern architecture-filtered mirroring, which is a different path with different operational semantics. Coupling synchronous proxy behavior to mirror configuration would make an unrelated mirror setting change registry request-worker exposure. The Session 3 values are internal named constants because they restore a safety boundary rather than define a supported product mode. No feature flag or new public configuration was added.
-
-Depth 32 is well above ordinary OCI index-to-manifest and artifact-to-subject paths. The 256-descriptor bound accommodates normal multi-platform graphs and layered images while preventing unlimited upstream requests. The 4 MiB individual and 16 MiB aggregate bounds permit unusually large JSON manifests but cap response memory and parsing work in one registry request.
-
-### Implementation changes
-
-- `data/registry_model/registry_proxy_model.py`
-  - Replaced recursive graph planning with an explicit LIFO work stack that preserves descendant-first, subject-first, descriptor-order traversal.
-  - Added `ProxyManifestTraversalLimitExceeded`, a controlled `ManifestDoesNotExist` subtype. Limit errors retain a distinct limit name and maximum value and follow the existing proxy endpoint error mapping.
-  - Validates and inserts each requested child or subject identity into `requested_manifests` before queuing any fetch.
-  - Uses the strict, enabled requested descriptor identity as the fetch-deduplication key. It does not use internal canonical SHA-256 for authorization or deduplication.
-  - Counts distinct blob and manifest descriptors, exact manifest bytes, and depth with explicit fail-closed checks. Boundary values are accepted; only values above a bound fail.
-  - Keeps all-SHA-256 roots on the existing one-node lazy path. No descendant request is introduced.
-  - Passes the 4 MiB cap into the proxy client and repeats the materialized-body check before parsing as defense for mocked or alternate proxy implementations.
-  - Maps the proxy client's oversized-response error to the controlled traversal-limit model error.
-- `proxy/__init__.py`
-  - Added optional bounded streaming to `Proxy.get_manifest()`.
-  - Rejects an advertised `Content-Length` above the limit before reading the body.
-  - Streams in 64 KiB chunks and rejects a body that crosses the limit when the length is absent, malformed, or understated.
-  - Closes the response on success or failure and maps stream transport failures to `UpstreamRegistryError`.
-  - The default unbounded mode remains available to unchanged non-coordinated callers, while every `ProxyModel` manifest read supplies the internal limit.
-- `proxy/fixtures.py`
-  - Extended the mocked manifest response helper to accept the optional bounded-read argument.
-- `data/registry_model/test/test_registry_proxy_model.py`
-  - Added bounded iterative traversal, request deduplication, cycle, OCI duplicate-descriptor persistence, failure-state, and retry coverage.
-- `proxy/test_proxy.py`
-  - Added streaming overflow and exact-boundary response tests.
-
-No schema, migration, endpoint, quota, storage, uploader, referrer cache, fallback alias, mirroring, scanner, copy, import, feature flag, or lifecycle-cleanup behavior changed in Session 3.
-
-### Before-and-after traversal behavior
-
-Before:
-
-1. Fetch and parse the root without a response-size limit.
-2. Recursively visit its subject and child descriptors.
-3. Fetch each referenced manifest before checking whether the requested identity was already visited.
-4. Retain no explicit depth, descriptor-count, individual-response, or aggregate-byte bound.
-5. Allow raw `RecursionError` and duplicate network requests.
-
-After:
-
-1. Stream every root, child, and subject manifest through the 4 MiB individual cap before parsing.
-2. Preserve the lazy one-node result if the root directly exposes only SHA-256 identities.
-3. For coordinated graphs, put the validated root requested identity in the requested set.
-4. Iteratively expand stack entries. Count exact bytes and distinct blob or manifest descriptors.
-5. Validate and mark each new child or subject requested identity before queuing its upstream fetch.
-6. Skip repeated requested identities, including cycle-closing edges, without a second request.
-7. Append an expanded node only after its distinct descendants, preserving the persistence plan's descendant-first contract.
-8. Fail the planning attempt with a controlled model error if any bound is exceeded. Planning still precedes blob prefetch and the final graph transaction, so no graph lifecycle state is exposed.
-
-### Permanent Session 3 coverage
-
-The new tests prove:
-
-1. A depth-1,100 graph fails with a controlled depth error and cannot raise `RecursionError`.
-2. A graph exactly at a patched depth boundary succeeds.
-3. A graph wider than a patched distinct-descriptor limit fails.
-4. Distinct-descriptor and aggregate-byte exact boundaries succeed.
-5. An individual oversized response fails before `parse_manifest_from_bytes()` is called.
-6. Aggregate distinct manifest bytes above the limit fail.
-7. Repeated child descriptors issue one upstream request.
-8. Repeated subject descriptors issue one request for the shared subject.
-9. One identity used as both child and subject is fetched once.
-10. A cycle terminates without refetching the root.
-11. A traversal-limit failure creates no manifest, manifest registration, blob registration, quota, or tag state.
-12. The same graph retries successfully when bounded, and duplicate OCI index descriptors persist one `ManifestChild` relationship.
-13. The proxy client rejects an unknown-length streamed body after crossing its limit and closes the response.
-14. A streamed body exactly at the individual limit succeeds.
-
-Retained tests continue to prove exact digest mismatch handling, placeholder promotion, missing physical-content repair, readable-content reuse, repository isolation, hidden canonical identity, rollback, retry convergence, repeated-success idempotency, quota rejection, quota-driven pruning rollback, Session 2 transaction depth and visibility, and lazy all-SHA-256 behavior.
-
-### Exact verification outcomes
-
-Expected failing regression before the production change:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings --show-capture=no data/registry_model/test/test_registry_proxy_model.py::TestRegistryProxyCoordinatedIngestion::test_graph_depth_limit_is_controlled_instead_of_recursing`
-
-Result: **1 failed as expected** with raw `RecursionError` from recursive `visit()` after repeated child fetches.
-
-The same smallest regression after the implementation change: **1 passed**.
-
-Initial new-test aggregate:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings --show-capture=no data/registry_model/test/test_registry_proxy_model.py::TestRegistryProxyCoordinatedIngestion -k 'depth_limit or depth_boundary or distinct_manifest_count or individual_manifest_size or aggregate_manifest_bytes or repeated_child or repeated_subject or child_and_subject or cycle_terminates or traversal_failure' proxy/test_proxy.py::TestProxy::test_get_manifest_rejects_oversized_response_while_streaming`
-
-Result: **9 passed, 1 failed**. The retry test initially set the descriptor limit to 2 but the actual graph has three distinct descriptors: root manifest, child manifest, and config blob. The test boundary was corrected to 3. The isolated retry test then passed. This was a test expectation error, not a production defect.
-
-Focused coordinated-ingestion class before final boundary additions: **24 passed, 1 skipped**. The skip was the PostgreSQL-only observer test.
-
-Full proxy registry model file after implementation and before final formatting:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_registry_proxy_model.py`
-
-Result: **78 passed, 1 skipped**. The skip was the PostgreSQL-only observer test.
-
-Proxy client file before final additions:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings proxy/test_proxy.py`
-
-Result: **35 passed**.
-
-Final post-format proxy model and proxy client aggregate:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_registry_proxy_model.py proxy/test_proxy.py`
-
-Result: **115 passed, 1 skipped**. This command passed twice after the final production edit. The skip is the PostgreSQL-only observer test run separately below.
-
-Relevant proxy worker, uploader, blob model, manifest model, quota, namespace-quota, and manifest endpoint aggregate:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings workers/test/test_proxycacheblobworker.py data/registry_model/test/test_blobuploader.py data/model/test/test_blob.py data/model/test/test_model_blob.py data/model/oci/test/test_oci_manifest.py data/model/test/test_quota.py data/model/test/test_namespacequota.py endpoints/v2/test/test_manifest.py`
-
-Result: **115 passed**.
-
-Registry interface and mocked direct proxy blob endpoint aggregate:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_interface.py endpoints/v2/test/test_blob.py::TestBlobPullThroughStorage`
-
-Result: **111 passed, 2 skipped**. The skips are the existing PostgreSQL-only registration races already covered in prior Handoff 5 sessions.
-
-Mocked manifest pull-through endpoint command, with external tests excluded:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings -m 'not e2e' endpoints/v2/test/test_manifest_pullthru.py`
-
-Result: **45 passed, 13 skipped, 12 deselected, 10 failed**. All ten failures are the current combined working tree's schema-1 fixtures. `manifest_exists()` returns Docker's historical schema-1 digest, while the existing `_pull_upstream_manifest()` exact full-response-byte calculation reports `upstream manifest digest mismatch`. Session 3 did not change the schema-1 digest calculation or error path. This is recorded as a regression-harness/product-contract failure and was not expanded into this traversal-only session.
-
-The same mocked endpoint file excluding those schema-1 cases:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings -m 'not e2e' endpoints/v2/test/test_manifest_pullthru.py -k 'not busybox_schema1'`
-
-Result: **41 passed, 9 skipped, 30 deselected**. No external registry was contacted.
-
-Pre-commit over every modified tracked file in the complete working tree:
-
-`files=$(git diff --name-only --diff-filter=ACMR) && .venv/bin/pre-commit run --files $files`
-
-The first Session 3 invocation covered **42 modified tracked files** and exited nonzero because Black reformatted `data/registry_model/registry_proxy_model.py` and `data/registry_model/test/test_registry_proxy_model.py`. All other applicable hooks passed. The exact command was rerun and passed. It was run again after the final stream-error mapping edit and **all applicable hooks passed**.
-
-Targeted mypy:
-
-`.venv/bin/mypy proxy/__init__.py data/registry_model/registry_proxy_model.py`
-
-Result: **passed**, no issues in two source files. Existing unchecked-body notes were informational.
-
-Compilation and whitespace:
-
-`.venv/bin/python -m compileall -q proxy/__init__.py proxy/fixtures.py proxy/test_proxy.py data/registry_model/registry_proxy_model.py data/registry_model/test/test_registry_proxy_model.py && git diff --check`
-
-Result: **passed** with no output. The final combined pre-commit, mypy, compilation, and diff-check command also passed.
-
-No external proxy, Docker Hub, quay.io, production registry, or production service test was run.
-
-### PostgreSQL setup and results
-
-The expected service on `127.0.0.1:5432` was initially unavailable. Podman was not running and Docker was not installed.
-
-A temporary local PostgreSQL 14 cluster was created under `/tmp/quay-handoff5-s3-pg-01a044bb` on `127.0.0.1:55433` with local-only trust. It created role `quay`, database `quay_handoff5_s3_01a044bb`, enabled `pg_trgm`, and migrated through Alembic head `a2f338ee672c`.
-
-Running the entire coordinated class against that one migrated database produced **6 passed, 20 setup errors**. The PostgreSQL observer test intentionally commits its fixed-name organization fixture. Tests ordered after it could not recreate `quayio-cache`. This is class-order database contamination, not a traversal or transaction failure.
-
-A fresh temporary PostgreSQL 14 cluster then ran the established production-transaction command:
-
-`TEST=true SKIP_DB_SCHEMA=true PYTHONPATH=. TEST_DATABASE_URI='postgresql://quay:quay@127.0.0.1:55433/quay_handoff5_s3_01a044bb' .venv/bin/python -m pytest -q --tb=short --disable-warnings --show-capture=no data/registry_model/test/test_registry_proxy_model.py::TestRegistryProxyCoordinatedIngestion::test_prefetch_and_storage_validation_run_outside_graph_transaction data/registry_model/test/test_registry_proxy_model.py::TestRegistryProxyCoordinatedIngestion::test_live_postgresql_hides_graph_until_commit_and_rolls_back`
-
-Result: **2 passed**. The temporary server was stopped and its data directory deleted by the command's cleanup trap.
-
-After Podman became available, the existing `quay-db` PostgreSQL **18.6** container was started. The session created isolated database `quay_handoff5_s3_01a044bb`, enabled `pg_trgm`, migrated it through `a2f338ee672c`, and ran the same two-test command on port 5432.
-
-Result: **2 passed**. The isolated database was dropped afterward and its absence was verified. The user-started `quay-db` container was left running.
-
-These tests prove upstream reads, storage streaming, digest validation, storage finalization, and config reads remain outside the final transaction. A separate PostgreSQL connection sees no blob registration, manifest registration, or manifest graph before commit. Forced final-transaction failure rolls back all visible state, and retry succeeds.
-
-### Focused adversarial review
-
-- **Depth and recursion:** Traversal contains no recursive call. The explicit stack is bounded by distinct descriptors. Depth is checked before a new distinct child or subject is queued. Cyclic edges already requested are skipped before depth enforcement.
-- **Width and work:** Distinct manifest, subject, child, and blob descriptor identities share the 256-entry cap. Individual and aggregate exact manifest bytes bound parsing and retained manifest data. Duplicate JSON descriptors still require bounded scanning of the already capped 4 MiB response but do not create extra fetches.
-- **Off-by-one behavior:** Root depth is 0. `>` checks accept exact depth and byte boundaries. Descriptor insertion checks the current count before adding a new identity. Exact depth, descriptor-count, individual-stream, and aggregate-byte boundary tests pass.
-- **Duplicate network requests:** Requested descriptor identity is strict-parsed, enabled, and inserted before a fetch task is queued. Duplicate child, duplicate subject, child-plus-subject, and cycle tests each prove one fetch.
-- **Identity and authorization:** Deduplication uses only the validated requested repository descriptor identity. Canonical-equivalent content under another alias is not used to authorize or suppress an upstream request. Repository-scoped resolution remains in Session 1 and Session 2 helpers.
-- **Digest validation:** Every distinct fetched manifest still passes exact-byte validation against its requested identity in `_pull_upstream_manifest()`. The retained mismatch test remains distinct from limit messages and passes.
-- **Controlled errors:** Every traversal bound raises `ProxyManifestTraversalLimitExceeded`, which is handled through the existing `ManifestDoesNotExist` proxy contract. Endpoint behavior remains controlled `MANIFEST_UNKNOWN` rather than raw recursion, parser, or memory errors. Limit names remain visible in the internal detail for diagnosis.
-- **External work and transactions:** Root and descendant reads, traversal, limit checks, blob prefetch, hashing, storage, and prevalidation all remain before `_ingest_proxy_manifest_graph()` opens the final transaction. No Session 2 external call or storage operation moved into that transaction.
-- **Partial visibility:** A traversal failure occurs before physical blob prefetch and final graph persistence. The permanent state test proves no manifest, graph relationship, blob or manifest registration, quota change, pruning, temporary tag, or visible tag. PostgreSQL still proves final-transaction isolation and rollback.
-- **Placeholder and stale placement:** Session 1 resolution and physical-readability helpers are unchanged. Placeholder promotion, missing-content repair, readable-content reuse, and retry tests pass.
-- **Quota and pruning:** Traversal limits run before quota work. Session 2 quota rejection and later-failure pruning rollback tests remain in the passing coordinated class and quota suites.
-- **Retry and idempotency:** Requested and pending sets are per attempt. A failed bounded attempt leaves no durable traversal state. A later valid attempt persists successfully. Existing repeated success still creates one registration and relationship and does not redownload readable content.
-- **Concurrent ingestion:** No shared mutable traversal state was added. Downloads remain outside the repository advisory lock. The short final transaction and repository-scoped advisory lock are unchanged.
-- **PostgreSQL:** Both temporary PostgreSQL 14 and containerized PostgreSQL 18.6 passed the transaction-depth and observer rollback tests. No MySQL test was run.
-- **Lazy SHA-256:** The coordination gate remains before descendant scheduling. All-SHA-256 roots return one root plan and make no child request. The full proxy model and endpoint regressions pass apart from the separately recorded schema-1 digest cases.
-- **quay.io and latency:** Applicability is conditional on proxy cache and enabled alternative algorithms. The work is now finite, but the 256-descriptor cap is not an overall wall-clock deadline. Existing per-request manifest and blob timeouts can still produce a long synchronous attempt when many distinct upstream objects are slow. This remains an operational risk to observe.
-
-No blocking Session 3 finding remains. OCI Distribution pull-through behavior and database graph persistence are impacted. Authorization and tenant boundaries are unchanged. No feature flag is appropriate because unsafe unbounded traversal must not remain operator-selectable.
-
-### Remaining risks and later-session boundaries
-
-- The limits are internal constants. Changing them requires a code rollout. This avoids public configuration coupling but prevents emergency operator tuning.
-- The 256-descriptor bound and per-request timeouts still permit a long finite synchronous attempt against a slow upstream. There is no aggregate wall-clock deadline or request cancellation budget in this session.
-- A failure after later blob CAS finalization can still leave unreferenced physical bytes under the Session 2 contract. It exposes no repository identity. Physical orphan cleanup remains Handoff 6 work.
-- The combined working tree's mocked schema-1 pull-through digest mismatch remains documented. It was not caused or changed by Session 3 and was not expanded into this traversal-only session.
-- The PostgreSQL coordinated class cannot currently run in full in one fixed database after its observer test commits the shared organization fixture. The two production transaction tests pass in their established isolated order.
-- MySQL concurrency and transaction behavior were not run.
-- **Referrer-cache propagation was not changed and remains later Handoff 5 work.**
-- **Fallback-tag alias lookup was not changed and remains later Handoff 5 work.**
-- **Mirror-root registration, complete mirroring, and filtered mirroring were not changed and remain later Handoff 5 work.**
-- **Scanner, copy, import, and unrelated proxy worker behavior were not changed.**
-- **Handoff 6 lifecycle cleanup was not changed and remains later work.**
-
-Session 3 closes only bounded iterative coordinated traversal and duplicate child or subject manifest-fetch prevention. Do not claim Handoff 5 complete until every other remaining Handoff 5 finding above is resolved.
-
-## SHA-384 extension
-
-**Status: implemented and focused verification passed. This does not close the remaining Handoff 5 findings or establish production readiness.**
-
-### Behavior and scope
-
-- Shared strict digest handling now supports SHA-384 with exactly 96 lowercase hexadecimal characters.
-- Exact-byte hashing uses Python `hashlib`; resumable SHA-384 state uses the already pinned `resumablehash` implementation and the existing safe JSON/base64 envelope.
-- Python and Go configuration accept every nonempty unique combination of `sha256`, `sha384`, and `sha512`. The default remains `["sha256"]`.
-- Blob upload, resume, finalization, pull, HEAD, mount, isolation, mismatch, conflict, idempotency, and authoritative SHA-256 finalization tests now run for SHA-384 and SHA-512.
-- Manifest push, exact-byte validation, pull, HEAD, tagging, hidden canonical identity, descriptor resolution, isolation, conflicts, OCI indexes and Docker manifest lists, mixed SHA-256/SHA-384/SHA-512 descriptors, artifacts, subjects, and referrers now have SHA-384 coverage.
-- Focused proxy tests cover SHA-384 root and child identities, alternative blob descriptors, exact upstream validation, repository isolation, failed-attempt cleanup, and retry.
-- Unsupported-algorithm tests now use `sha999`. Valid but disabled SHA-384 and malformed-length SHA-384 remain distinct.
-- Docker schema-1 behavior was not changed.
-- No database model, migration, registration size, registration index, dependency, or default configuration change was made for SHA-384.
-
-### Files added to the existing tracked diff
-
-- `util/config/schema.py`
-- `util/config/test/test_schema.py`
-- `internal/config/digest.go`
-- `internal/config/config_test.go`
-- `internal/config/validate_test.go`
-
-Existing modified digest and lifecycle files were extended without discarding prior work:
-
-- `digest/digest_tools.py`
-- `digest/test/test_digest_tools.py`
-- `data/model/oci/test/test_oci_manifest.py`
-- `data/registry_model/test/test_blobuploader.py`
-- `data/registry_model/test/test_registry_proxy_model.py`
-- `endpoints/v2/test/test_blob.py`
-- `endpoints/v2/test/test_manifest.py`
-
-### Verification
-
-- Final focused Python aggregate: **258 passed**.
-- Final focused SHA-384/SHA-512 proxy selection: **10 passed, 21 deselected**.
-- Full proxy model suite: **84 passed, 1 skipped**. The skip is the PostgreSQL-only observer test from existing work.
-- Registry interface and proxy client aggregate: **145 passed, 2 skipped**. The skips are existing PostgreSQL-only registration race tests.
-- Registry protocol blob, mount, and manifest selection: **271 passed, 1,188 deselected**.
-- Mocked manifest pull-through suite: **45 passed, 10 failed, 13 skipped, 12 deselected**. All 10 failures are the pre-existing Docker schema-1 upstream digest mismatch cases. Excluding those cases produced **41 passed, 9 skipped, 30 deselected**.
-- `go test ./internal/config -count=1`: passed.
-- `go test ./...`: 30 tested packages passed, 1 tested package failed, and 4 packages had no tests on `darwin/arm64`. The sole failure is the existing `internal/migrate.TestInPostgresNetworkNamespace` use of `/proc/self/ns/net` on macOS.
-- `go test ./internal/migrate -skip '^TestInPostgresNetworkNamespace$'`: passed.
-- `go vet ./...`: passed.
-- Pre-commit over all 47 modified tracked files: passed. An earlier focused invocation exited nonzero only because Black reformatted six changed test files; its rerun passed.
-- Targeted mypy over seven production files: passed with no issues.
-- Python compilation and `git diff --check`: passed.
-- Both HTML documents parsed with unique IDs, valid local fragments, and present local image assets. No browser runner was available for desktop or mobile rendering.
-
-### Remaining validation and risks
-
-- No new live PostgreSQL or MySQL run was performed because SHA-384 adds no persistence or transaction behavior. Existing PostgreSQL-only tests remained skipped in the SQLite aggregates.
-- The installed native `resumablehash` SHA-384 implementation passed on local macOS arm64. Linux architectures, wheel or image packaging, and compiler/toolchain availability were not validated.
-- No external Docker, Podman, Skopeo, ORAS, containerd, Buildah, Clair, production registry, or quay.io interoperability test was run.
-- SHA-384 is a Quay extension under OCI Image Specification 1.1.1. External clients may reject it even though Quay, Python `hashlib`, the pinned `resumablehash`, and opencontainers/go-digest can process it.
-- The known schema-1 proxy defect, referrer-cache issue, mirror-root issue, fallback-tag issue, and lifecycle cleanup remain outside this SHA-384 extension.
-
-## Final SHA-384 adversarial review and interoperability validation
-
-**Status: the SHA-384 review is complete. No SHA-384 production-code defect was found. Two verified test gaps were closed. This is not a production-readiness verdict.**
-
-### Review scope and findings
-
-- The initial worktree matched the expected branch `shaon-feature-PQC`, HEAD `9352a3d42478d2aa696df4b76805e5dbbe9a8290`, merge base `d81004d24669132d45df8fbd1eafc86c149e38fa`, 47 modified tracked files, three expected untracked files, and no staged files.
-- The complete tracked diff was inventoried by file and hunk. SHA-384 references and every production SHA-512 reference were searched separately. Production SHA-384 support remains confined to `digest/digest_tools.py`, `util/config/schema.py`, and `internal/config/digest.go`. No SHA-512-only production branch outside those registries blocks SHA-384.
-- Exact-byte blob, manifest, and proxy validation selects the requested algorithm and hashes unmodified bytes. SHA-256 remains the independently computed canonical storage and manifest identity.
-- Blob and manifest aliases resolve through repository-scoped registrations and repository relationships. Existing cross-repository, mount, descriptor, proxy, artifact, subject, and referrer SHA-384 tests passed.
-- New alternative-only content does not gain an externally resolvable canonical SHA-256 alias. Existing legacy canonical visibility is preserved explicitly before an alternative alias is added.
-- Blob and manifest registration conflicts remain immutable, idempotent, and covered by transaction rollback tests parameterized for SHA-384 and SHA-512.
-- Persisted resumable state records and validates the algorithm, format version, architecture, byte order, byte count, origin, and native state. Cross-algorithm restoration between SHA-384 and SHA-512 is rejected.
-- Malformed SHA-384, valid-but-disabled SHA-384, and unsupported `sha999` use distinct error paths. Existing endpoint tests passed.
-- When both SHA-384 and SHA-512 are configured, a hintless chunked upload deliberately tracks neither alternative. It can finish as SHA-256, but an alternative final digest after prior bytes requires an explicit opening hint. New coverage fixes this fail-closed contract for both alternatives.
-- Docker schema-1 remains SHA-256-only. A new real signed schema-1 endpoint test proves SHA-384 and SHA-512 digest-addressed pushes are rejected while the historical schema-1 SHA-256 digest-addressed push succeeds.
-- Remaining SHA-512-only tests cover algorithm-independent lifecycle, GC, scanner, traversal-limit, or mirroring behavior already exercised by direct SHA-384 endpoint/model tests. Parameterizing them would add runtime without proving a new SHA-384 invariant.
-- No production file, database model, migration, index, field size, default, dependency, generated file, or external documentation file changed in this final session.
-
-### Tests added
-
-- `endpoints/v2/test/test_blob.py`
-  - `test_hintless_chunked_upload_with_multiple_alternatives_requires_a_hint`, parameterized for SHA-384 and SHA-512.
-  - Proves no alternative state is selected arbitrarily, prior bytes cannot be finalized under an untracked alternative, the upload is canceled, and no registration is created.
-- `endpoints/v2/test/test_manifest.py`
-  - `test_schema1_digest_push_remains_sha256_only`, parameterized for SHA-384 and SHA-512.
-  - Uses a real signed schema-1 manifest. Proves alternative digest routes return `UNSUPPORTED`, SHA-256 still succeeds, and no alternative registration is created.
-
-### Exact validation commands and outcomes
-
-The first focused invocation was accidentally run from the harness start directory rather than the target worktree:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_blob.py::test_hintless_chunked_upload_with_multiple_alternatives_requires_a_hint endpoints/v2/test/test_manifest.py::test_schema1_digest_push_remains_sha256_only`
-
-Result: **pytest did not start**; shell exit 127 because `.venv/bin/python` was not found. This was an invocation failure, not a test failure.
-
-The command was rerun from `/Users/shossain/QuayWorkspace/shaon-feature-PQC` before formatting and again after Black:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_blob.py::test_hintless_chunked_upload_with_multiple_alternatives_requires_a_hint endpoints/v2/test/test_manifest.py::test_schema1_digest_push_remains_sha256_only`
-
-Result on each run: **4 passed**.
-
-Changed SHA-focused Python files:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings digest/test/test_digest_tools.py util/config/test/test_schema.py data/model/oci/test/test_oci_manifest.py data/registry_model/test/test_blobuploader.py data/registry_model/test/test_registry_proxy_model.py endpoints/v2/test/test_blob.py endpoints/v2/test/test_manifest.py`
-
-Result: **346 passed, 1 skipped**. The skip is the existing PostgreSQL-only proxy observer test.
-
-Go configuration:
-
-`go test ./internal/config -count=1`
-
-Result: **passed**.
-
-Registry interface and proxy client:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_interface.py proxy/test_proxy.py`
-
-Result: **145 passed, 2 skipped**. The skips are existing PostgreSQL-only registration races.
-
-Registry protocol blob, mount, and basic manifest selection:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings test/registry/registry_tests.py -k 'test_chunked_blob_uploading or test_blob_mounting or test_basic_push_pull_by_manifest'`
-
-Result: **271 passed, 1,188 deselected**.
-
-Mocked manifest pull-through excluding known schema-1 cases:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings -m 'not e2e' endpoints/v2/test/test_manifest_pullthru.py -k 'not busybox_schema1'`
-
-Result: **41 passed, 9 skipped, 30 deselected**.
-
-Full mocked manifest pull-through:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings -m 'not e2e' endpoints/v2/test/test_manifest_pullthru.py`
-
-Result: **45 passed, 10 failed, 13 skipped, 12 deselected**. Every failure is an existing `busybox_schema1` upstream manifest digest mismatch. SHA-384 code and the new direct schema-1 test did not alter this path.
-
-Go aggregate:
-
-`go test ./...`
-
-Result: **30 tested packages passed, 1 tested package failed, and 4 packages had no tests** on macOS arm64. The sole failure was the known `internal/migrate.TestInPostgresNetworkNamespace` use of absent `/proc/self/ns/net`.
-
-Fallback and vet:
-
-`go test ./internal/migrate -skip '^TestInPostgresNetworkNamespace$' && go vet ./...`
-
-Result: **passed**; vet emitted no findings.
-
-Targeted mypy:
-
-`.venv/bin/mypy digest/digest_tools.py data/model/oci/blob.py data/model/oci/manifest.py data/registry_model/blobuploader.py data/registry_model/registry_oci_model.py data/registry_model/registry_proxy_model.py endpoints/v2/blob.py endpoints/v2/manifest.py`
-
-Result: **passed**, no issues in eight source files.
-
-Compilation and whitespace:
-
-`.venv/bin/python -m compileall -q digest/digest_tools.py data/model/oci/blob.py data/model/oci/manifest.py data/registry_model/blobuploader.py data/registry_model/registry_oci_model.py data/registry_model/registry_proxy_model.py endpoints/v2/blob.py endpoints/v2/manifest.py endpoints/v2/test/test_blob.py endpoints/v2/test/test_manifest.py && git diff --check`
-
-Result: **passed**.
-
-Focused pre-commit:
-
-`.venv/bin/pre-commit run --files endpoints/v2/test/test_blob.py endpoints/v2/test/test_manifest.py`
-
-First result: **nonzero because Black reformatted both files**. The exact command was rerun and **all applicable hooks passed**.
-
-Full pre-commit:
-
-`files=$(git diff --name-only --diff-filter=ACMR) && .venv/bin/pre-commit run --files $files`
-
-Result: **all applicable hooks passed across 47 modified tracked files**.
-
-### Live Quay and external-client interoperability
-
-Available local tools and services:
-
-- Podman 6.0.2: available.
-- Skopeo 1.21.0: available.
-- ORAS 1.3.1: available.
-- Docker, `ctr`/containerd CLI, Nerdctl, Buildah CLI, and Clair CLI/service: unavailable.
-- Local Quay, PostgreSQL, and Redis containers were running. `quay-quay` bind-mounted this target worktree.
-
-The local development config was temporarily changed from the default SHA-256 allowlist to `['sha256', 'sha384', 'sha512']`, and `quay-quay` was restarted. A temporary verified user and a tiny Podman-imported image were used. The configuration was restored byte-for-byte, Quay was restarted, the live allowlist was verified as `['sha256']`, and the temporary user, repository metadata, registrations, and local image were removed.
-
-Baseline external push:
-
-`podman push --authfile /tmp/sha384-interop-01a04710-valid/auth.json --tls-verify=false localhost:8080/sha384interop/image:source`
-
-Result: **passed** using canonical SHA-256 descriptors.
-
-A registry API script fetched the exact tag manifest bytes, computed SHA-384, and sent:
-
-`PUT http://localhost:8080/v2/sha384interop/image/manifests/sha384:265bc0ea9cf3200b7a1f269897c0e07ef2f1427140b0ed533a241c17f77291773862204c7e53814a34e543d85c334612`
-
-Result: **HTTP 201** with the requested SHA-384 `Docker-Content-Digest`. A subsequent digest `GET` returned **HTTP 200**, the same digest header, and byte-for-byte identical manifest content. This proves the live Quay extension accepted SHA-384; it does not prove OCI conformance or production readiness.
-
-Podman pull:
-
-`podman pull --authfile /tmp/sha384-interop-01a04710-valid/auth.json --tls-verify=false localhost:8080/sha384interop/image@sha384:265bc0ea9cf3200b7a1f269897c0e07ef2f1427140b0ed533a241c17f77291773862204c7e53814a34e543d85c334612`
-
-Result: **failed, exit 125** with `Manifest does not match provided manifest digest sha384:...`. Quay had already returned exact bytes under that identity; this is Podman's client-side digest behavior for the unregistered OCI algorithm.
-
-Skopeo inspect:
-
-`skopeo inspect --authfile /tmp/sha384-interop-01a04710-valid/auth.json --tls-verify=false docker://localhost:8080/sha384interop/image@sha384:265bc0ea9cf3200b7a1f269897c0e07ef2f1427140b0ed533a241c17f77291773862204c7e53814a34e543d85c334612`
-
-Result: **failed, exit 1** with the same manifest-digest mismatch. This is client-side rejection, not Quay rejecting SHA-384.
-
-ORAS fetch:
-
-`oras manifest fetch --plain-http --registry-config /tmp/sha384-interop-01a04710-valid/auth.json localhost:8080/sha384interop/image@sha384:265bc0ea9cf3200b7a1f269897c0e07ef2f1427140b0ed533a241c17f77291773862204c7e53814a34e543d85c334612`
-
-Result: **passed, exit 0**. `cmp` against the original manifest returned **exit 0**, proving exact bytes.
-
-The first external attempt was infrastructure-invalid: ORAS rejected an absolute payload path before contacting Quay, and stale saved `testuser` credentials caused HTTP 401. No SHA-384 identity was created by that attempt. Both attempts restored `local-dev/stack/config.yaml` byte-for-byte.
-
-Initial temporary-user cleanup exposed the existing repository lifecycle foreign-key defect: repository purge tried to delete `ImageStorage` while `RepositoryBlobDigest` still referenced it. No lifecycle code was changed. Removing only the temporary repository's two digest-registration rows allowed the existing cleanup path to delete the temporary user and repository successfully.
-
-### Native dependency and release assumptions
-
-- Local native probe: Python 3.12.12 on macOS 26.6.1 arm64, `resumablehash` 1.0.0 from the pinned Git dependency. SHA-384 and SHA-512 hashing and native-state extraction both succeeded; each native state was 216 bytes.
-- Existing Quay-container probe: Python 3.12.13 on Linux aarch64 with glibc 2.34 contained `resumablehash/_hash_ext.cpython-312-aarch64-linux-gnu.so`. SHA-384 and SHA-512 native-state extraction, restoration, continuation, and final hashing succeeded; each native state was 216 bytes. This proves only the already-built local Linux aarch64 image.
-- Linux x86_64, a clean Linux image build, wheel availability, Git availability, compiler/toolchain availability, cross-architecture resume behavior, and production packaging remain **unproven**.
-- No live MySQL run was performed. No new PostgreSQL test was needed because this session changed only tests and documentation; existing PostgreSQL-only tests remained skipped in SQLite aggregates.
-- OCI Image Specification 1.1.1 does not register SHA-384. Podman and Skopeo rejected the extension in this environment; ORAS accepted it. External interoperability must be treated client by client.
-- No database migration was added.
-
-## Story 4: Repository-registered digest pulls
-
-**Status: Done under the local definition of done. The implementation was already present; this session added missing regression evidence and delivery documentation only.**
-
-### Static review result
-
-- Manifest digest GET and automatic HEAD strictly parse the requested identity, enforce the active allowlist before cache lookup, authorize repository pull access, resolve only that repository's registration, and return exact persisted bytes with the requested digest.
-- Tag GET and automatic HEAD select a deterministic enabled repository-visible registration. Canonical SHA-256 is preferred only when it is explicitly or historically visible and enabled. Schema conversion returns the digest of the bytes actually served and rechecks the active allowlist.
-- Blob GET and HEAD strictly parse and allowlist-check before cache lookup, resolve repository relationships and registrations, and serve canonical stored bytes while returning the requested registered digest.
-- Legacy SHA-256 fallback is available only while the repository/object pair has no registration. Once an alternative registration exists, hidden canonical SHA-256 no longer resolves unless it is explicitly registered.
-- Manifest cache keys include repository ID and requested digest. Blob cache keys include namespace, repository, requested digest, and cache version. Missing results are not cached. Disabled algorithms are rejected before a positive cache can be used.
-- GET and HEAD share authentication and repository authorization. Flask's automatic manifest HEAD uses the GET handler and strips only the body. Blob HEAD has an explicit handler using the same lookup contract.
-- No accidental canonical fallback, cross-repository lookup, disabled-algorithm cache bypass, GET/HEAD identity mismatch, or served-byte digest mismatch was found.
-- No production file changed.
-
-### Tests added
-
-- `endpoints/v2/test/test_manifest.py`
-  - Added referenced config and layer details to the existing alternative-manifest fixture.
-  - Added a SHA-384/SHA-512 Story 4 graph pull contract covering manifest digest and tag GET/HEAD, referenced config and layer GET/HEAD, independent hashing, hidden canonical rejection, explicit canonical registration, repository isolation, unauthorized requests, primed-cache hard-disable, and re-enable behavior.
-  - Added malformed, unsupported, disabled, and unknown manifest pull GET/HEAD parity.
-- `endpoints/v2/test/test_blob.py`
-  - Extended precise blob lookup errors with matching HEAD status coverage.
-
-### Exact local verification
-
-Baseline focused selection before the new tests:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py::test_alternative_single_manifest_push_pull_tag_and_repository_isolation endpoints/v2/test/test_manifest.py::test_tag_push_pull_and_cleanup_obey_hard_allowlist endpoints/v2/test/test_manifest.py::test_tag_pull_does_not_expose_disabled_canonical_identity endpoints/v2/test/test_manifest.py::test_tag_pull_rejects_disabled_converted_representation endpoints/v2/test/test_manifest.py::test_manifest_cache_is_invalidated_for_alternative_digest_after_tag_retarget endpoints/v2/test/test_manifest.py::test_sha384_manifest_list_lifecycle_with_mixed_child_identities endpoints/v2/test/test_blob.py::test_alternative_chunked_blob_upload_resume_and_pull endpoints/v2/test/test_blob.py::test_blob_lookup_digest_errors_are_precise`
-
-Result: **13 passed**.
-
-New Story 4 selection, run before and after formatting:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py::test_story4_registered_graph_pull_contract endpoints/v2/test/test_manifest.py::test_manifest_pull_digest_errors_are_precise_for_get_and_head endpoints/v2/test/test_blob.py::test_blob_lookup_digest_errors_are_precise`
-
-Result on both runs: **7 passed**.
-
-Complete manifest endpoint file:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py`
-
-Result: **62 passed**.
-
-Complete blob endpoint file:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_blob.py`
-
-Result: **50 passed**.
-
-Digest, OCI manifest model, and registry interface aggregate:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings digest/test/test_digest_tools.py data/model/oci/test/test_oci_manifest.py data/registry_model/test/test_interface.py`
-
-Result: **193 passed, 2 skipped**. The skips are the PostgreSQL-only registration races already covered in earlier handoffs.
-
-Mocked pull-through regression outside deferred schema-1 and external e2e cases:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings -m 'not e2e' endpoints/v2/test/test_manifest_pullthru.py -k 'not busybox_schema1'`
-
-Result: **45 passed, 9 skipped, 30 deselected**.
-
-Existing SHA-256 registry protocol manifest selection:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings test/registry/registry_tests.py -k 'test_basic_push_pull_by_manifest'`
-
-Result: **3 passed, 1,456 deselected**.
-
-Focused pre-commit:
-
-`.venv/bin/pre-commit run --files endpoints/v2/test/test_manifest.py endpoints/v2/test/test_blob.py`
-
-First result: **nonzero because Black reformatted both files**. Every other applicable hook passed. The exact command was rerun and **all applicable hooks passed**.
-
-### Live regctl round trip
-
-- `quay-quay` was running and bind-mounted `/Users/shossain/QuayWorkspace/shaon-feature-PQC` to `/quay-registry`.
-- The live Quay configuration reported `['sha256', 'sha384', 'sha512']`.
-- Only tests and documentation changed, so no source-module restart was required.
-- The existing regctl registry configuration was used. No credentials were printed or added to commands.
-
-Fresh SHA-512 BusyBox graph push:
-
-`regctl image mod busybox:latest --digest-algo sha512 --create localhost:8080/testuser/pqc-story4:sha512`
-
-Result: **passed**, and the command printed `localhost:8080/testuser/pqc-story4:sha512`.
-
-Fresh OCI-layout pull/copy:
-
-`regctl image copy --force-recursive localhost:8080/testuser/pqc-story4:sha512 ocidir:///tmp/pqc-story4-oci-20260901104930:sha512`
-
-Result: **passed**.
-
-The remote root was `sha512:0bd23dcfecb44322dd952511fc3c392f2eb652f3eb6dac7c352156a43b782a957b8cf23b26633bffc66c56acbdb82e6f805501661cd55b011e01673a4a72963c`. An inline Python verifier walked the fresh layout, read every descriptor from `blobs/<algorithm>/<encoded>`, checked descriptor size, and recomputed each digest with `hashlib.new(algorithm, bytes)`. Result: **52 unique objects verified**: 1 index, 17 child manifests, 17 configurations, and 17 layers. Every descriptor algorithm was SHA-512.
-
-The selected normal `linux/amd64` graph used:
-
-- Manifest: `sha512:567ed32d3ecedafbe918adc3785e20c823a59aa1c9c619d33966de13e8c390adbc12ff635e95f6311ab9af24d637e19880bf7cacc99a57daa73d7bc0336f7fe0`
-- Configuration: `sha512:015f0d5f92e7c29aff787ab1e60536fb0144f9033d1caceb29494a4acb88ad141d2ed4d26fff5f3a254b4ecb4a7728f93655c66741b6460b4529a1a6d76a1b5e`
-- Layer: `sha512:8368b4eeaf292a3073dadaf70654ffb71a05679f4d56e17e309b157bcd8012c5be03a8bd7c056e4a4fd388007290ec4d243409e996ef1aefb9ee720477782524`
-
-`regctl manifest get` by tag and root digest returned byte-identical 10,533-byte index content. `regctl manifest head` by tag and root digest returned HTTP success, the OCI index media type, and the registered SHA-512 root in `Docker-Content-Digest`. The selected child manifest GET returned 674 bytes. `regctl blob get` and `regctl blob head` succeeded for its 444-byte configuration and 2,226,327-byte layer and returned their registered SHA-512 identities. Independent SHA-512 recomputation passed for the root index, selected child manifest, configuration, and layer.
-
-The internal canonical SHA-256 values were calculated independently from retrieved bytes but were not registered by this digest-addressed push:
-
-- Root manifest: `sha256:9edfb5319801ada456f67d05aeee6fc8946d09731ff8337e873ec3648255ccb8`
-- Configuration blob: `sha256:b7cadd906362981e134f4ca8ff053e210c0bad92929603d819f48476e374fc10`
-
-`regctl manifest get`, `regctl manifest head`, `regctl blob get`, and `regctl blob head` against those canonical identities each failed as expected with exit 1 and HTTP 404 (`MANIFEST_UNKNOWN` or `BLOB_UNKNOWN`).
-
-### Scope and remaining limits
-
-- Story 4 is complete for configure, push, digest-addressed tagging, pull, and normal SHA-256 compatibility.
-- Story 1 and Story 2 remain independently `In progress` in the delivery tracker.
-- Blob mounts, referrers, proxy cache, mirroring, copying, importing, builds, Clair, UI, lifecycle cleanup, and operational tooling were not changed.
-- Deferred items D1–D8 remain deferred. No deferred item blocked Story 4.
-- No OCI conformance, broad client matrix, MySQL, mixed-version, mixed-region, object-storage, replication, or production packaging claim is made.
-
-## Story 5: Repository-scoped blob mounts
-
-**Status: Done under the local definition of done. The implementation was already present; this session added missing mount regression evidence and delivery documentation only.**
-
-### Static review result
-
-- The destination blob-upload route requires destination push authorization before handler execution. Read-only destination scope returns HTTP 401 and creates no destination link or registration.
-- The externally supplied `mount` value is strictly parsed as lowercase exact-length SHA-256, SHA-384, or SHA-512. Unsupported and disabled algorithms are rejected before source repository lookup or blob cache access. Mirror-managed destinations retain their existing SHA-256-only ingestion boundary.
-- Missing `from`, unknown source repository, unknown valid source digest, a digest registered only in another repository, and inaccessible private source all use the existing normal HTTP 202 upload fallback. Public source reads retain the existing behavior.
-- Source authorization is checked before blob resolution. Private repositories require source pull permission. Public, full-superuser, and global-readonly-superuser handling follows existing permission contracts.
-- Source lookup uses the repository named by `from` and the exact requested digest. The blob cache key contains source namespace, repository name, complete digest including algorithm, and cache version. Missing values are not cached.
-- Repository blob resolution accepts an exact `RepositoryBlobDigest` only when the same repository also references the `ImageStorage` row through `UploadedBlob` or `ManifestBlob`. It does not fall back from an unregistered identity to globally deduplicated canonical content. The historical globally shared empty SHA-256 layer remains an unchanged legacy exception.
-- The resolved source `Blob` carries the canonical `ImageStorage` database ID and SHA-256 checksum. Mounting uses both values in `temp_link_blob_by_id()`, so a globally deduplicated row that was not resolved and authorized in the source cannot be substituted.
-- Destination temporary linking and requested digest registration execute in one outer production transaction. Registration insertion uses a nested `db.atomic()` savepoint. An idempotent uniqueness race does not roll back caller work, while a conflicting destination registration raises without remapping and rolls back the temporary link.
-- A new destination receives only the requested registration. Other source aliases and unregistered canonical SHA-256 remain hidden. Explicit SHA-256 mount creates and resolves SHA-256 normally while enabled.
-- Mount does not read, stream, copy, finalize, or create physical bytes. It reuses the exact canonical `ImageStorage` row and existing placement. Repeated mounts remain client-visible idempotent and keep one immutable destination digest registration; each successful request may refresh reachability through another temporary `UploadedBlob` row under the established mount contract.
-- A successful mount returns HTTP 201, the requested digest in `Docker-Content-Digest`, a destination blob `Location` using that digest, and no `Docker-Upload-UUID`.
-- Destination GET and HEAD strictly parse and allowlist-check before cache lookup, require destination pull access, resolve the destination registration, read canonical SHA-256 storage bytes, and return the requested registered identity. GET and HEAD use the same repository-scoped lookup contract.
-- No production source file changed. The only target-worktree implementation artifact from this session is expanded coverage in `endpoints/v2/test/test_blob.py`.
-
-### Tests added or expanded
-
-`endpoints/v2/test/test_blob.py` now proves:
-
-- Registered SHA-256, SHA-384, and SHA-512 mount success.
-- HTTP 201 response headers and absence of an invented upload UUID.
-- Destination GET and HEAD with exact bytes, content length, requested identity, and independent hashing.
-- Exact source `ImageStorage` row reuse, unchanged global `ImageStorage` count, unchanged placement count, and no physical copy.
-- One requested destination registration and no copied source aliases.
-- Hidden canonical SHA-256 rejection for SHA-384 and SHA-512 mounts, plus normal explicit SHA-256 behavior.
-- Repeated successful mounts with one immutable destination registration.
-- Destination push denial without link or registration state.
-- Source pull denial, wrong-source repository isolation, public-source compatibility, missing `from`, unknown digest, and unknown source repository fallback.
-- Every covered fallback creates a normal upload session that can be canceled through the existing upload endpoint.
-- Disabled-algorithm rejection before a primed blob cache is touched, followed by successful reuse of the same registration after re-enable.
-- Endpoint conflict response without digest remapping. Existing registry-interface coverage proves the temporary destination link rolls back under a real Peewee transaction.
-
-### Exact local verification
-
-The first combined baseline command accidentally supplied two `-k` options:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_blob.py -k 'blob_mounting or alternative_mount or mount_digest_errors' data/registry_model/test/test_interface.py -k 'mount_blob or mount_alternative or mount_rejects_destination_digest_remap'`
-
-Result: **4 passed, 164 deselected**. Pytest applied the final `-k`, so this selected only the four registry-interface mount tests. It was not treated as endpoint evidence.
-
-Unambiguous pre-change endpoint baseline:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_blob.py -k 'blob_mounting or alternative_mount or mount_digest_errors'`
-
-Result: **20 passed, 30 deselected**.
-
-Unambiguous pre-change registry-interface baseline:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_interface.py -k 'mount_blob or mount_alternative or mount_rejects_destination_digest_remap'`
-
-Result: **4 passed, 114 deselected**.
-
-Expanded Story 5 endpoint selection before formatting:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_blob.py -k 'story5 or blob_mounting or alternative_mount or mount_requires_destination or mount_hard_disable or mount_digest_errors'`
-
-Result: **26 passed, 30 deselected**.
-
-Complete blob endpoint file before formatting:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_blob.py`
-
-Result: **56 passed**.
-
-Relevant registry-interface mount, cache, conflict rollback, and race selection:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_interface.py -k 'mount_blob or mount_alternative or mount_rejects_destination_digest_remap or get_cached_repo_blob or repository_digest_registration_live_concurrency'`
-
-Result: **5 passed, 1 skipped, 112 deselected**. The skip is the PostgreSQL-only registration race already covered in earlier handoffs. No production transaction behavior changed in Story 5, so no new live database race was required.
-
-Blob model and uploader regressions:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/test/test_blob.py data/model/test/test_model_blob.py data/registry_model/test/test_blobuploader.py`
-
-Result: **36 passed**.
-
-Existing SHA-256 registry protocol mount coverage:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings test/registry/registry_tests.py -k 'test_blob_mounting'`
-
-Result: **252 passed, 1,207 deselected**.
-
-Focused pre-commit:
-
-`.venv/bin/pre-commit run --files endpoints/v2/test/test_blob.py`
-
-First result: **nonzero because Black reformatted `endpoints/v2/test/test_blob.py`**. Every other applicable hook passed. The exact command was rerun and **all applicable hooks passed**.
-
-Post-format expanded Story 5 endpoint selection:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_blob.py -k 'story5 or blob_mounting or alternative_mount or mount_requires_destination or mount_hard_disable or mount_digest_errors'`
-
-Result: **26 passed, 30 deselected**.
-
-Final complete blob endpoint file:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_blob.py`
-
-Result: **56 passed**.
-
-Strict digest parser and hashing coverage:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings digest/test/test_digest_tools.py`
-
-Result: **54 passed**.
-
-Compilation and whitespace:
-
-`.venv/bin/python -m compileall -q endpoints/v2/test/test_blob.py && git diff --check`
-
-Result: **passed** with no output, both before and after the final complete endpoint run.
-
-Final pre-commit across every modified target-worktree file:
-
-`files=$(git diff --name-only --diff-filter=ACMR) && .venv/bin/pre-commit run --files $files`
-
-Result: **all applicable hooks passed** for `HANDOFF.md`, `endpoints/v2/test/test_blob.py`, and the preserved pre-existing `endpoints/v2/test/test_manifest.py` change.
-
-### Live SHA-512 mount validation
-
-Environment:
-
-- `quay-quay` was bind-mounted from `/Users/shossain/QuayWorkspace/shaon-feature-PQC` to `/quay-registry`.
-- The active allowlist was `['sha256', 'sha384', 'sha512']`.
-- `regctl` 0.11.5 used its existing configuration. No credentials, bearer tokens, passwords, or auth-file contents were printed.
-- Dedicated repositories were `localhost:8080/testuser/pqc-story5-source-01a05e37` and `localhost:8080/testuser/pqc-story5-destination-01a05e37`.
-
-Source graph command:
-
-`regctl image mod busybox:latest --digest-algo sha512 --create localhost:8080/testuser/pqc-story5-source-01a05e37:sha512`
-
-Result: **passed**.
-
-The selected `linux/amd64` configuration blob was:
-
-`sha512:015f0d5f92e7c29aff787ab1e60536fb0144f9033d1caceb29494a4acb88ad141d2ed4d26fff5f3a254b4ecb4a7728f93655c66741b6460b4529a1a6d76a1b5e`
-
-It contained 444 bytes. Independent source SHA-512 verification passed. Its internal canonical identity was `sha256:b7cadd906362981e134f4ca8ff053e210c0bad92929603d819f48476e374fc10`.
-
-An inline Python `requests` command read the existing regctl host credentials in memory, requested only the necessary registry scopes, and sent:
-
-`POST /v2/testuser/pqc-story5-destination-01a05e37/blobs/uploads/?mount=<selected-sha512>&from=testuser/pqc-story5-source-01a05e37`
-
-Result: **HTTP 201**. `Docker-Content-Digest` was the requested SHA-512 value, `Location` ended in the destination blob URL with that value, and `Docker-Upload-UUID` was absent. Repeating the same request returned **HTTP 201** again.
-
-Destination `GET` and `HEAD` for the mounted SHA-512 identity returned **HTTP 200**. GET returned the exact 444 source bytes. HEAD returned the same requested `Docker-Content-Digest`. Exact-byte comparison and independent SHA-512 recomputation passed.
-
-Database and storage inspection after mount found:
-
-- Source `ImageStorage` ID: 36.
-- Destination registration `ImageStorage` ID: 36.
-- Global rows for the canonical SHA-256 identity: 1.
-- Physical placement rows for the canonical storage: 1.
-- Destination aliases for that row: only the requested SHA-512 identity.
-- Repeated mounts created temporary reachability rows only; they did not create a second registration, canonical row, placement, or byte copy.
-
-Destination GET and HEAD through the unregistered canonical SHA-256 identity returned **HTTP 404**. This is required identity isolation, not a defect.
-
-A token with destination pull/push scope but no source pull scope sent the same known mount request. Result: **HTTP 202** with a normal upload UUID and location. Deleting that fallback upload returned **HTTP 204**. The response did not disclose that the private source content existed.
-
-A malformed live `sha512:1234` mount returned **HTTP 400**, code `DIGEST_INVALID`, reason `malformed`, and no upload UUID.
-
-For the hard-disable check, SHA-512 was temporarily removed from `local-dev/stack/config.yaml` and `quay-quay` was restarted. The first attempt was **infrastructure-blocked** because `/v2/auth` returned HTTP 502 while the backend was still becoming ready. The mount endpoint was not reached. The cleanup trap restored the configuration and restarted Quay.
-
-The check was rerun with authenticated readiness polling. With the temporary active allowlist `['sha256', 'sha384']`, the same mount returned **HTTP 400**, code `UNSUPPORTED`, reason `disabled`, and no upload UUID. The original config was restored byte-for-byte, its SHA-256 returned to `4de46dadfc727018452ddd490056beb5f5af736e1d0f5751cb8ddb942430731f`, and the active allowlist returned to `['sha256', 'sha384', 'sha512']`. The same existing destination registration then mounted again with **HTTP 201**.
-
-### Scope and remaining limits
-
-- Story 5 is complete for repository-scoped blob mounts under SHA-256, SHA-384, and SHA-512, including destination pull and normal SHA-256 compatibility.
-- Story 1 and Story 2 remain independently `In progress` in the delivery tracker.
-- Referrers, proxy cache, mirroring, complete-image copies, imports, builds, Clair, UI, deletion, garbage collection, conformance, and operational tooling were not changed.
-- Deferred items D1–D8 remain deferred. No deferred item blocked Story 5.
-- No new PostgreSQL or MySQL run was performed because production mount transaction behavior did not change. Existing production-transaction rollback and prior PostgreSQL registration-race evidence remain applicable.
-- No OCI conformance, broad client matrix, mixed-version, mixed-region, object-storage, replication, or production-readiness claim is made.
-
-## Story 6: Mixed-digest multi-architecture images
-
-**Status: Done under the local definition of done. The production implementation was already present. This session added the missing Story 6 regression evidence and delivery documentation only.**
-
-### Configurable-digest end goal and session state
-
-The overall goal remains repository-visible SHA-256, SHA-384, and SHA-512 identities for supported Registry V2 operations while Quay keeps SHA-256 as its canonical internal storage, deduplication, manifest, and graph identity. Alternative identities must be explicitly registered, repository-scoped, hard-disabled by the active allowlist, and never inferred from globally deduplicated canonical rows.
-
-- Worktree: `/Users/shossain/QuayWorkspace/shaon-feature-PQC`
-- Branch: `shaon-feature-PQC`
 - Base and merge base: `d81004d24669132d45df8fbd1eafc86c149e38fa`
-- Starting commit: `844a495009ea9eafb8284ccbbccb2995fd9bd2ee`
-- Starting subject: `NO-ISSUE: test(registry): validate registered digest pulls and mounts`
-- Relevant implementation commit: `139a00109080e0236fe8c73820d5700e5d837508` (`NO-ISSUE: feat(registry): implement configurable digest lifecycle`)
-- Relevant Story 4 and Story 5 evidence commit: `844a495009ea9eafb8284ccbbccb2995fd9bd2ee`
-- Final session commit: the commit containing this Story 6 section. Its exact hash cannot be embedded in its own Git preimage; obtain it with `git rev-parse HEAD`. The final response and next-session prompt record the exact hash.
-- Starting target status: clean, with no staged, unstaged, or untracked target files.
-- The complete `master...HEAD` baseline covered 70 files, 10,610 insertions, and 652 deletions before this session.
-- No reset, restore, rebase, amend, push, remote change, or other-worktree modification occurred.
+- Current feature HEAD: `b59c747e7482f174dee81508dd3aca363ef7d7e6`
+- Current feature subject: `NO-ISSUE: feat(registry): support registered OCI artifact identities`
+- This compact handoff is committed separately with subject `NO-ISSUE: docs(registry): compact configurable-digest handoff`. Its hash cannot be embedded in its own Git preimage; use `git rev-parse HEAD` and verify the subject.
+- Expected target status after the handoff commit: clean, with no staged, unstaged, or untracked files.
+- Merge commits for the independent foundations:
+  - PR #6917 configuration: `7b27d59b3acdf5e9172f3ef25720655a667b5852`
+  - PR #6918 registration schema: `9352a3d42478d2aa696df4b76805e5dbbe9a8290`
+- Main implementation commit: `139a00109080e0236fe8c73820d5700e5d837508`
+- Story 4 and Story 5 evidence commit: `844a495009ea9eafb8284ccbbccb2995fd9bd2ee`
+- Story 6 evidence commit: `608ee31b6d1747b3e1184511c968b1ed58b88747`
+- Story 7 implementation and evidence commit: `b59c747e7482f174dee81508dd3aca363ef7d7e6`
+
+## Delivery status
+
+- Story 1: **In progress**, pending independent evaluation.
+- Story 2: **In progress**, pending independent evaluation.
+- Story 3: **Done**.
+- Story 4: **Done**.
+- Story 5: **Done**.
+- Story 6: **Done**.
+- Story 7: **Done**.
+- Recommended next work: **Story 8, referrer discovery through registered digest identities**.
+
+Do not change Story 1 or Story 2 merely because later stories depend on their behavior.
+
+## Non-negotiable identity contracts
+
+1. `ImageStorage.content_checksum` remains canonical SHA-256.
+2. `Manifest.digest` remains canonical SHA-256.
+3. Alternative identities are stored only in repository-scoped `RepositoryBlobDigest` and `RepositoryManifestDigest` rows.
+4. A new alternative-only object does not expose its hidden canonical SHA-256 identity.
+5. Canonical SHA-256 remains visible only when explicitly registered, historically visible before the first registration, or intentionally created through a tag or SHA-256 route.
+6. Digest parsing is strict. Encoded values are lowercase and exact length.
+7. Supported algorithms are SHA-256, SHA-384, and SHA-512. An algorithm must also be active in `ALLOWED_HASH_ALGORITHMS` at the relevant API boundary.
+8. Blob and manifest validation hashes exact uploaded or request bytes.
+9. Registrations are immutable and idempotent. A repository digest cannot be remapped to different canonical content.
+10. Blob, manifest, child, and subject resolution must remain repository-scoped.
+11. Graph, registration, quota, pruning, and tag changes must remain transactionally consistent.
+12. Cache invalidation must happen after the lifecycle transaction commits.
+13. Persisted resumable hash state uses the validated JSON/base64 envelope. Do not introduce pickle or general object deserialization.
+14. Mirror-managed repositories retain their established SHA-256-only ingestion boundary unless a dedicated later story changes it.
+
+## Completed behavior at the current feature HEAD
+
+### Configuration and digest handling
+
+- Python and Go configuration accept nonempty unique combinations of `sha256`, `sha384`, and `sha512`.
+- The default remains `['sha256']`.
+- Shared strict parsing distinguishes malformed, unsupported, and valid-but-disabled algorithms.
+- SHA-384 is a Quay extension. OCI Image Specification 1.1.1 does not register it.
+
+### Blob lifecycle
+
+- Enabled SHA-256, SHA-384, and SHA-512 blobs support monolithic, chunked, resumed, and hintless-compatible uploads.
+- Exact bytes are validated against the final requested digest while canonical SHA-256 is calculated independently.
+- Repository registrations are created only after successful validation.
+- GET and HEAD return the requested registered identity and canonical stored bytes.
+- Hidden canonical SHA-256 does not resolve for alternative-only blobs.
+- Legacy SHA-256 behavior remains available under the established fallback rules.
+- Rolling-configuration behavior, persisted resumable state, malformed input, mismatch, conflict, disabled algorithms, and cancellation have focused coverage.
+
+### Blob mounts
+
+- Cross-repository mounts resolve the exact requested digest in the named source repository.
+- Private sources require source pull authorization. Destinations require push authorization.
+- Unknown or inaccessible valid sources use the normal Distribution HTTP 202 upload fallback without disclosing private content.
+- Malformed, unsupported, or disabled mount digests fail immediately.
+- Destination link and registration occur in one transaction.
+- Mounts reuse the exact canonical `ImageStorage` row and do not copy physical bytes.
+- New alternative-only mounts expose only the requested destination identity.
+
+### Manifest and image graph lifecycle
+
+- Single manifests, OCI indexes, and Docker manifest lists support enabled SHA-256, SHA-384, and SHA-512 route identities.
+- Manifest PUT validates exact request bytes before publication.
+- Config, layer, child, and subject descriptors resolve through registrations in the target repository.
+- Mixed SHA-256, SHA-384, and SHA-512 descriptor graphs are supported.
+- Descriptor size and media type are checked against persisted content.
+- `ManifestBlob`, `ManifestChild`, and canonical subject fields store canonical relationships.
+- Parent graph, requested registration, quota accounting, and tag changes share the lifecycle transaction.
+- Digest and tag GET and HEAD preserve exact bytes, media type, and the selected repository-visible identity.
+- Nested availability and descendant cache invalidation remain repository-scoped.
+- Proxy coordination, traversal limits, scanner identity, mirroring command preservation, and selected background paths exist from the main implementation commit, subject to the limitations below.
+
+### OCI artifacts: Story 7
+
+- Digest-addressed OCI artifacts accept enabled SHA-256, SHA-384, and SHA-512 identities.
+- Tag-addressed artifact publication remains canonical SHA-256 because a tag route carries no client-selected digest algorithm.
+- Artifact config, layer, and subject descriptors are strict-parsed and allowlist-checked before model persistence.
+- Subjects resolve through explicit target-repository registrations.
+- Unknown, cross-repository, size-mismatched, and media-type-mismatched subjects fail before artifact publication.
+- Artifact bytes and `artifactType` are preserved.
+- `Manifest.subject` stores the resolved canonical subject SHA-256 internally.
+- Alternative-only artifact and subject canonical SHA-256 identities remain hidden.
+- Repeated artifact publication is idempotent.
+- `create_manifest_with_temp_tag()` returns the requested repository-visible digest rather than hidden canonical SHA-256.
+- Digest and tag GET and automatic HEAD return exact artifact bytes and the selected registered artifact identity.
+
+## Story 7 root cause and changed files
+
+Story 7 was blocked by two deliberate SHA-256-only Demo 1 publication gates. One was in the endpoint and one was below registry-model publication. The graph and registration implementation was already capable of repository-scoped alternative artifact and subject identities.
 
-Story 1 and Story 2 remain independently **In progress**. Story 3, Story 4, Story 5, and Story 6 are **Done**. Story 6 dependency completion does not change Story 1 or Story 2 status.
+After removing those gates, focused testing found that temporary-tag publication returned a datatype carrying canonical SHA-256 even though the requested alternative registration was persisted. The wrapper now receives `requested_digest`.
 
-### Existing production behavior confirmed
-
-No production file changed. Static tracing and focused execution confirmed the existing implementation already provides the following Story 6 behavior:
-
-- Digest-addressed OCI index and Docker manifest-list PUT routes use the shared strict parser, reject malformed, unsupported, and disabled identities, and hash the exact request bytes with the requested algorithm before publication.
-- The endpoint allowlist check runs before repository lookup and manifest cache use. Mirror-managed repositories retain their explicit SHA-256-only ingestion boundary; Story 6 direct registry pushes are not routed through secondary ingestion.
-- Manifest push and pull decorators enforce destination write and repository read authorization before model operations.
-- Parent descriptors are strict-parsed and allowlist-checked at the route boundary. Child resolution then calls `resolve_repository_manifest_descriptor()` with the exact descriptor digest, size, and media type.
-- Child lookup uses `RepositoryManifestDigest` scoped by the target repository. It does not use another repository's registration or a globally matching canonical `Manifest` row.
-- Child descriptor size is compared with exact persisted child bytes. Descriptor media type is compared with the persisted manifest media type before parent graph writes.
-- Every child configuration and layer digest is strict-parsed and allowlist-checked. `_build_blob_map()` resolves it through the target repository's `RepositoryBlobDigest` plus repository relationship. Config reads use the same repository-scoped retriever.
-- Child manifest exact-byte validation occurs when each child is pushed. Parent exact-byte validation occurs before parent parsing can create graph state.
-- `Manifest.digest`, `ImageStorage.content_checksum`, `ManifestChild`, and `ManifestBlob` remain canonical SHA-256 internal identities. External descriptors are preserved byte-for-byte in persisted manifest JSON and are not rewritten to SHA-256.
-- Parent graph persistence, requested parent registration, quota accounting, and all requested tag changes run in the existing outer lifecycle transaction. Registration insertion uses a nested Peewee `atomic()` savepoint, preserving caller work during an idempotent uniqueness race.
-- Unknown children and descriptor mismatches are detected before parent creation. Registration conflicts and quota or tag failures roll back the graph, parent registration, quota effects, and tags. Existing generic quota and forced multi-tag rollback tests cover the same publication transaction.
-- Registration helpers are immutable and idempotent. They return the existing same-content registration and reject remapping to different canonical content.
-- Digest-addressed PUT, GET, and automatic HEAD preserve the requested identity in `Docker-Content-Digest`. PUT locations use the requested digest. Tag GET and HEAD choose an enabled repository-visible registration for the exact parent.
-- Manifest cache keys contain repository ID and requested digest. Blob cache keys contain namespace, repository, full requested digest, and cache version. Missing values are not cached. Disabled algorithms are rejected before cache use.
-- Parent and descendant cache invalidation occurs only after the tag lifecycle transaction commits and traverses nested indexes without crossing repository boundaries.
-- Subsequent child GET/HEAD and config/layer GET/HEAD resolve the exact registered target-repository identities and return exact persisted bytes.
-- Explicit SHA-256 publication remains valid while SHA-256 is enabled. Alternative-only parent, child, config, and layer objects do not expose canonical SHA-256 unless it was explicitly or historically registered.
-- Existing all-SHA-256 manifest-list behavior and normal single-manifest behavior remain on the established paths.
-
-No automatic canonical fallback, cross-repository descriptor resolution, pre-validation parent publication, ignored child size or media-type mismatch, partial parent state after tested failures, registration remap, pre-commit cache invalidation, tag selection of a disabled identity, GET/HEAD identity divergence, or mixed-descriptor rewriting was found.
-
-### Test changes
-
-Only `endpoints/v2/test/test_manifest.py` changed in the target worktree.
-
-- Extended the existing manifest fixture so manifest, configuration, and layer algorithms can be selected independently without changing defaults for existing tests.
-- Extended the digest PUT helper to request a tag during digest-addressed publication.
-- Replaced the narrow SHA-384-root mixed-child test with `test_story6_mixed_digest_multiarchitecture_contract`, parameterized across OCI index and Docker manifest-list media types and SHA-256, SHA-384, and SHA-512 roots.
-- Each case publishes SHA-256, SHA-384, and SHA-512 children. Each child deliberately uses different configuration and layer algorithms.
-- The contract test covers repeated publication, digest and tag GET/HEAD, child GET/HEAD, config and layer GET/HEAD, independent digest verification, requested response identities, requested locations, tag response headers, hidden canonical rejection, explicit SHA-256 success, parent/child/blob repository isolation, pull and push authorization, primed-cache hard-disable, re-enable, canonical graph relationships, requested-only registrations, and one physical placement per canonical blob.
-- Added OCI index and Docker manifest-list descriptor size and media-type mismatch rollback coverage.
-- Added parent registration-conflict rollback coverage while retaining the existing child/single-manifest registration-conflict coverage.
-- Strengthened unknown-child coverage to request a parent tag and prove that no visible tag remains.
-
-No artifact, subject, referrer, proxy-cache, mirror, copy, import, build, Clair, UI, deletion, garbage-collection, conformance, or operational-tool test changed.
-
-### Exact local test commands and outcomes
-
-Baseline before modification:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py::test_sha384_manifest_list_lifecycle_with_mixed_child_identities endpoints/v2/test/test_manifest.py::test_manifest_list_rejects_cross_repository_and_unknown_child endpoints/v2/test/test_manifest.py::test_manifest_registration_conflict_rolls_back_new_graph endpoints/v2/test/test_manifest.py::test_digest_push_with_multiple_tags_rolls_back_atomically endpoints/v2/test/test_manifest.py::test_manifest_reference_digest_errors endpoints/v2/test/test_manifest.py::test_manifest_pull_digest_errors_are_precise_for_get_and_head endpoints/v2/test/test_manifest.py::test_story4_registered_graph_pull_contract`
-
-Result: **17 passed**.
-
-First new focused run:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py::test_story6_mixed_digest_multiarchitecture_contract endpoints/v2/test/test_manifest.py::test_story6_parent_descriptor_mismatch_rolls_back_publication endpoints/v2/test/test_manifest.py::test_story6_parent_registration_conflict_rolls_back_graph_and_tag endpoints/v2/test/test_manifest.py::test_manifest_list_rejects_cross_repository_and_unknown_child`
-
-Result: **6 passed, 6 failed**. All six failures were a new test assertion using the nonexistent `ImageStorageLocation.image_storage` field. The production behavior and every API assertion had passed before that final database assertion. The test now queries `ImageStoragePlacement.storage`, which is the actual placement relationship.
-
-Corrected focused run: the same command resulted in **12 passed**. The post-Black rerun also resulted in **12 passed**.
-
-Complete manifest endpoint file:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py`
-
-Result: **71 passed**.
-
-Complete blob endpoint file:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_blob.py`
-
-Result: **56 passed**.
-
-OCI manifest model file:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/oci/test/test_oci_manifest.py`
-
-Result: **23 passed**.
-
-Registry model interface file:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_interface.py`
-
-Result: **116 passed, 2 skipped**. The skips are the existing PostgreSQL-only blob and manifest registration races. Production transaction code did not change, and those races passed in earlier handoffs.
-
-Existing registry protocol manifest-list and normal single-manifest coverage:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings test/registry/registry_tests.py -k 'manifest_list or basic_push_pull_by_manifest'`
-
-Result: **27 passed, 1,432 deselected**.
-
-Focused pre-commit:
-
-`.venv/bin/pre-commit run --files endpoints/v2/test/test_manifest.py`
-
-First result: **nonzero because Black reformatted the modified test file**. Every other applicable hook passed. The exact command was rerun and **all applicable hooks passed**.
-
-### Live mixed-graph validation
-
-Environment:
-
-- `quay-quay` was running from image `localhost/quay-local:latest`.
-- `/Users/shossain/QuayWorkspace/shaon-feature-PQC` was bind-mounted to `/quay-registry`.
-- The active allowlist was `['sha256', 'sha384', 'sha512']`.
-- regctl 0.11.5 used its existing registry configuration. No credentials, auth file, password, bearer token, or token response was printed.
-- The source repository was `localhost:8080/testuser/pqc-story6-01a05e6b`.
-- The isolated mixed destination was `localhost:8080/testuser/pqc-story6-mixed-01a05e6b`.
-
-Source graph commands:
-
-`regctl image mod busybox:latest --digest-algo sha256 --create localhost:8080/testuser/pqc-story6-01a05e6b:sha256`
-
-`regctl image mod busybox:latest --digest-algo sha384 --create localhost:8080/testuser/pqc-story6-01a05e6b:sha384`
-
-`regctl image mod busybox:latest --digest-algo sha512 --create localhost:8080/testuser/pqc-story6-01a05e6b:sha512`
-
-Result: **all three passed**.
-
-The final live registry verifier was run with:
-
-`cd /Users/shossain/QuayWorkspace/shaon-feature-PQC && .venv/bin/python /tmp/pqc-story6-live.py`
-
-Result: **passed** against the isolated destination. It uploaded only each selected descriptor's requested identity, pushed every selected child by digest, and published the root by SHA-512 digest with tag `mixed`.
-
-Published root:
-
-`sha512:cf4c1bab313a6b3d69f2ed6c09d52361a7d395912a9290cb5635d4a32994d97520c335adc7b7a2eb7c630b4331a5410c17e0cd5c38dd8c52b611a33477d66910`
-
-Selected children:
-
-- SHA-256 amd64: `sha256:1cfa4e2b09e127b9c4ed43578d3f3c18e7d44ea47b9ea98475c0cbe9086525f8`
-- SHA-384 arm64: `sha384:876366e42534dd11e1781685343332853277ccb011606134c7e1379ed6d9f7f9b06fd14008166cccadccfcb93a88dfdb`
-- SHA-512 ppc64le: `sha512:1783ed52b8c19702555d2f46fc23bbf8d6b4b29235c8ede420537417c32b7ac555ff92e71d34cecafd864aa0fbc61a2d35ac71b7853eb22c75b52e274a93cecf`
-
-Live outcomes:
-
-- Root PUT returned HTTP 201, the requested SHA-512 `Docker-Content-Digest`, the requested digest in `Location`, and the committed tag.
-- Root GET and HEAD by digest passed.
-- Root GET and HEAD by tag passed and returned the registered SHA-512 root identity.
-- All three selected child manifests returned exact persisted bytes through their SHA-256, SHA-384, or SHA-512 descriptor identities. GET and HEAD headers matched.
-- Each child's configuration and layer returned exact stored bytes through the descriptor identity. GET and HEAD headers matched.
-- Independent `hashlib.new(descriptor_algorithm, bytes)` verification passed for **10 objects**: one root index, three child manifests, three configurations, and three layers.
-- The persisted root bytes retained the mixed descriptor algorithms and platform order.
-- Unregistered canonical SHA-256 root, alternative child, alternative configuration, and alternative layer identities returned HTTP 404.
-- An explicitly registered SHA-256 child, configuration, and layer remained pullable.
-- The root did not resolve in another repository.
-
-Container database verification command:
-
-`podman cp /tmp/pqc-story6-live-result.json quay-quay:/tmp/pqc-story6-live-result.json && podman cp /tmp/pqc-story6-dbcheck.py quay-quay:/tmp/pqc-story6-dbcheck.py && podman exec quay-quay python /tmp/pqc-story6-dbcheck.py`
-
-Result: **passed**.
-
-Database findings:
-
-- The SHA-512 root maps to canonical `sha256:09f01645845dd0979eb39708dcb7fbec57a4de9a65e6d8a51889e2534fa7e8d9` in `Manifest` row 139.
-- The three selected children map to canonical SHA-256 `Manifest` rows 136, 137, and 138.
-- `ManifestChild` contains exactly three canonical parent-child edges.
-- Each child has canonical `ManifestBlob` edges to its configuration and layer `ImageStorage` rows.
-- Every object in the destination has exactly its explicitly requested repository registration.
-- Every verified blob has one canonical `ImageStorage` row and one physical placement. No alias created a second physical copy.
-
-Hard-disable command outcome:
-
-- `local-dev/stack/config.yaml` was backed up and SHA-256 hashed.
-- SHA-384 was temporarily removed, `quay-quay` was restarted, and authenticated readiness was checked.
-- GET of the registered SHA-384 child returned HTTP 400, code `UNSUPPORTED`, reason `disabled`.
-- The original configuration was restored byte-for-byte and Quay was restarted.
-- Original and restored configuration SHA-256 were both `4de46dadfc727018452ddd490056beb5f5af736e1d0f5751cb8ddb942430731f`.
-- The restored active allowlist was `['sha256', 'sha384', 'sha512']`.
-
-Re-enable verification:
-
-`regctl manifest get localhost:8080/testuser/pqc-story6-mixed-01a05e6b@sha384:876366e42534dd11e1781685343332853277ccb011606134c7e1379ed6d9f7f9b06fd14008166cccadccfcb93a88dfdb --format raw-body > /tmp/pqc-story6-reenabled-child.json`
-
-Result: **passed**. The returned child contained 610 bytes, and independent SHA-384 verification passed.
-
-### Failures and blockers
-
-Product test failures:
-
-- **None.** Every final focused and required regression command passed.
-
-Test-code failure resolved:
-
-- The first new focused run failed only because the new assertion named the wrong placement-model field. Root cause: `ImageStorageLocation` identifies storage backends; `ImageStoragePlacement.storage` is the relation to canonical content. The test now uses the correct model and passes in all six root/media-type cases.
-
-Infrastructure blockers:
-
-- `python3 /tmp/pqc-story6-live.py` initially failed before contacting Quay because the system Python did not have `requests`. The same verifier ran with the target worktree's virtual environment and passed.
-- No infrastructure blocker remained at completion.
-
-Live validation harness corrections:
-
-- The first live hidden-canonical attempt used one repository for all three complete converted source graphs. The full SHA-256 source graph explicitly registered canonical aliases for objects later selected from alternative graphs, so a canonical layer correctly resolved. This was invalid isolation setup, not a product defect. The final destination uploaded only the requested identities and all hidden-canonical checks passed.
-- The next verifier attempt reused a destination-scoped token for the wrong-repository check and received an authorization result before repository lookup. The final check requested the correct pull scope for the isolated repository and received the required HTTP 404.
-
-### Final static checks
-
-Final pre-commit command after the Story 6 documentation update:
-
-`files=$(git diff --name-only --diff-filter=ACMR) && .venv/bin/pre-commit run --files $files`
-
-Result: **all applicable hooks passed** for `HANDOFF.md` and `endpoints/v2/test/test_manifest.py`.
-
-Compilation and whitespace command:
-
-`.venv/bin/python -m compileall -q endpoints/v2/test/test_manifest.py && git diff --check`
-
-Result: **passed** with no output.
-
-The same final pre-commit, compilation, and diff-check commands were rerun after recording these outcomes and passed again.
-
-Targeted mypy was not run because no production Python changed. A live PostgreSQL transaction or concurrency run was not repeated because no production transaction code changed. Existing production-transaction rollback tests passed in the endpoint and interface suites, and prior PostgreSQL registration-race evidence remains applicable.
-
-### Remaining limitations and deferred work
-
-- Story 6 live validation used an OCI index. Docker manifest-list behavior is covered by the same six-case endpoint test matrix and existing registry protocol tests, but a second live Docker manifest-list graph was not published.
-- No new PostgreSQL or MySQL transaction/concurrency run was performed. Production code did not change.
-- No OCI Distribution conformance run, broad client matrix, mixed-version, mixed-region, object-storage, replication, or production packaging claim is made.
-- SHA-384 remains a Quay extension with client-specific interoperability limits.
-- OCI artifacts, subjects, referrers, proxy cache, mirroring, cross-repository complete-image copy, importing, builds, Clair, UI, deletion, garbage collection, and operational tooling remain outside Story 6.
-- Deferred D1–D8 work remains deferred. No deferred item blocked Story 6.
-- Live repositories and source content created for Story 6 remain available for inspection. Their cleanup belongs to later lifecycle stories; this session did not invoke deletion or garbage collection.
-
-### Recommended next story
-
-Proceed with **Story 7: Push and pull OCI artifacts with registered digest identities**. Start by reading this file completely, then inspect the explicit alternative artifact and subject boundary in `endpoints/v2/manifest.py`, canonical subject resolution and descriptor validation in `data/model/oci/manifest.py`, response datatypes and graph persistence in `data/registry_model/registry_oci_model.py`, and existing artifact tests in `endpoints/v2/test/test_manifest.py`. Do not include Story 8 referrer discovery unless Story 7 cannot be made correct without it. Preserve repository-scoped registrations and hidden canonical identities, and keep Story 1 and Story 2 status unchanged.
-
-## Story 7: Push and pull OCI artifacts with registered digest identities
-
-**Status: Done under the local definition of done. Story 8 referrer discovery remains separate and unchanged.**
-
-Story 1 and Story 2 remain independently **In progress**. Story 3, Story 4, Story 5, Story 6, and Story 7 are **Done**. Later-story completion does not change Story 1 or Story 2 status.
-
-### Repository and scope
-
-- Worktree: `/Users/shossain/QuayWorkspace/shaon-feature-PQC`
-- Branch: `shaon-feature-PQC`
-- Starting HEAD: `608ee31b6d1747b3e1184511c968b1ed58b88747`
-- Starting subject: `NO-ISSUE: test(registry): validate mixed-digest multi-architecture images`
-- Base and merge base: `d81004d24669132d45df8fbd1eafc86c149e38fa`
-- Final commit subject: `NO-ISSUE: feat(registry): support registered OCI artifact identities`
-- The final commit is the commit containing this section. Its hash cannot be embedded in its own Git preimage; obtain it with `git rev-parse HEAD`. The final response records the exact hash.
-- Starting status was clean, with no staged, unstaged, or untracked files.
-- The complete starting `master...HEAD` patch contained 70 files, 281 hunks, 11,226 additions, and 652 deletions. Its saved patch SHA-256 was `e58156269d1a56d7c8af7438bc7ca6ddcb496cf3c634af2c728aa77fe4ac4907`.
-- No reset, restore, rebase, amend, push, remote change, or other-worktree modification occurred. `/Users/shossain/QuayWorkspace/11537-pqc-schema` was not accessed or modified.
-
-The session stayed within direct OCI artifact publication and pull. It did not change referrer discovery, proxy cache, mirroring, complete-image copy, imports, builds, Clair, UI, deletion, garbage collection, conformance, or operational tooling.
-
-### Root cause and implementation
-
-The configurable-digest graph implementation already supplied exact-byte manifest hashing, repository-scoped blob and manifest registrations, canonical graph persistence, repository-scoped subject resolution, subject size and media-type validation, transactional graph and tag publication, cache invalidation, and registered digest pull. Story 7 was blocked by two deliberate Demo 1 capability gates:
-
-1. `endpoints/v2/manifest.py` rejected any artifact publication when either the artifact route identity or subject descriptor identity was not SHA-256.
-2. `data/model/oci/manifest.py` repeated the same SHA-256-only check below every registry-model publication entry point.
-
-After removing those obsolete gates, a focused registry-model test exposed one additional identity defect. `create_manifest_with_temp_tag()` persisted the requested registration but returned a `Manifest` datatype carrying hidden canonical SHA-256. It now passes `requested_digest` to the existing datatype wrapper, matching tagged publication and digest lookup behavior.
-
-No schema, migration, configuration, dependency, feature flag, retriever, blob lifecycle, referrer endpoint, or cache algorithm changed.
-
-### Completed behavior
-
-- Digest-addressed OCI artifacts accept enabled SHA-256, SHA-384, or SHA-512 identities and validate the requested digest over the exact request bytes before publication.
-- Tag-addressed artifact pushes remain canonical SHA-256 because a tag route carries no client-selected digest algorithm. Their subject descriptors may use any enabled registered identity.
-- Artifact config, layer, and subject descriptors are strict-parsed and allowlist-checked at the endpoint before model work.
-- Subjects resolve only through a registration in the target repository. A registration in another repository does not satisfy publication.
-- Subject descriptor size and media type are checked against exact persisted subject bytes and media type before artifact graph persistence.
-- `Manifest.digest` remains canonical SHA-256. `Manifest.subject` stores the resolved canonical subject SHA-256 internally. `Manifest.artifact_type` and exact artifact bytes are preserved.
-- `RepositoryManifestDigest` exposes only explicitly requested artifact and subject identities. Alternative-only artifact, subject, config, and payload objects do not expose hidden canonical SHA-256.
-- Artifact graph, requested registration, quota accounting, and tag changes continue through the existing lifecycle transaction. Repeated publication is idempotent.
-- Digest and tag GET and automatic HEAD return exact persisted artifact bytes, original OCI media type, and the selected registered artifact identity.
-- Pull and push authorization, repository isolation, hard-disable behavior, response digest, location, and `OCI-Tag` behavior use the existing manifest contracts.
-- `create_manifest_with_temp_tag()` now returns the requested repository-visible identity instead of hidden canonical SHA-256.
-- The alternative referrer subject query remains rejected by the existing Story 8 capability boundary. Story 7 tests do not call referrer discovery.
-
-### Files changed
-
-Production:
+Production files changed by Story 7:
 
 - `endpoints/v2/manifest.py`
 - `data/model/oci/manifest.py`
 - `data/registry_model/registry_oci_model.py`
 
-Tests:
+Story 7 tests:
 
 - `endpoints/v2/test/test_manifest.py`
 - `data/registry_model/test/test_interface.py`
 
-Delivery state:
+`data/model/oci/retriever.py`, `data/registry_model/datatypes.py`, and the other starting files were traced but required no Story 7 change.
 
-- `.PITASKS.md`
-- `HANDOFF.md`
+## Current Story 8 boundary
 
-`data/model/oci/retriever.py` and `data/registry_model/datatypes.py` were traced but required no change.
+Story 7 changed artifact publication and pull only. Referrer discovery remains deliberately limited:
 
-### Exact local test evidence
+- `endpoints/v2/referrers.py` still rejects SHA-384 and SHA-512 subject queries.
+- The current registry model rebuilds native and cached referrer descriptors through repository-visible SHA-256 selection.
+- Alternative-only artifacts can be published and pulled directly but are not yet returned through alternative-identity referrer discovery.
+- Existing SHA-256 native referrer lookup and `artifactType` filtering continue to work.
 
-Existing pre-change artifact boundary:
+Do not infer that Story 7 completed Story 8.
+
+## Relevant verification evidence
+
+### Story 7 focused and regression tests
+
+Artifact and subject baseline before the Story 7 production change:
 
 `TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py -k 'alternative_artifact_identity or alternative_subject_identity or sha256_referrer_query_and_artifact_type_filter'`
 
-Result: **7 passed, 64 deselected**. This confirmed the obsolete rejection behavior and SHA-256 compatibility before production changes.
+Result: **7 passed, 64 deselected**. These were the then-current SHA-256-only boundary tests.
 
-Test-first registry-model command:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py -k 'story7' data/registry_model/test/test_interface.py -k 'registry_publication_accepts_registered_artifact'`
-
-Result: **4 failed, 184 deselected as expected**. Pytest applied only the final `-k`, so this command selected the four registry-model cases. All failed at `ReferrerDigestUnsupportedException` before persistence. It was not endpoint evidence.
-
-Separate test-first endpoint command:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py -k 'story7'`
-
-Result: **5 failed, 65 deselected as expected**. Every case returned the obsolete `UNSUPPORTED` artifact or subject response.
-
-After removing the two publication gates:
-
-- Endpoint Story 7 selection: **5 passed, 65 deselected**.
-- Registry-model selection: **3 passed, 1 failed, 114 deselected**. The failure showed that temporary-tag publication returned canonical SHA-256 instead of the requested SHA-384 identity.
-
-After fixing the temporary-tag wrapper:
-
-- Endpoint Story 7 selection: **5 passed, 65 deselected**.
-- Registry-model selection: **4 passed, 114 deselected**.
-
-After adding subject validation and rollback coverage:
+Final Story 7 selection:
 
 `TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py -k 'story7'`
 
 Result: **9 passed, 65 deselected**.
 
-Final complete manifest endpoint suite:
+Complete manifest endpoint suite:
 
 `TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py`
 
-Result: **74 passed**. This includes the unchanged Story 8 alternative referrer-query rejection.
+Result: **74 passed**.
 
-Final registry interface suite:
+Registry interface suite:
 
 `TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_interface.py`
 
-Result: **116 passed, 2 skipped**. The skips are the existing PostgreSQL-only blob and manifest registration races covered in earlier stories.
+Result: **116 passed, 2 skipped**. The skips are the PostgreSQL-only blob and manifest registration races that passed in earlier implementation sessions.
 
-Final OCI manifest and digest aggregate:
+OCI manifest and digest aggregate:
 
 `TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/oci/test/test_oci_manifest.py digest/test/test_digest_tools.py`
 
 Result: **77 passed**.
 
-Existing SHA-256 registry protocol push and pull:
+SHA-256 registry protocol push and pull:
 
 `TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings test/registry/registry_tests.py -k 'test_basic_push_pull_by_manifest'`
 
 Result: **3 passed, 1,456 deselected**.
 
-### Static verification
+### Static checks
 
 Targeted mypy:
 
 `.venv/bin/mypy data/model/oci/manifest.py data/registry_model/registry_oci_model.py endpoints/v2/manifest.py`
 
-Result: **passed**, with no issues in three source files.
+Result: **passed** with no issues.
 
-Targeted compilation and whitespace:
-
-`.venv/bin/python -m compileall -q data/model/oci/manifest.py data/registry_model/registry_oci_model.py data/registry_model/test/test_interface.py endpoints/v2/manifest.py endpoints/v2/test/test_manifest.py && git diff --check`
-
-Result: **passed**.
-
-Targeted pre-commit:
-
-`.venv/bin/pre-commit run --files .PITASKS.md data/model/oci/manifest.py data/registry_model/registry_oci_model.py data/registry_model/test/test_interface.py endpoints/v2/manifest.py endpoints/v2/test/test_manifest.py`
-
-First result: **nonzero because Black reformatted the two test files**. Every other applicable hook passed. The exact command was rerun and **all applicable hooks passed**.
-
-Final pre-commit over every Story 7 file, including this handoff:
-
-`files=$(git diff --name-only --diff-filter=ACMR) && .venv/bin/pre-commit run --files $files`
-
-Result: **all applicable hooks passed** for `.PITASKS.md`, `HANDOFF.md`, the three production files, and the two test files.
-
-Final compilation and diff checks:
+Compilation and whitespace:
 
 `.venv/bin/python -m compileall -q data/model/oci/manifest.py data/registry_model/registry_oci_model.py data/registry_model/test/test_interface.py endpoints/v2/manifest.py endpoints/v2/test/test_manifest.py && git diff --check && git diff --check master`
 
-Result: **passed** with no output.
-
-The final pre-commit repository check confirmed the expected branch and starting HEAD, no staged files, no untracked files, and only the seven intended Story 7 files modified. The complete combined `master` patch parsed successfully as 70 files and 280 hunks before the final task-state update.
-
-### Live artifact publication and pull
-
-Environment:
-
-- Local `quay-quay`, PostgreSQL, and Redis containers were running.
-- The target worktree was bind-mounted into `quay-quay`.
-- `quay-quay` was restarted to load the production changes.
-- Readiness polling saw transient connection resets during startup, then `/v2/auth` returned HTTP 401 as expected without credentials.
-- The active live allowlist was `['sha256', 'sha384', 'sha512']`.
-- Existing regctl credentials were read only in memory. No credential, token, or auth-file content was printed.
-
-Fresh subject publication:
-
-`regctl image mod busybox:latest --digest-algo sha512 --create localhost:8080/testuser/pqc-story7-01a05e7e:subject`
-
 Result: **passed**.
 
-The subject was the 10,533-byte OCI index `sha512:0bd23dcfecb44322dd952511fc3c392f2eb652f3eb6dac7c352156a43b782a957b8cf23b26633bffc66c56acbdb82e6f805501661cd55b011e01673a4a72963c`.
+Pre-commit over all Story 7 files passed. The first focused invocation reformatted the two test files with Black; subsequent focused and final invocations passed without changes.
 
-Direct Registry V2 artifact validation:
+### Live Story 7 validation
 
-`cd /Users/shossain/QuayWorkspace/shaon-feature-PQC && .venv/bin/python /tmp/pqc-story7-live.py`
+The local Quay container was restarted with the target worktree bind-mounted. The active live allowlist was `['sha256', 'sha384', 'sha512']`.
 
-Result: **passed**.
+A fresh SHA-512 BusyBox OCI index was published as the subject:
 
-The script did not call the referrers endpoint. It uploaded a SHA-384 config and SHA-512 payload, then published a 781-byte OCI artifact by SHA-384 digest with tag `artifact`:
+- Repository: `localhost:8080/testuser/pqc-story7-01a05e7e`
+- Tag: `subject`
+- Subject digest: `sha512:0bd23dcfecb44322dd952511fc3c392f2eb652f3eb6dac7c352156a43b782a957b8cf23b26633bffc66c56acbdb82e6f805501661cd55b011e01673a4a72963c`
 
-`sha384:aba053dc276e8a3cfff16a39c8ed0b38e5253648efec41329e906e716a67a295eda1f38af93246b9da12733dc1b76b09`
+A direct Registry V2 script then uploaded a SHA-384 config and SHA-512 payload and published a 781-byte OCI artifact:
+
+- Tag: `artifact`
+- Artifact digest: `sha384:aba053dc276e8a3cfff16a39c8ed0b38e5253648efec41329e906e716a67a295eda1f38af93246b9da12733dc1b76b09`
+- Internal artifact SHA-256: `sha256:ded291334c713cb1a960fe6031a2d7d2e9dbf022d76199d212fa47dfaeb5dca0`
+- Internal subject SHA-256: `sha256:9edfb5319801ada456f67d05aeee6fc8946d09731ff8337e873ec3648255ccb8`
 
 Live outcomes:
 
-- Artifact PUT returned HTTP 201, the requested SHA-384 digest, a matching digest location, and `OCI-Tag: artifact`.
-- Artifact GET and HEAD by digest and tag returned HTTP 200, the OCI artifact media type, and the SHA-384 artifact identity.
-- GET returned exact bytes and independent SHA-384 recomputation passed.
-- Config GET and HEAD by SHA-384 returned exact bytes and the requested identity.
-- Payload GET and HEAD by SHA-512 returned exact bytes and the requested identity.
-- Hidden canonical SHA-256 GET requests for the artifact, subject, config, and payload each returned HTTP 404.
+- Artifact PUT returned HTTP 201 with the requested SHA-384 identity, matching location, and `OCI-Tag: artifact`.
+- Artifact GET and HEAD by digest and tag returned HTTP 200, exact bytes, OCI artifact media type, and the SHA-384 identity.
+- Config and payload GET and HEAD returned exact bytes through their registered identities.
+- Hidden canonical SHA-256 GET requests for artifact, subject, config, and payload returned HTTP 404.
+- Database inspection confirmed one artifact registration, one subject registration, two canonical artifact blob edges, and canonical subject storage.
+- The live validation did not call the referrers endpoint.
+- The live repository remains available. It was not deleted because lifecycle cleanup was outside Story 7.
 
-Container database verification:
+## Known limitations and deferred work
 
-`podman cp /tmp/pqc-story7-live-result.json quay-quay:/tmp/pqc-story7-live-result.json && podman cp /tmp/pqc-story7-dbcheck.py quay-quay:/tmp/pqc-story7-dbcheck.py && podman exec quay-quay python /tmp/pqc-story7-dbcheck.py`
+- Story 8 referrer discovery through registered subject and artifact identities is not implemented.
+- Referrer fallback-tag lookup across all repository-visible subject aliases remains unresolved.
+- Proxy artifact ingestion cache propagation and alternative referrer cache behavior require Story 8 review if those paths are included.
+- Mirror root alternative registration remains unproven for full and architecture-filtered mirroring.
+- Mocked Docker schema-1 pull-through tests have an existing upstream digest mismatch. Docker schema-1 remains SHA-256-only.
+- Failed coordinated proxy storage work can leave unreferenced canonical bytes. No graph or registration exposes them. Physical orphan cleanup remains lifecycle work.
+- Full blob unlink, upload expiration, repository or namespace deletion, concurrent deletion, registration cleanup, and garbage collection remain later lifecycle scope.
+- PostgreSQL registration races passed previously. MySQL concurrency has not been run.
+- SHA-384 resumable hashing passed on local macOS arm64 and the existing Linux aarch64 Quay image. Clean Linux builds, Linux x86_64 packaging, and cross-architecture resume remain unproven.
+- Podman and Skopeo rejected SHA-384 manifest pulls client-side in earlier interoperability testing. ORAS accepted exact SHA-384 manifest bytes. Client interoperability must be evaluated individually.
+- No OCI Distribution conformance, broad client matrix, mixed-version, mixed-region, object-storage, replication, performance, or production-readiness claim is made.
+- Deferred items D1-D8 remain deferred unless explicitly reassigned.
 
-The first database-check attempt failed before querying because the temporary script had not imported `app`, leaving Peewee's database proxy uninitialized. After adding the initialization import, the same checks passed:
+## Recommended next story
 
-- Repository ID: 13.
-- Artifact canonical `Manifest` ID: 158.
-- Subject canonical `Manifest` ID: 157.
-- Artifact internal digest: `sha256:ded291334c713cb1a960fe6031a2d7d2e9dbf022d76199d212fa47dfaeb5dca0`.
-- Subject internal digest: `sha256:9edfb5319801ada456f67d05aeee6fc8946d09731ff8337e873ec3648255ccb8`.
-- Artifact subject stored the canonical subject digest.
-- Artifact had exactly one repository manifest registration: its requested SHA-384 identity.
-- Subject had exactly one repository manifest registration: its requested SHA-512 identity.
-- Both artifact blob edges used the expected canonical storage rows and each row had only its requested repository digest registration.
-- The live artifact tag pointed to the canonical artifact row.
+Proceed with **Story 8: referrer discovery through registered digest identities**.
 
-### Blockers, limitations, and deferred work
+Start with:
 
-- No product blocker remains for Story 7.
-- No new live PostgreSQL or MySQL test was run. Story 7 changed no transaction implementation, registration helper, schema, or migration. Existing PostgreSQL registration-race evidence and the passing transaction rollback suites remain applicable.
-- The two PostgreSQL-only interface tests remained skipped in SQLite.
-- Live validation used a SHA-512 OCI index as the artifact subject. Unit coverage also uses single-manifest subjects and tag-addressed artifact publication.
-- The live repository and objects remain available for inspection. They were not deleted because lifecycle cleanup is outside Story 7.
-- No OCI Distribution conformance, broad client matrix, mixed-version, mixed-region, object-storage, replication, or production-readiness claim is made.
-- SHA-384 remains a Quay extension with client-specific interoperability limits.
-- Referrer discovery by alternative subject identity remains Story 8. The existing referrers endpoint still rejects SHA-384 and SHA-512 subject queries and still emits only its current SHA-256 capability response.
-- Proxy cache, mirroring, complete-image copy, importing, builds, Clair, UI, deletion, garbage collection, conformance, and operational tooling were not changed.
+- `endpoints/v2/referrers.py`
+- `data/registry_model/registry_oci_model.py`
+- `data/model/oci/manifest.py`
+- `data/registry_model/datatypes.py`
+- `endpoints/v2/test/test_manifest.py`
+- Relevant referrer cache-key and registry-interface tests
 
-### Recommended next story
+Required Story 8 properties:
 
-Proceed with **Story 8: referrer discovery through registered digest identities**. Start with `endpoints/v2/referrers.py`, `data/registry_model/registry_oci_model.py`, `data/model/oci/manifest.py`, cache-key behavior, and the existing alternative-referrer rejection tests in `endpoints/v2/test/test_manifest.py`. Resolve subjects repository-locally, return only registered repository-visible artifact identities, preserve artifact-type filtering and fallback-tag behavior, and never expose hidden canonical SHA-256. Keep Story 1 and Story 2 independently In progress.
+1. Strictly parse and allowlist-check the requested subject digest before lookup or cache use.
+2. Resolve the subject only through its target-repository registration.
+3. Query the canonical internal subject relationship without exposing canonical SHA-256.
+4. Return only repository-visible registered artifact identities.
+5. Preserve exact artifact bytes, descriptor size, media type, and `artifactType` filtering.
+6. Handle subjects and artifacts with mixed SHA-256, SHA-384, and SHA-512 registrations.
+7. Keep native and fallback-tag discovery consistent across visible subject aliases.
+8. Deduplicate results by canonical artifact while selecting a deterministic enabled external identity.
+9. Invalidate filtered and unfiltered caches for every visible subject alias only after publication commits.
+10. Reject cross-repository aliases and disabled algorithms even when cache entries were primed while enabled.
+11. Preserve existing SHA-256 behavior.
+12. Do not expand into proxy cache, mirroring, copying, imports, builds, Clair, UI, deletion, garbage collection, conformance, or operational tooling unless Story 8 correctness requires a narrow supporting change.
+
+Before implementation, run the existing SHA-256 referrer tests and the current alternative-query rejection tests to establish the baseline. Keep Story 1 and Story 2 independently In progress.
