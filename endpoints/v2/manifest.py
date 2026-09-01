@@ -23,7 +23,6 @@ from data.model.oci.manifest import (
     ManifestChildUnknownException,
     ManifestDescriptorMismatchException,
     ManifestSubjectUnknownException,
-    ReferrerDigestUnsupportedException,
 )
 from data.model.oci.tag import RetargetTagException
 from data.registry_model import registry_model
@@ -347,7 +346,6 @@ def write_manifest_by_tagname(namespace_name, repo_name, manifest_ref):
     # algorithm implicitly.
     _validate_manifest_digest_algorithm("sha256")
     parsed = _parse_manifest(request.content_type, request.data)
-    _validate_referrer_publication_digests(parsed, parsed.digest)
     _validate_manifest_descriptor_digests(parsed)
 
     # A tag reference carries no alternative digest identity. Registering the canonical digest
@@ -386,7 +384,6 @@ def write_manifest_by_digest(namespace_name, repo_name, manifest_ref):
     _validate_manifest_digest_algorithm(requested_digest.hash_alg)
 
     parsed = _parse_manifest(request.content_type, request.data)
-    _validate_referrer_publication_digests(parsed, requested_digest)
     _validate_manifest_descriptor_digests(parsed)
     requested_tags = _requested_manifest_tags()
 
@@ -475,8 +472,6 @@ def write_manifest_by_digest(namespace_name, repo_name, manifest_ref):
                 "field": mdme.reason,
             }
         )
-    except ReferrerDigestUnsupportedException as rdue:
-        raise DigestUnsupported(rdue.algorithm)
     except ManifestDigestConflictException:
         raise DigestInvalid(
             detail={"digest": str(requested_digest), "reason": "conflict"},
@@ -565,26 +560,6 @@ def _validate_manifest_descriptor_digests(manifest_impl):
     for descriptor_digest in _manifest_descriptor_digests(manifest_impl):
         parsed = _parse_manifest_reference(descriptor_digest)
         _validate_manifest_digest_algorithm(parsed.hash_alg)
-
-
-def _validate_referrer_publication_digests(manifest_impl, requested_digest):
-    subject = manifest_impl.subject
-    if subject is None:
-        return
-
-    subject_digest = subject.get("digest") if isinstance(subject, dict) else subject.digest
-    parsed_subject = _parse_manifest_reference(subject_digest)
-    parsed_artifact = (
-        requested_digest
-        if isinstance(requested_digest, digest_tools.Digest)
-        else _parse_manifest_reference(requested_digest)
-    )
-
-    # Alternative artifact and subject identities are a Demo 8 capability. Parse both identities
-    # strictly before applying this boundary, and leave blob/layer descriptor algorithms alone.
-    for digest in (parsed_artifact, parsed_subject):
-        if digest.hash_alg != "sha256":
-            raise DigestUnsupported(digest.hash_alg)
 
 
 def _validate_mirror_manifest_digests(repository_ref, manifest_impl, requested_digest=None):
@@ -790,8 +765,6 @@ def _write_manifest(
                 "field": mdme.reason,
             }
         )
-    except ReferrerDigestUnsupportedException as rdue:
-        raise DigestUnsupported(rdue.algorithm)
     except ManifestDigestConflictException:
         raise DigestInvalid(
             detail={"digest": requested_digest, "reason": "conflict"},

@@ -2479,53 +2479,218 @@ def test_referrer_subject_query_parses_strictly_before_capability_check(
     assert error["detail"]["reason"] == expected_reason
 
 
-@pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
-def test_alternative_artifact_identity_is_rejected_without_publication(algorithm, client, app):
+@pytest.mark.parametrize(
+    "artifact_algorithm,subject_algorithm",
+    [("sha256", "sha384"), ("sha384", "sha512"), ("sha512", "sha256")],
+)
+def test_story7_registered_artifact_push_pull_contract(
+    artifact_algorithm, subject_algorithm, client, app
+):
     repository = "devtable/simple"
-    subject = _sha512_single_manifest(repository, b"sha256 artifact subject", algorithm="sha256")
+    other_repository = "devtable/complex"
+    tag_name = f"story7-{artifact_algorithm}-{subject_algorithm}"
+    subject = _sha512_single_manifest(
+        repository,
+        b"story7 artifact subject",
+        algorithm=subject_algorithm,
+    )
     subject["media_type"] = DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE
-    artifact = _oci_artifact(repository, subject, algorithm=algorithm)
+    artifact = _oci_artifact(repository, subject, algorithm=artifact_algorithm)
+    auth_headers = _manifest_auth_headers(repository)
+    artifact_headers = {
+        **auth_headers,
+        "Content-Type": OCI_IMAGE_MANIFEST_CONTENT_TYPE,
+        "Accept": OCI_IMAGE_MANIFEST_CONTENT_TYPE,
+    }
+    test_cache = InMemoryDataModelCache(TEST_CACHE_CONFIG)
 
-    with patch.dict(
-        realapp.config,
-        {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384", "sha512"]},
+    with (
+        patch.dict(
+            realapp.config,
+            {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384", "sha512"]},
+        ),
+        patch("endpoints.v2.manifest.model_cache", test_cache),
     ):
-        _put_manifest(client, repository, subject["canonical_digest"], subject)
-        before = _repository_publication_state(repository)
-        with (
-            patch("endpoints.v2.manifest.track_and_log") as track_push,
-            patch("endpoints.v2.manifest.spawn_notification") as notify_push,
-        ):
-            response = _put_manifest(
+        _put_manifest(client, repository, subject["external_digest"], subject)
+
+        conduct_call(
+            client,
+            "v2.write_manifest_by_digest",
+            url_for,
+            "PUT",
+            {
+                "repository": repository,
+                "manifest_ref": artifact["external_digest"],
+                "tag": "unauthorized-story7",
+            },
+            expected_code=401,
+            headers={
+                **_manifest_auth_headers(repository, actions=("pull",)),
+                "Content-Type": OCI_IMAGE_MANIFEST_CONTENT_TYPE,
+            },
+            raw_body=artifact["bytes"],
+        )
+
+        for _ in range(2):
+            pushed = _put_manifest(
                 client,
                 repository,
                 artifact["external_digest"],
                 artifact,
-                expected_code=400,
+                tag=tag_name,
+            )
+            assert pushed.headers["Docker-Content-Digest"] == artifact["external_digest"]
+            assert pushed.headers["Location"].endswith("/manifests/" + artifact["external_digest"])
+            assert pushed.headers.getlist("OCI-Tag") == [tag_name]
+
+        for endpoint, manifest_ref in (
+            ("v2.fetch_manifest_by_digest", artifact["external_digest"]),
+            ("v2.fetch_manifest_by_tagname", tag_name),
+        ):
+            for method in ("GET", "HEAD"):
+                pulled = conduct_call(
+                    client,
+                    endpoint,
+                    url_for,
+                    method,
+                    {"repository": repository, "manifest_ref": manifest_ref},
+                    expected_code=200,
+                    headers=artifact_headers.copy(),
+                )
+                assert pulled.headers["Docker-Content-Digest"] == artifact["external_digest"]
+                assert pulled.headers["Content-Type"] == OCI_IMAGE_MANIFEST_CONTENT_TYPE
+                assert pulled.data == (artifact["bytes"] if method == "GET" else b"")
+                if method == "GET":
+                    assert (
+                        f"{artifact_algorithm}:"
+                        + hashlib.new(artifact_algorithm, pulled.data).hexdigest()
+                        == artifact["external_digest"]
+                    )
+
+        for method in ("GET", "HEAD"):
+            conduct_call(
+                client,
+                "v2.fetch_manifest_by_digest",
+                url_for,
+                method,
+                {"repository": repository, "manifest_ref": artifact["external_digest"]},
+                expected_code=401,
+                headers={"Accept": OCI_IMAGE_MANIFEST_CONTENT_TYPE},
+            )
+            conduct_call(
+                client,
+                "v2.fetch_manifest_by_digest",
+                url_for,
+                method,
+                {"repository": other_repository, "manifest_ref": artifact["external_digest"]},
+                expected_code=404,
+                headers=_manifest_auth_headers(other_repository, actions=("pull",)),
             )
 
-    assert response.get_json()["errors"][0] == {
-        "code": "UNSUPPORTED",
-        "message": "digest algorithm is unsupported",
-        "detail": {"algorithm": algorithm, "reason": "unsupported"},
-    }
-    assert _repository_publication_state(repository) == before
-    track_push.assert_not_called()
-    notify_push.assert_not_called()
+        if artifact["canonical_digest"] != artifact["external_digest"]:
+            for method in ("GET", "HEAD"):
+                conduct_call(
+                    client,
+                    "v2.fetch_manifest_by_digest",
+                    url_for,
+                    method,
+                    {"repository": repository, "manifest_ref": artifact["canonical_digest"]},
+                    expected_code=404,
+                    headers=auth_headers.copy(),
+                )
+
+        if subject["canonical_digest"] != subject["external_digest"]:
+            conduct_call(
+                client,
+                "v2.fetch_manifest_by_digest",
+                url_for,
+                "GET",
+                {"repository": repository, "manifest_ref": subject["canonical_digest"]},
+                expected_code=404,
+                headers=auth_headers.copy(),
+            )
+
+        with patch.dict(
+            realapp.config,
+            {
+                "ALLOWED_HASH_ALGORITHMS": [
+                    algorithm
+                    for algorithm in ("sha256", "sha384", "sha512")
+                    if algorithm != artifact_algorithm
+                ]
+            },
+        ):
+            disabled = conduct_call(
+                client,
+                "v2.fetch_manifest_by_tagname",
+                url_for,
+                "GET",
+                {"repository": repository, "manifest_ref": tag_name},
+                expected_code=400,
+                headers=artifact_headers.copy(),
+            )
+            assert disabled.get_json()["errors"][0]["detail"] == {
+                "algorithm": artifact_algorithm,
+                "reason": "disabled",
+            }
+
+        conduct_call(
+            client,
+            "v2.fetch_manifest_by_digest",
+            url_for,
+            "GET",
+            {"repository": repository, "manifest_ref": artifact["external_digest"]},
+            expected_code=200,
+            headers=artifact_headers.copy(),
+        )
+
+    repository_row = model.repository.get_repository("devtable", "simple")
+    subject_row = Manifest.get(
+        repository=repository_row,
+        digest=subject["canonical_digest"],
+    )
+    artifact_row = Manifest.get(
+        repository=repository_row,
+        digest=artifact["canonical_digest"],
+    )
+    assert artifact_row.subject == subject_row.digest
+    assert artifact_row.artifact_type == "application/vnd.example.signature"
+    assert artifact_row.manifest_bytes.encode("utf-8") == artifact["bytes"]
+    assert {
+        registration.digest
+        for registration in RepositoryManifestDigest.select().where(
+            RepositoryManifestDigest.repository == repository_row,
+            RepositoryManifestDigest.manifest == artifact_row,
+        )
+    } == {artifact["external_digest"]}
+    assert {
+        relationship.blob_id
+        for relationship in ManifestBlob.select().where(
+            ManifestBlob.repository == repository_row,
+            ManifestBlob.manifest == artifact_row,
+        )
+    } == artifact["blob_ids"]
+    assert (
+        Tag.get(repository=repository_row, name=tag_name, lifetime_end_ms=None).manifest
+        == artifact_row
+    )
 
 
-@pytest.mark.parametrize("addressing", ["digest", "tag"])
-@pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
-def test_alternative_subject_identity_is_rejected_without_publication(
-    algorithm, addressing, client, app
-):
+@pytest.mark.parametrize("subject_algorithm", ["sha384", "sha512"])
+def test_story7_tag_addressed_artifact_accepts_registered_subject(subject_algorithm, client, app):
     repository = "devtable/simple"
-    subject = _sha512_single_manifest(repository, b"alternative artifact subject", algorithm)
+    tag_name = f"story7-tag-{subject_algorithm}"
+    subject = _sha512_single_manifest(
+        repository,
+        b"story7 tag-addressed subject",
+        algorithm=subject_algorithm,
+    )
     subject["media_type"] = DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE
     artifact = _oci_artifact(repository, subject, algorithm="sha256")
     headers = {
         **_manifest_auth_headers(repository),
         "Content-Type": OCI_IMAGE_MANIFEST_CONTENT_TYPE,
+        "Accept": OCI_IMAGE_MANIFEST_CONTENT_TYPE,
     }
 
     with patch.dict(
@@ -2533,39 +2698,107 @@ def test_alternative_subject_identity_is_rejected_without_publication(
         {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384", "sha512"]},
     ):
         _put_manifest(client, repository, subject["external_digest"], subject)
-        before = _repository_publication_state(repository)
-        with (
-            patch("endpoints.v2.manifest.track_and_log") as track_push,
-            patch("endpoints.v2.manifest.spawn_notification") as notify_push,
-        ):
-            if addressing == "digest":
-                response = _put_manifest(
-                    client,
-                    repository,
-                    artifact["canonical_digest"],
-                    artifact,
-                    expected_code=400,
-                )
-            else:
-                response = conduct_call(
-                    client,
-                    "v2.write_manifest_by_tagname",
-                    url_for,
-                    "PUT",
-                    {"repository": repository, "manifest_ref": "blocked-artifact"},
-                    expected_code=400,
-                    headers=headers,
-                    raw_body=artifact["bytes"],
-                )
+        pushed = conduct_call(
+            client,
+            "v2.write_manifest_by_tagname",
+            url_for,
+            "PUT",
+            {"repository": repository, "manifest_ref": tag_name},
+            expected_code=201,
+            headers=headers.copy(),
+            raw_body=artifact["bytes"],
+        )
+        pulled = conduct_call(
+            client,
+            "v2.fetch_manifest_by_tagname",
+            url_for,
+            "GET",
+            {"repository": repository, "manifest_ref": tag_name},
+            expected_code=200,
+            headers=headers.copy(),
+        )
 
-    assert response.get_json()["errors"][0] == {
-        "code": "UNSUPPORTED",
-        "message": "digest algorithm is unsupported",
-        "detail": {"algorithm": algorithm, "reason": "unsupported"},
-    }
+    assert pushed.headers["Docker-Content-Digest"] == artifact["canonical_digest"]
+    assert pulled.headers["Docker-Content-Digest"] == artifact["canonical_digest"]
+    assert pulled.data == artifact["bytes"]
+    repository_row = model.repository.get_repository("devtable", "simple")
+    artifact_row = Manifest.get(repository=repository_row, digest=artifact["canonical_digest"])
+    assert artifact_row.subject == subject["canonical_digest"]
+
+
+@pytest.mark.parametrize(
+    "failure,expected_code,expected_field",
+    [
+        ("unknown", "MANIFEST_BLOB_UNKNOWN", None),
+        ("cross-repository", "MANIFEST_BLOB_UNKNOWN", None),
+        ("size", "MANIFEST_INVALID", "size"),
+        ("media-type", "MANIFEST_INVALID", "media type"),
+    ],
+)
+def test_story7_subject_descriptor_validation_prevents_artifact_publication(
+    failure, expected_code, expected_field, client, app
+):
+    repository = "devtable/simple"
+    subject_repository = "devtable/complex" if failure == "cross-repository" else repository
+    subject = _sha512_single_manifest(
+        subject_repository,
+        f"story7 {failure} subject".encode("utf-8"),
+        algorithm="sha384",
+    )
+    subject["media_type"] = DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE
+    artifact = _oci_artifact(repository, subject, algorithm="sha512")
+
+    with patch.dict(
+        realapp.config,
+        {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384", "sha512"]},
+    ):
+        if failure != "unknown":
+            _put_manifest(
+                client,
+                subject_repository,
+                subject["external_digest"],
+                subject,
+            )
+
+        artifact_dict = json.loads(artifact["bytes"])
+        if failure == "unknown":
+            artifact_dict["subject"]["digest"] = "sha384:" + "0" * 96
+        elif failure == "size":
+            artifact_dict["subject"]["size"] += 1
+        elif failure == "media-type":
+            artifact_dict["subject"]["mediaType"] = OCI_IMAGE_INDEX_CONTENT_TYPE
+
+        artifact["bytes"] = json.dumps(
+            artifact_dict,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        artifact["canonical_digest"] = "sha256:" + hashlib.sha256(artifact["bytes"]).hexdigest()
+        artifact["external_digest"] = "sha512:" + hashlib.sha512(artifact["bytes"]).hexdigest()
+        before = _repository_publication_state(repository)
+        response = _put_manifest(
+            client,
+            repository,
+            artifact["external_digest"],
+            artifact,
+            expected_code=400,
+            tag=f"story7-invalid-{failure}",
+        )
+
+    error = response.get_json()["errors"][0]
+    assert error["code"] == expected_code
+    if expected_field is None:
+        assert error["detail"] == {
+            "digest": artifact_dict["subject"]["digest"],
+            "descriptor": "subject",
+        }
+    else:
+        assert error["detail"] == {
+            "digest": artifact_dict["subject"]["digest"],
+            "reason": "descriptor_mismatch",
+            "field": expected_field,
+        }
     assert _repository_publication_state(repository) == before
-    track_push.assert_not_called()
-    notify_push.assert_not_called()
 
 
 def test_sha256_referrer_query_and_artifact_type_filter_continue_working(client, app):

@@ -35,7 +35,6 @@ from data.model.oci.tag import (
     get_child_manifests,
 )
 from data.model.quota import QuotaOperation, update_quota
-from digest import digest_tools
 from image.docker.schema1 import ManifestException
 from image.docker.schema2 import EMPTY_LAYER_BLOB_DIGEST, EMPTY_LAYER_BYTES
 from image.docker.schema2.list import MalformedSchema2ManifestList
@@ -99,12 +98,6 @@ class ManifestDescriptorMismatchException(CreateManifestException):
         super().__init__("Manifest descriptor `%s` has mismatched %s" % (digest, reason))
         self.digest = digest
         self.reason = reason
-
-
-class ReferrerDigestUnsupportedException(CreateManifestException):
-    def __init__(self, algorithm):
-        super().__init__("Referrer digest algorithm `%s` is unsupported" % algorithm)
-        self.algorithm = algorithm
 
 
 class _ManifestAlreadyExists(Exception):
@@ -509,24 +502,6 @@ def connect_blobs(manifest: ManifestInterface, blob_ids: set[int], repository_id
         raise _ManifestAlreadyExists(e)
 
 
-def _validate_referrer_publication_digests(manifest_interface_instance, requested_digest):
-    subject = manifest_interface_instance.subject
-    if subject is None:
-        return
-
-    subject_digest = subject.get("digest") if isinstance(subject, dict) else subject.digest
-    for digest in (requested_digest or manifest_interface_instance.digest, subject_digest):
-        digest_str = str(digest)
-        try:
-            parsed = digest_tools.Digest.parse_digest(digest_str, strict=True)
-        except digest_tools.UnsupportedDigestAlgorithmException:
-            raise ReferrerDigestUnsupportedException(digest_str.split(":", 1)[0])
-        except digest_tools.InvalidDigestException as exc:
-            raise CreateManifestException("Invalid referrer digest `%s`" % digest_str) from exc
-        if parsed.hash_alg != "sha256":
-            raise ReferrerDigestUnsupportedException(parsed.hash_alg)
-
-
 def get_or_create_manifest(
     repository_id,
     manifest_interface_instance,
@@ -551,10 +526,6 @@ def get_or_create_manifest(
     Note that *all* blobs referenced by the manifest must exist already in the repository or this
     method will fail with a None.
     """
-    # Keep the Demo 1 referrer capability boundary below all publication entry points. This must
-    # run before existing-manifest lookup because that lookup can create a temporary tag.
-    _validate_referrer_publication_digests(manifest_interface_instance, requested_digest)
-
     canonical_digest = manifest_interface_instance.digest
     legacy_visible = lookup_canonical_manifest(
         repository_id,

@@ -2230,3 +2230,235 @@ Targeted mypy was not run because no production Python changed. A live PostgreSQ
 ### Recommended next story
 
 Proceed with **Story 7: Push and pull OCI artifacts with registered digest identities**. Start by reading this file completely, then inspect the explicit alternative artifact and subject boundary in `endpoints/v2/manifest.py`, canonical subject resolution and descriptor validation in `data/model/oci/manifest.py`, response datatypes and graph persistence in `data/registry_model/registry_oci_model.py`, and existing artifact tests in `endpoints/v2/test/test_manifest.py`. Do not include Story 8 referrer discovery unless Story 7 cannot be made correct without it. Preserve repository-scoped registrations and hidden canonical identities, and keep Story 1 and Story 2 status unchanged.
+
+## Story 7: Push and pull OCI artifacts with registered digest identities
+
+**Status: Done under the local definition of done. Story 8 referrer discovery remains separate and unchanged.**
+
+Story 1 and Story 2 remain independently **In progress**. Story 3, Story 4, Story 5, Story 6, and Story 7 are **Done**. Later-story completion does not change Story 1 or Story 2 status.
+
+### Repository and scope
+
+- Worktree: `/Users/shossain/QuayWorkspace/shaon-feature-PQC`
+- Branch: `shaon-feature-PQC`
+- Starting HEAD: `608ee31b6d1747b3e1184511c968b1ed58b88747`
+- Starting subject: `NO-ISSUE: test(registry): validate mixed-digest multi-architecture images`
+- Base and merge base: `d81004d24669132d45df8fbd1eafc86c149e38fa`
+- Final commit subject: `NO-ISSUE: feat(registry): support registered OCI artifact identities`
+- The final commit is the commit containing this section. Its hash cannot be embedded in its own Git preimage; obtain it with `git rev-parse HEAD`. The final response records the exact hash.
+- Starting status was clean, with no staged, unstaged, or untracked files.
+- The complete starting `master...HEAD` patch contained 70 files, 281 hunks, 11,226 additions, and 652 deletions. Its saved patch SHA-256 was `e58156269d1a56d7c8af7438bc7ca6ddcb496cf3c634af2c728aa77fe4ac4907`.
+- No reset, restore, rebase, amend, push, remote change, or other-worktree modification occurred. `/Users/shossain/QuayWorkspace/11537-pqc-schema` was not accessed or modified.
+
+The session stayed within direct OCI artifact publication and pull. It did not change referrer discovery, proxy cache, mirroring, complete-image copy, imports, builds, Clair, UI, deletion, garbage collection, conformance, or operational tooling.
+
+### Root cause and implementation
+
+The configurable-digest graph implementation already supplied exact-byte manifest hashing, repository-scoped blob and manifest registrations, canonical graph persistence, repository-scoped subject resolution, subject size and media-type validation, transactional graph and tag publication, cache invalidation, and registered digest pull. Story 7 was blocked by two deliberate Demo 1 capability gates:
+
+1. `endpoints/v2/manifest.py` rejected any artifact publication when either the artifact route identity or subject descriptor identity was not SHA-256.
+2. `data/model/oci/manifest.py` repeated the same SHA-256-only check below every registry-model publication entry point.
+
+After removing those obsolete gates, a focused registry-model test exposed one additional identity defect. `create_manifest_with_temp_tag()` persisted the requested registration but returned a `Manifest` datatype carrying hidden canonical SHA-256. It now passes `requested_digest` to the existing datatype wrapper, matching tagged publication and digest lookup behavior.
+
+No schema, migration, configuration, dependency, feature flag, retriever, blob lifecycle, referrer endpoint, or cache algorithm changed.
+
+### Completed behavior
+
+- Digest-addressed OCI artifacts accept enabled SHA-256, SHA-384, or SHA-512 identities and validate the requested digest over the exact request bytes before publication.
+- Tag-addressed artifact pushes remain canonical SHA-256 because a tag route carries no client-selected digest algorithm. Their subject descriptors may use any enabled registered identity.
+- Artifact config, layer, and subject descriptors are strict-parsed and allowlist-checked at the endpoint before model work.
+- Subjects resolve only through a registration in the target repository. A registration in another repository does not satisfy publication.
+- Subject descriptor size and media type are checked against exact persisted subject bytes and media type before artifact graph persistence.
+- `Manifest.digest` remains canonical SHA-256. `Manifest.subject` stores the resolved canonical subject SHA-256 internally. `Manifest.artifact_type` and exact artifact bytes are preserved.
+- `RepositoryManifestDigest` exposes only explicitly requested artifact and subject identities. Alternative-only artifact, subject, config, and payload objects do not expose hidden canonical SHA-256.
+- Artifact graph, requested registration, quota accounting, and tag changes continue through the existing lifecycle transaction. Repeated publication is idempotent.
+- Digest and tag GET and automatic HEAD return exact persisted artifact bytes, original OCI media type, and the selected registered artifact identity.
+- Pull and push authorization, repository isolation, hard-disable behavior, response digest, location, and `OCI-Tag` behavior use the existing manifest contracts.
+- `create_manifest_with_temp_tag()` now returns the requested repository-visible identity instead of hidden canonical SHA-256.
+- The alternative referrer subject query remains rejected by the existing Story 8 capability boundary. Story 7 tests do not call referrer discovery.
+
+### Files changed
+
+Production:
+
+- `endpoints/v2/manifest.py`
+- `data/model/oci/manifest.py`
+- `data/registry_model/registry_oci_model.py`
+
+Tests:
+
+- `endpoints/v2/test/test_manifest.py`
+- `data/registry_model/test/test_interface.py`
+
+Delivery state:
+
+- `.PITASKS.md`
+- `HANDOFF.md`
+
+`data/model/oci/retriever.py` and `data/registry_model/datatypes.py` were traced but required no change.
+
+### Exact local test evidence
+
+Existing pre-change artifact boundary:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py -k 'alternative_artifact_identity or alternative_subject_identity or sha256_referrer_query_and_artifact_type_filter'`
+
+Result: **7 passed, 64 deselected**. This confirmed the obsolete rejection behavior and SHA-256 compatibility before production changes.
+
+Test-first registry-model command:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py -k 'story7' data/registry_model/test/test_interface.py -k 'registry_publication_accepts_registered_artifact'`
+
+Result: **4 failed, 184 deselected as expected**. Pytest applied only the final `-k`, so this command selected the four registry-model cases. All failed at `ReferrerDigestUnsupportedException` before persistence. It was not endpoint evidence.
+
+Separate test-first endpoint command:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py -k 'story7'`
+
+Result: **5 failed, 65 deselected as expected**. Every case returned the obsolete `UNSUPPORTED` artifact or subject response.
+
+After removing the two publication gates:
+
+- Endpoint Story 7 selection: **5 passed, 65 deselected**.
+- Registry-model selection: **3 passed, 1 failed, 114 deselected**. The failure showed that temporary-tag publication returned canonical SHA-256 instead of the requested SHA-384 identity.
+
+After fixing the temporary-tag wrapper:
+
+- Endpoint Story 7 selection: **5 passed, 65 deselected**.
+- Registry-model selection: **4 passed, 114 deselected**.
+
+After adding subject validation and rollback coverage:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py -k 'story7'`
+
+Result: **9 passed, 65 deselected**.
+
+Final complete manifest endpoint suite:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py`
+
+Result: **74 passed**. This includes the unchanged Story 8 alternative referrer-query rejection.
+
+Final registry interface suite:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_interface.py`
+
+Result: **116 passed, 2 skipped**. The skips are the existing PostgreSQL-only blob and manifest registration races covered in earlier stories.
+
+Final OCI manifest and digest aggregate:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/oci/test/test_oci_manifest.py digest/test/test_digest_tools.py`
+
+Result: **77 passed**.
+
+Existing SHA-256 registry protocol push and pull:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings test/registry/registry_tests.py -k 'test_basic_push_pull_by_manifest'`
+
+Result: **3 passed, 1,456 deselected**.
+
+### Static verification
+
+Targeted mypy:
+
+`.venv/bin/mypy data/model/oci/manifest.py data/registry_model/registry_oci_model.py endpoints/v2/manifest.py`
+
+Result: **passed**, with no issues in three source files.
+
+Targeted compilation and whitespace:
+
+`.venv/bin/python -m compileall -q data/model/oci/manifest.py data/registry_model/registry_oci_model.py data/registry_model/test/test_interface.py endpoints/v2/manifest.py endpoints/v2/test/test_manifest.py && git diff --check`
+
+Result: **passed**.
+
+Targeted pre-commit:
+
+`.venv/bin/pre-commit run --files .PITASKS.md data/model/oci/manifest.py data/registry_model/registry_oci_model.py data/registry_model/test/test_interface.py endpoints/v2/manifest.py endpoints/v2/test/test_manifest.py`
+
+First result: **nonzero because Black reformatted the two test files**. Every other applicable hook passed. The exact command was rerun and **all applicable hooks passed**.
+
+Final pre-commit over every Story 7 file, including this handoff:
+
+`files=$(git diff --name-only --diff-filter=ACMR) && .venv/bin/pre-commit run --files $files`
+
+Result: **all applicable hooks passed** for `.PITASKS.md`, `HANDOFF.md`, the three production files, and the two test files.
+
+Final compilation and diff checks:
+
+`.venv/bin/python -m compileall -q data/model/oci/manifest.py data/registry_model/registry_oci_model.py data/registry_model/test/test_interface.py endpoints/v2/manifest.py endpoints/v2/test/test_manifest.py && git diff --check && git diff --check master`
+
+Result: **passed** with no output.
+
+The final pre-commit repository check confirmed the expected branch and starting HEAD, no staged files, no untracked files, and only the seven intended Story 7 files modified. The complete combined `master` patch parsed successfully as 70 files and 280 hunks before the final task-state update.
+
+### Live artifact publication and pull
+
+Environment:
+
+- Local `quay-quay`, PostgreSQL, and Redis containers were running.
+- The target worktree was bind-mounted into `quay-quay`.
+- `quay-quay` was restarted to load the production changes.
+- Readiness polling saw transient connection resets during startup, then `/v2/auth` returned HTTP 401 as expected without credentials.
+- The active live allowlist was `['sha256', 'sha384', 'sha512']`.
+- Existing regctl credentials were read only in memory. No credential, token, or auth-file content was printed.
+
+Fresh subject publication:
+
+`regctl image mod busybox:latest --digest-algo sha512 --create localhost:8080/testuser/pqc-story7-01a05e7e:subject`
+
+Result: **passed**.
+
+The subject was the 10,533-byte OCI index `sha512:0bd23dcfecb44322dd952511fc3c392f2eb652f3eb6dac7c352156a43b782a957b8cf23b26633bffc66c56acbdb82e6f805501661cd55b011e01673a4a72963c`.
+
+Direct Registry V2 artifact validation:
+
+`cd /Users/shossain/QuayWorkspace/shaon-feature-PQC && .venv/bin/python /tmp/pqc-story7-live.py`
+
+Result: **passed**.
+
+The script did not call the referrers endpoint. It uploaded a SHA-384 config and SHA-512 payload, then published a 781-byte OCI artifact by SHA-384 digest with tag `artifact`:
+
+`sha384:aba053dc276e8a3cfff16a39c8ed0b38e5253648efec41329e906e716a67a295eda1f38af93246b9da12733dc1b76b09`
+
+Live outcomes:
+
+- Artifact PUT returned HTTP 201, the requested SHA-384 digest, a matching digest location, and `OCI-Tag: artifact`.
+- Artifact GET and HEAD by digest and tag returned HTTP 200, the OCI artifact media type, and the SHA-384 artifact identity.
+- GET returned exact bytes and independent SHA-384 recomputation passed.
+- Config GET and HEAD by SHA-384 returned exact bytes and the requested identity.
+- Payload GET and HEAD by SHA-512 returned exact bytes and the requested identity.
+- Hidden canonical SHA-256 GET requests for the artifact, subject, config, and payload each returned HTTP 404.
+
+Container database verification:
+
+`podman cp /tmp/pqc-story7-live-result.json quay-quay:/tmp/pqc-story7-live-result.json && podman cp /tmp/pqc-story7-dbcheck.py quay-quay:/tmp/pqc-story7-dbcheck.py && podman exec quay-quay python /tmp/pqc-story7-dbcheck.py`
+
+The first database-check attempt failed before querying because the temporary script had not imported `app`, leaving Peewee's database proxy uninitialized. After adding the initialization import, the same checks passed:
+
+- Repository ID: 13.
+- Artifact canonical `Manifest` ID: 158.
+- Subject canonical `Manifest` ID: 157.
+- Artifact internal digest: `sha256:ded291334c713cb1a960fe6031a2d7d2e9dbf022d76199d212fa47dfaeb5dca0`.
+- Subject internal digest: `sha256:9edfb5319801ada456f67d05aeee6fc8946d09731ff8337e873ec3648255ccb8`.
+- Artifact subject stored the canonical subject digest.
+- Artifact had exactly one repository manifest registration: its requested SHA-384 identity.
+- Subject had exactly one repository manifest registration: its requested SHA-512 identity.
+- Both artifact blob edges used the expected canonical storage rows and each row had only its requested repository digest registration.
+- The live artifact tag pointed to the canonical artifact row.
+
+### Blockers, limitations, and deferred work
+
+- No product blocker remains for Story 7.
+- No new live PostgreSQL or MySQL test was run. Story 7 changed no transaction implementation, registration helper, schema, or migration. Existing PostgreSQL registration-race evidence and the passing transaction rollback suites remain applicable.
+- The two PostgreSQL-only interface tests remained skipped in SQLite.
+- Live validation used a SHA-512 OCI index as the artifact subject. Unit coverage also uses single-manifest subjects and tag-addressed artifact publication.
+- The live repository and objects remain available for inspection. They were not deleted because lifecycle cleanup is outside Story 7.
+- No OCI Distribution conformance, broad client matrix, mixed-version, mixed-region, object-storage, replication, or production-readiness claim is made.
+- SHA-384 remains a Quay extension with client-specific interoperability limits.
+- Referrer discovery by alternative subject identity remains Story 8. The existing referrers endpoint still rejects SHA-384 and SHA-512 subject queries and still emits only its current SHA-256 capability response.
+- Proxy cache, mirroring, complete-image copy, importing, builds, Clair, UI, deletion, garbage collection, conformance, and operational tooling were not changed.
+
+### Recommended next story
+
+Proceed with **Story 8: referrer discovery through registered digest identities**. Start with `endpoints/v2/referrers.py`, `data/registry_model/registry_oci_model.py`, `data/model/oci/manifest.py`, cache-key behavior, and the existing alternative-referrer rejection tests in `endpoints/v2/test/test_manifest.py`. Resolve subjects repository-locally, return only registered repository-visible artifact identities, preserve artifact-type filtering and fallback-tag behavior, and never expose hidden canonical SHA-256. Keep Story 1 and Story 2 independently In progress.

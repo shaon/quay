@@ -39,7 +39,6 @@ from data.model import (
     namespacequota,
 )
 from data.model.blob import store_blob_record_and_temp_link
-from data.model.oci.manifest import ReferrerDigestUnsupportedException
 from data.model.oci.retriever import RepositoryContentRetriever
 from data.model.storage import get_layer_path
 from data.registry_model.blobuploader import BlobUploadSettings, upload_blob
@@ -2058,7 +2057,7 @@ def _add_manifest_registration(repository_ref, manifest, algorithm):
 
 @pytest.mark.parametrize("publication", ["tag", "temporary-tag"])
 @pytest.mark.parametrize("alternative_identity", ["artifact", "subject"])
-def test_registry_publication_rejects_alternative_referrer_identity_before_persistence(
+def test_registry_publication_accepts_registered_artifact_and_subject_identities(
     publication, alternative_identity, initialized_db, registry_model
 ):
     repository_ref = registry_model.lookup_repository("devtable", "simple")
@@ -2066,11 +2065,12 @@ def test_registry_publication_rejects_alternative_referrer_identity_before_persi
     subject, _ = registry_model.create_manifest_and_retarget_tag(
         repository_ref,
         subject_impl,
-        "registry-boundary-subject",
+        "registry-artifact-subject",
         storage,
         requested_digest=subject_impl.digest,
         raise_on_error=True,
     )
+    canonical_subject_digest = subject.digest
 
     requested_digest = None
     if alternative_identity == "subject":
@@ -2085,7 +2085,7 @@ def test_registry_publication_rejects_alternative_referrer_identity_before_persi
     artifact = _build_referrer_manifest(
         "devtable",
         "simple",
-        f"registry-boundary-{publication}-{alternative_identity}",
+        f"registry-artifact-{publication}-{alternative_identity}",
         subject=subject,
         artifact_type="application/vnd.example.signature",
     )
@@ -2094,46 +2094,41 @@ def test_registry_publication_rejects_alternative_referrer_identity_before_persi
     else:
         requested_digest = artifact.digest
 
-    before = {
-        "manifests": Manifest.select().where(Manifest.repository == repository_ref.id).count(),
-        "registrations": RepositoryManifestDigest.select()
-        .where(RepositoryManifestDigest.repository == repository_ref.id)
-        .count(),
-        "tags": Tag.select().where(Tag.repository == repository_ref.id).count(),
-    }
     cache = MagicMock()
     cache.cache_config = TEST_CACHE_CONFIG
+    if publication == "tag":
+        created_artifact, _ = registry_model.create_manifest_and_retarget_tag(
+            repository_ref,
+            artifact,
+            "registry-artifact",
+            storage,
+            model_cache=cache,
+            requested_digest=requested_digest,
+            raise_on_error=True,
+        )
+    else:
+        created_artifact = registry_model.create_manifest_with_temp_tag(
+            repository_ref,
+            artifact,
+            300,
+            storage,
+            model_cache=cache,
+            requested_digest=requested_digest,
+            raise_on_error=True,
+        )
 
-    with pytest.raises(ReferrerDigestUnsupportedException):
-        if publication == "tag":
-            registry_model.create_manifest_and_retarget_tag(
-                repository_ref,
-                artifact,
-                "blocked-registry-artifact",
-                storage,
-                model_cache=cache,
-                requested_digest=requested_digest,
-                raise_on_error=True,
-            )
-        else:
-            registry_model.create_manifest_with_temp_tag(
-                repository_ref,
-                artifact,
-                300,
-                storage,
-                model_cache=cache,
-                requested_digest=requested_digest,
-                raise_on_error=True,
-            )
-
-    assert {
-        "manifests": Manifest.select().where(Manifest.repository == repository_ref.id).count(),
-        "registrations": RepositoryManifestDigest.select()
-        .where(RepositoryManifestDigest.repository == repository_ref.id)
-        .count(),
-        "tags": Tag.select().where(Tag.repository == repository_ref.id).count(),
-    } == before
-    cache.invalidate.assert_not_called()
+    artifact_row = Manifest.get_by_id(created_artifact.id)
+    assert created_artifact.digest == requested_digest
+    assert artifact_row.subject == canonical_subject_digest
+    assert artifact_row.artifact_type == "application/vnd.example.signature"
+    assert (
+        RepositoryManifestDigest.get(
+            repository=repository_ref.id,
+            digest=requested_digest,
+        ).manifest
+        == artifact_row
+    )
+    cache.invalidate.assert_called()
 
 
 def test_native_referrers_select_visible_sha256_and_omit_alternative_only(

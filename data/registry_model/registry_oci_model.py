@@ -1153,7 +1153,9 @@ class OCIModel(RegistryDataInterface):
                 return None
 
             wrapped_manifest = Manifest.for_manifest(
-                created_manifest.manifest, self._legacy_image_id_handler
+                created_manifest.manifest,
+                self._legacy_image_id_handler,
+                digest=requested_digest,
             )
 
         # Do not permit a cache reload between invalidation and transaction commit.
