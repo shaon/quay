@@ -330,6 +330,15 @@ class OCIModel(RegistryDataInterface):
             )
             if referrer_row is None:
                 continue
+            if (
+                oci.manifest.lookup_canonical_manifest(
+                    repository_ref._db_id,
+                    referrer_row.digest,
+                    allow_hidden=True,
+                )
+                is None
+            ):
+                continue
 
             digest = oci.manifest.get_repository_manifest_digest(
                 repository_ref._db_id,
@@ -1117,6 +1126,33 @@ class OCIModel(RegistryDataInterface):
                 manifest.repository.id, model_cache.cache_config
             )
             model_cache.invalidate(gen_key)
+
+            if deleted_tags:
+                manifest_row = database.Manifest.get_by_id(manifest.id)
+                if manifest_row.subject is not None:
+                    subject_manifest = oci.manifest.lookup_canonical_manifest(
+                        manifest.repository.id,
+                        manifest_row.subject,
+                        allow_dead=True,
+                        allow_hidden=True,
+                    )
+                    if subject_manifest is not None:
+                        self._invalidate_referrers_cache_for_subject(
+                            manifest.repository,
+                            subject_manifest,
+                            (
+                                [manifest_row.artifact_type]
+                                if manifest_row.artifact_type is not None
+                                else []
+                            ),
+                            model_cache,
+                        )
+                self._invalidate_referrers_cache_for_fallback_tags(
+                    manifest.repository,
+                    [tag.name for tag in deleted_tags],
+                    [manifest_row],
+                    model_cache,
+                )
 
             return [ShallowTag.for_tag(tag) for tag in deleted_tags]
 

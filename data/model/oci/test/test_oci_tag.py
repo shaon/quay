@@ -436,6 +436,21 @@ def test_delete_tags_for_manifest(initialized_db):
             assert get_tag(repo, tag.name) is None
 
 
+def test_story14_delete_tags_for_manifest_includes_hidden_lifecycle_tags(initialized_db):
+    with patch("data.model.config.app_config", {"RESET_CHILD_MANIFEST_EXPIRATION": False}):
+        repository = create_repository("devtable", "newrepo", None)
+        manifest, _ = create_manifest_for_testing(repository, "story14-hidden-tags")
+        visible_tag = retarget_tag("story14-visible", manifest.id)
+        hidden_tag = Tag.get(manifest=manifest, hidden=True)
+
+        deleted = delete_tags_for_manifest(manifest)
+
+        assert {tag.id for tag in deleted} == {visible_tag.id, hidden_tag.id}
+        assert not filter_to_alive_tags(
+            Tag.select().where(Tag.manifest == manifest), allow_hidden=True
+        ).exists()
+
+
 def test_delete_tags_for_manifest_same_manifest(initialized_db):
     with patch("data.model.config.app_config", {"RESET_CHILD_MANIFEST_EXPIRATION": False}):
         new_repo = model.repository.create_repository("devtable", "newrepo", None)
@@ -1088,8 +1103,8 @@ class TestDeleteTagsForManifestImmutable:
 
         deleted = delete_tags_for_manifest(manifest)
 
-        assert len(deleted) == 2
-        assert {t.name for t in deleted} == {"v1.0", "v2.0"}
+        assert {tag.name for tag in deleted if not tag.hidden} == {"v1.0", "v2.0"}
+        assert len([tag for tag in deleted if tag.hidden]) == 1
 
         # Both tags should be gone
         assert get_tag(repo.id, "v1.0") is None
@@ -1429,7 +1444,8 @@ def test_delete_tags_for_manifest_cascades_cosign_once(initialized_db):
         assert get_tag(repo.id, cosign_tag_name) is not None
 
         deleted = delete_tags_for_manifest(manifest)
-        assert {t.name for t in deleted} == {"v1.0", "latest"}
+        assert {tag.name for tag in deleted if not tag.hidden} == {"v1.0", "latest"}
+        assert len([tag for tag in deleted if tag.hidden]) == 1
         assert get_tag(repo.id, "v1.0") is None
         assert get_tag(repo.id, "latest") is None
         assert get_tag(repo.id, cosign_tag_name) is None
@@ -1586,9 +1602,10 @@ def test_delete_tags_for_manifest_skips_expire_when_only_cosign_tags(initialized
         sig_manifest, _ = create_manifest_for_testing(repo, "sig-only-cosign")
         retarget_tag(cosign_tag_name, sig_manifest.id)
 
-        # Deleting tags on the signature manifest itself: only Cosign-named tags.
+        # Deleting the signature manifest expires its visible Cosign tag and hidden lifecycle tag.
         deleted = delete_tags_for_manifest(sig_manifest)
-        assert {t.name for t in deleted} == {cosign_tag_name}
+        assert {tag.name for tag in deleted if not tag.hidden} == {cosign_tag_name}
+        assert len([tag for tag in deleted if tag.hidden]) == 1
         assert get_tag(repo.id, cosign_tag_name) is None
         # Image tag must remain; no subject-digest Cosign cascade ran against it.
         assert get_tag(repo.id, "v-image") is not None

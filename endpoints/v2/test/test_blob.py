@@ -708,6 +708,70 @@ def test_story5_registered_mount_contract(algorithm, client, app):
 
 
 @pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
+def test_story14_registered_blob_delete_remains_unsupported(algorithm, client, app):
+    repository = "devtable/simple"
+    content = f"story 14 {algorithm} blob delete boundary".encode()
+    requested_digest = f"{algorithm}:" + hashlib.new(algorithm, content).hexdigest()
+    repository_row, blob, _ = _store_registered_blob(repository, content, requested_digest)
+    registrations_before = list(
+        RepositoryBlobDigest.select()
+        .where(
+            RepositoryBlobDigest.repository == repository_row,
+            RepositoryBlobDigest.image_storage == blob,
+        )
+        .order_by(RepositoryBlobDigest.id)
+    )
+    links_before = list(
+        UploadedBlob.select()
+        .where(
+            UploadedBlob.repository == repository_row,
+            UploadedBlob.blob == blob,
+        )
+        .order_by(UploadedBlob.id)
+    )
+
+    for allowed_algorithms in (["sha256", algorithm], ["sha256"]):
+        with patch.dict(
+            realapp.config,
+            {"ALLOWED_HASH_ALGORITHMS": allowed_algorithms},
+        ):
+            response = conduct_call(
+                client,
+                "v2.delete_digest",
+                url_for,
+                "DELETE",
+                {"repository": repository, "digest": requested_digest},
+                expected_code=405,
+                headers=_blob_auth_headers(repository),
+            )
+        assert response.get_json()["errors"][0]["code"] == "UNSUPPORTED"
+
+    assert (
+        list(
+            RepositoryBlobDigest.select()
+            .where(
+                RepositoryBlobDigest.repository == repository_row,
+                RepositoryBlobDigest.image_storage == blob,
+            )
+            .order_by(RepositoryBlobDigest.id)
+        )
+        == registrations_before
+    )
+    assert (
+        list(
+            UploadedBlob.select()
+            .where(
+                UploadedBlob.repository == repository_row,
+                UploadedBlob.blob == blob,
+            )
+            .order_by(UploadedBlob.id)
+        )
+        == links_before
+    )
+    assert model.oci.blob.get_repository_blob_by_digest(repository_row, requested_digest) == blob
+
+
+@pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
 def test_alternative_mount_enforces_source_authorization_and_repository_boundary(
     algorithm, client, app
 ):

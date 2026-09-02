@@ -28,10 +28,12 @@ The feature supports repository-visible SHA-256, SHA-384, and SHA-512 identities
 - Story 7 implementation: `b59c747e7482f174dee81508dd3aca363ef7d7e6`
 - Story 8 implementation: `bc21299727b875af15fa67a689677e69b9f688ff`
 - External-registry deferral: `229069a0180a43f36f89d25f34a5bd72ad7dab7f`
-- Story 13 changes add lazy legacy SHA-256 registration, endpoint and model coverage, and this handoff. No schema, migration, configuration, proxy, mirror, import, or lifecycle path changed.
-- Story 13 is committed with subject `NO-ISSUE: fix(registry): preserve legacy SHA-256 identities`. Its hash cannot be embedded in its own Git preimage; use `git rev-parse HEAD` and verify the subject.
-- Expected target status after the Story 13 commit: clean, with no staged, unstaged, or untracked files.
-- The planning repository had unrelated modified and untracked files before this update. This session changed only its current-session `.PITASKS.md` section and Story 13 status and evidence in `TODO.md`. The planning repository was not committed. `PQC-Features.md` was unchanged because the accepted capability boundary did not change.
+- Pre-Story 14 HEAD: `943ac2c12dff1bbc8d6310886b5ab81747e29ca4`.
+- Pre-Story 14 subject: `NO-ISSUE: fix(registry): preserve legacy SHA-256 identities`.
+- Story 14 changes make registered manifest deletion include hidden lifecycle tags, suppress deleted native referrers, and invalidate native and fallback referrer caches. No schema, migration, configuration, blob unlink, repository/namespace cleanup, upload expiration, garbage collection, proxy, mirror, import, or Docker schema 1 alternative-identity behavior changed.
+- Story 14 is committed with subject `NO-ISSUE: fix(registry): delete registered digest content`. Its hash cannot be embedded in its own Git preimage; use `git rev-parse HEAD` and verify the subject.
+- Expected target status after the Story 14 commit: clean, with no staged, unstaged, or untracked files.
+- The planning repository had unrelated modified and untracked files before this update. This session changed only its current-session `.PITASKS.md` section and Story 14 status and evidence in `TODO.md`. The planning repository was not committed. `PQC-Features.md` was unchanged because the accepted capability boundary did not change.
 
 ## Delivery status
 
@@ -48,7 +50,8 @@ The feature supports repository-visible SHA-256, SHA-384, and SHA-512 identities
 - Story 11: **Deferred** with repository and organization mirroring.
 - Story 12: **Deferred** with external image import.
 - Story 13: **Done**.
-- Recommended next work: **Story 14, delete content through registered digest identities**.
+- Story 14: **Done**.
+- Recommended next work: **Story 15, remove digest registrations during repository and namespace deletion**.
 
 Do not change Story 1 or Story 2 merely because later stories depend on their behavior.
 
@@ -122,6 +125,17 @@ Do not change Story 1 or Story 2 merely because later stories depend on their be
 - Disabling SHA-256 blocks legacy and explicitly registered SHA-256 reads before cache lookup without deleting registrations or canonical content. Enabled alternative identities remain usable, and re-enabling SHA-256 restores canonical access and tag preference.
 - Unauthorized, malformed, disabled, and unknown requests retain their established registry errors. Normal SHA-256 publication, pull, and mount behavior remains compatible.
 
+### Story 14 registered-identity deletion
+
+- Authorized manifest deletion resolves exact repository-scoped SHA-256, SHA-384, or SHA-512 registrations even when the requested algorithm is disabled.
+- Deletion expires every alive tag for the manifest, including temporary hidden lifecycle tags used by untagged digest publication. All aliases then become unavailable through manifest GET, HEAD, referrer discovery, and repeated DELETE.
+- Native OCI artifact deletion invalidates filtered and unfiltered referrer caches for every visible subject identity after the tag transaction commits.
+- Fallback-index deletion invalidates subject caches derived from its digest-form fallback tag. Fresh and primed native/fallback discovery no longer returns deleted content.
+- Native referrer response hydration rechecks canonical reachability, so a stale cache record cannot re-expose a deleted artifact.
+- Manifest registrations, canonical manifests, graph links, blobs, and blob registrations remain for later lifecycle garbage collection. Story 14 does not remove canonical content physically.
+- Arbitrary blob DELETE remains HTTP 405 `UNSUPPORTED` for registered and disabled identities because unlinking a referenced blob would corrupt manifest graphs. It does not mutate registrations, upload links, or bytes.
+- Strict malformed/unsupported errors, unknown-content behavior, write authorization, repository isolation, immutable-tag behavior, and normal SHA-256 deletion remain intact.
+
 ## Story 8 root causes and changed files
 
 The unfinished behavior had six causes:
@@ -183,6 +197,33 @@ Documentation changed:
 - `HANDOFF.md`
 
 No schema or migration changed.
+
+## Story 14 root causes and changed files
+
+The deletion gaps had four causes:
+
+1. The manifest DELETE endpoint used normal visible lookup, so a digest-pushed manifest with only a hidden lifecycle tag returned `MANIFEST_UNKNOWN`.
+2. `delete_tags_for_manifest` selected visible tags only, leaving temporary hidden tags alive and the registered manifest reachable.
+3. Native referrer selection trusted cached/database candidates without rechecking canonical reachability after deletion.
+4. Manifest deletion invalidated manifest and tag caches but did not invalidate native subject or digest-form fallback referrer caches.
+
+Production files changed:
+
+- `data/model/oci/tag.py`
+- `data/registry_model/registry_oci_model.py`
+- `endpoints/v2/manifest.py`
+
+Test files changed:
+
+- `data/model/oci/test/test_oci_tag.py`
+- `endpoints/v2/test/test_blob.py`
+- `endpoints/v2/test/test_manifest.py`
+
+Documentation changed:
+
+- `HANDOFF.md`
+
+No schema or migration changed. Blob unlink remained explicitly unsupported.
 
 ## Verification evidence
 
@@ -310,6 +351,56 @@ Targeted mypy:
 
 Result: **passed**, no issues in five source files.
 
+### Story 14 tests
+
+Initial characterization from the Quay worktree:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/oci/test/test_oci_tag.py endpoints/v2/test/test_manifest.py endpoints/v2/test/test_blob.py -k story14`
+
+Result: **4 failed, 5 passed, 241 deselected**. Three failures demonstrated product gaps: hidden lifecycle tags survived deletion, an untagged registered artifact returned `MANIFEST_UNKNOWN`, and a deleted fallback index remained in a primed referrer cache. One failure was a test defect that passed a database `Repository` row to an API expecting `RepositoryReference`; deletion itself had succeeded. The first attempted command was run from the planning directory and could not find `.venv/bin/python`; it did not execute tests.
+
+Final focused SQLite coverage:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/oci/test/test_oci_tag.py endpoints/v2/test/test_manifest.py endpoints/v2/test/test_blob.py -k story14`
+
+Result: **9 passed, 241 deselected**.
+
+Complete manifest and blob endpoint suites:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py endpoints/v2/test/test_blob.py`
+
+Result: **153 passed**.
+
+Complete OCI tag model suite:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/oci/test/test_oci_tag.py`
+
+Result: **96 passed, 1 skipped**. The skip is an existing database-specific case.
+
+Complete registry interface suite:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_interface.py`
+
+Result: **120 passed, 2 skipped**. The skips remain the PostgreSQL-only registration races validated in Story 13.
+
+Focused PostgreSQL Story 14 coverage:
+
+`TEST=true TEST_DATABASE_URI='postgresql://quay:quay@localhost:5432/quay' PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/oci/test/test_oci_tag.py endpoints/v2/test/test_manifest.py endpoints/v2/test/test_blob.py -k story14`
+
+Result: **9 passed, 241 deselected**.
+
+Broad SHA-256 registry deletion, deleted-digest pull, push/pull, and mount regressions:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings test/registry/registry_tests.py -k 'test_delete_manifest or test_attempt_pull_by_manifest_digest_for_deleted_tag or test_basic_push_pull_by_manifest or blob_mount'`
+
+Result: **273 passed, 1,186 deselected**.
+
+Final SHA-256 registry deletion and deleted-digest pull selection after the last production adjustment:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings test/registry/registry_tests.py -k 'test_delete_manifest or test_attempt_pull_by_manifest_digest_for_deleted_tag'`
+
+Result: **18 passed, 1,441 deselected**.
+
 ### Static checks
 
 Pre-commit passed over every Story 8 target-worktree file. Earlier passes reformatted Python with Black; the final pass made no changes.
@@ -329,6 +420,20 @@ Result: **passed**.
 Story 10 pre-commit passed for `endpoints/v2/test/test_manifest.py` after the first Black pass reformatted the file. Python compilation and `git diff --check` also passed.
 
 Story 13 pre-commit passed for every changed Quay file after the first pass reformatted five Python files. Python compilation and `git diff --check` passed.
+
+Story 14 pre-commit passed for all six changed Quay files. The first virtual-environment run reformatted `endpoints/v2/test/test_blob.py`; the final run made no changes. A prior invocation through the shell `PATH` did not run because `pre-commit` was unavailable there.
+
+Story 14 targeted mypy:
+
+`.venv/bin/mypy data/model/oci/tag.py data/registry_model/registry_oci_model.py endpoints/v2/manifest.py`
+
+Result: **passed**, no issues in three source files.
+
+Story 14 compilation and whitespace:
+
+`.venv/bin/python -m compileall -q data/model/oci/tag.py data/model/oci/test/test_oci_tag.py data/registry_model/registry_oci_model.py endpoints/v2/manifest.py endpoints/v2/test/test_blob.py endpoints/v2/test/test_manifest.py && git diff --check && git diff --check master`
+
+Result: **passed**.
 
 ## Live Story 8 validation
 
@@ -407,13 +512,40 @@ Live outcomes:
 
 The first `regctl` copy attempts returned unauthorized because the running stack's service key was unhealthy; a direct request confirmed `Unknown service key`, and restarting only `quay-quay` repaired the environment. Three temporary validation commands were also defective: the first SQL query used the nonexistent `quayuser` table instead of quoted `user`, one `psql -c` command incorrectly expected variable interpolation, and the first HEAD loop used `curl -X HEAD`, which waited for a body. Corrected commands passed. These were environment or validation-script failures, not product test failures. The dedicated live repository and two empty repositories from the failed copy attempts were not deleted because repository cleanup is outside Story 13.
 
+## Live Story 14 validation
+
+The running `quay-quay` container was bind-mounted from the target worktree. Instance health returned HTTP 200 and the initial allowlist was SHA-256, SHA-384, and SHA-512. The dedicated repository was `localhost:8080/testuser/pqc-story14-live-1788331630`.
+
+Key identities:
+
+- Subject SHA-512: `sha512:067885a63490613fce2dc53160df716bb9250ff1a6aa9f0339c0ae948eaabd87a5eb7c5cfe0d80b2e5140943e697b27624980642153c766bfcf52402d98ee563`
+- Native artifact SHA-512: `sha512:41821b2e957a31e19c0e27e4cfbd7243b9e933fd6c1b9b54e12b7a0c34a8d90153080ebba90d233f449994ee7d3807859d03c75e4504b45c62b52ac8b2893b3f`
+- Native artifact SHA-384 alias: `sha384:49b5eb7722d6de746bddf6b572e7ccb17aad4cd89d4994c3e420ff11a3729518969ecd40ce221c28d7d269ffbb1b05b4`
+- Fallback-only artifact SHA-384: `sha384:c106fbe1acdc0031eaf2843446242a0b3aa4d041588bdee851ee7a37adc9c56b3168204ade23e81ad6a4889c2d2ba753`
+- Fallback index SHA-512: `sha512:04fc6c6f2253a362ba96bc1482cfd0953ba0bbc795f39a9bc5c60405dbed49ff879e0b6d5a527856be001061b8781292d908fab9187d5f4f6415e3cd2cd616ba`
+- Sample registered blob SHA-512: `sha512:2cad476a6a6a68bb7e0319ab26f8d5c0e74fdbe0e3b4da7f6022ba605994eafd15b53e5343e669f42c87ab7fb7cb6e7fe734a4f9fd1bbeea6f932a9506f3c7a7`
+
+Live outcomes:
+
+- A tagged SHA-512 subject, untagged native artifact with SHA-512 and SHA-384 identities, untagged fallback-only SHA-384 artifact, and SHA-512 fallback index were published successfully.
+- Two identical referrer requests primed the cache and returned exactly the native SHA-512 artifact and fallback-only SHA-384 artifact.
+- SHA-512 was removed temporarily from the active allowlist. While disabled, deleting the native artifact and fallback index through their SHA-512 identities each returned HTTP 202.
+- Blob DELETE through the disabled registered SHA-512 identity returned HTTP 405 `UNSUPPORTED`, and a SHA-512 manifest GET returned the expected HTTP 400 disabled error.
+- The configuration was restored byte-for-byte to SHA-256 `4de46dadfc727018452ddd490056beb5f5af736e1d0f5751cb8ddb942430731f`, Quay restarted, and health returned HTTP 200.
+- After restore, native artifact GET/HEAD through SHA-512 and SHA-384 and fallback-index GET/HEAD through SHA-512 returned HTTP 404. The fallback tag returned HTTP 404. Referrer discovery returned an empty descriptor list from the previously primed cache path.
+- The subject, fallback-only artifact, and sample blob remained readable through their registered identities, proving deletion was scoped and blob DELETE did not mutate content.
+- Read-only PostgreSQL inspection showed canonical SHA-256 manifests with repository registrations retained. The deleted native artifact and fallback index had zero alive tags; the subject and fallback-only artifact each had one. Six blob registrations, six recent-upload links, and six manifest-blob links remained.
+
+Container restarts produced transient connection resets and one three-second readiness-probe timeout before health returned 200; no registry operation failed. The first read-only `psql -c` command incorrectly assumed client-variable expansion and failed before querying; the corrected literal-safe command passed. This was a validation-script defect, not a product failure. The live repository was not deleted because repository cleanup is Story 15.
+
 ## Active limitations and deferred work
 
 - Proxy cache, repository mirroring, organization mirroring, external image import, and all related external-registry or live interoperability validation are explicitly deferred until reassigned.
 - Story 9 remains unimplemented. A partial Story 9 attempt was fully reverted before this handoff update.
 - Complete-image copy is supported only between normal repositories managed by the same Quay deployment while the external-registry deferral is active. Artifact-copy and referrer-copy variations remain unvalidated.
-- Builds, Clair, UI, deletion, garbage collection, conformance, and operational tooling remain later stories.
+- Builds, Clair, UI, garbage collection, conformance, and operational tooling remain later stories.
 - Full blob unlink, upload expiration, repository or namespace deletion, registration cleanup, and physical orphan cleanup remain lifecycle work.
+- Story 14 expires manifest lifecycle tags but intentionally leaves registrations, canonical rows, graph links, and bytes for later garbage collection. Arbitrary blob DELETE remains unsupported.
 - PostgreSQL blob and manifest registration races passed again in Story 13; MySQL concurrency remains unrun.
 - SHA-384 resumable hashing passed on local macOS arm64 and an existing Linux aarch64 image. Clean Linux builds, Linux x86_64 packaging, and cross-architecture resume remain unproven.
 - Podman and Skopeo rejected SHA-384 manifest pulls client-side in earlier tests; client interoperability remains tool-specific.
@@ -422,6 +554,6 @@ The first `regctl` copy attempts returned unauthorized because the running stack
 
 ## Recommended next story
 
-Proceed with **Story 14: delete content through registered digest identities**.
+Proceed with **Story 15: remove digest registrations during repository and namespace deletion**.
 
-Evaluate manifest and blob deletion semantics independently before changing production code. Keep repository and namespace cleanup, upload expiration, garbage collection, Docker schema 1 alternative identities, and deferred integrations outside Story 14 unless the tracker is deliberately revised.
+Start with characterization of repository and namespace deletion across all `RepositoryBlobDigest` and `RepositoryManifestDigest` rows. Keep upload expiration, garbage collection, physical orphan cleanup, Docker schema 1 alternative identities, and deferred integrations outside Story 15 unless the tracker is deliberately revised.

@@ -26,7 +26,7 @@ from data.database import (
     db,
     db_transaction,
 )
-from data.model.oci.tag import set_tag_immutable
+from data.model.oci.tag import filter_to_alive_tags, set_tag_immutable
 from data.model.storage import get_layer_path
 from data.model.test.test_repo_mirroring import create_mirror_repo_robot
 from data.registry_model import registry_model
@@ -4123,6 +4123,397 @@ def test_fetch_manifest_by_tagname_tracks_pull_metrics(client, app):
         call_args = mock_event.track_tag_pull.call_args
         # Args: repository_ref, tag_name, manifest_digest
         assert call_args[0][1] == "latest"  # tag_name
+
+
+@pytest.mark.parametrize(
+    "digest,expected_code,expected_reason",
+    [
+        ("sha384:" + "a" * 95, "DIGEST_INVALID", "malformed"),
+        ("sha512:" + "A" * 128, "DIGEST_INVALID", "malformed"),
+        ("sha999:" + "a" * 96, "UNSUPPORTED", "unsupported"),
+    ],
+)
+def test_story14_manifest_delete_strictly_parses_registered_identity(
+    digest, expected_code, expected_reason, client, app
+):
+    response = conduct_call(
+        client,
+        "v2.delete_manifest_by_digest",
+        url_for,
+        "DELETE",
+        {"repository": "devtable/simple", "manifest_ref": digest},
+        expected_code=400,
+        headers=_manifest_auth_headers("devtable/simple"),
+    )
+
+    error = response.get_json()["errors"][0]
+    assert error["code"] == expected_code
+    assert error["detail"]["reason"] == expected_reason
+
+
+def test_story14_delete_registered_manifest_aliases_isolated_and_hard_disable_safe(client, app):
+    repository = "devtable/simple"
+    other_repository = "devtable/complex"
+    manifest_info = _sha512_single_manifest(
+        repository,
+        b"story14 registered manifest aliases",
+        algorithm="sha512",
+    )
+    tags = ["story14-primary", "story14-secondary"]
+    cache = InMemoryDataModelCache(TEST_CACHE_CONFIG)
+
+    with (
+        patch.dict(
+            realapp.config,
+            {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384", "sha512"]},
+        ),
+        patch("endpoints.v2.manifest.model_cache", cache),
+    ):
+        _put_manifest(
+            client,
+            repository,
+            manifest_info["external_digest"],
+            manifest_info,
+            tag=tags,
+        )
+        sha384_alias = _register_manifest_alias(
+            repository,
+            manifest_info["canonical_digest"],
+            manifest_info["bytes"],
+            "sha384",
+        )
+        repository_row = model.repository.get_repository("devtable", "simple")
+        manifest_row = Manifest.get(
+            repository=repository_row,
+            digest=manifest_info["canonical_digest"],
+        )
+        model.oci.manifest.register_repository_manifest_digest(
+            repository_row.id,
+            manifest_row,
+            manifest_info["canonical_digest"],
+        )
+        aliases = {
+            manifest_info["canonical_digest"],
+            sha384_alias,
+            manifest_info["external_digest"],
+        }
+
+        for alias in aliases:
+            conduct_call(
+                client,
+                "v2.fetch_manifest_by_digest",
+                url_for,
+                "GET",
+                {"repository": repository, "manifest_ref": alias},
+                expected_code=200,
+                headers=_manifest_auth_headers(repository, actions=("pull",)),
+            )
+
+        conduct_call(
+            client,
+            "v2.delete_manifest_by_digest",
+            url_for,
+            "DELETE",
+            {
+                "repository": other_repository,
+                "manifest_ref": manifest_info["external_digest"],
+            },
+            expected_code=404,
+            headers=_manifest_auth_headers(other_repository),
+        )
+        conduct_call(
+            client,
+            "v2.delete_manifest_by_digest",
+            url_for,
+            "DELETE",
+            {"repository": repository, "manifest_ref": manifest_info["external_digest"]},
+            expected_code=401,
+            headers=_manifest_auth_headers(repository, actions=("pull",)),
+        )
+        conduct_call(
+            client,
+            "v2.delete_manifest_by_digest",
+            url_for,
+            "DELETE",
+            {"repository": repository, "manifest_ref": manifest_info["external_digest"]},
+            expected_code=401,
+        )
+
+    with (
+        patch.dict(realapp.config, {"ALLOWED_HASH_ALGORITHMS": ["sha256"]}),
+        patch("endpoints.v2.manifest.model_cache", cache),
+    ):
+        conduct_call(
+            client,
+            "v2.delete_manifest_by_digest",
+            url_for,
+            "DELETE",
+            {"repository": repository, "manifest_ref": manifest_info["external_digest"]},
+            expected_code=202,
+            headers=_manifest_auth_headers(repository),
+        )
+
+    with (
+        patch.dict(
+            realapp.config,
+            {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384", "sha512"]},
+        ),
+        patch("endpoints.v2.manifest.model_cache", cache),
+    ):
+        for alias in aliases:
+            for method in ("GET", "HEAD"):
+                conduct_call(
+                    client,
+                    "v2.fetch_manifest_by_digest",
+                    url_for,
+                    method,
+                    {"repository": repository, "manifest_ref": alias},
+                    expected_code=404,
+                    headers=_manifest_auth_headers(repository, actions=("pull",)),
+                )
+        conduct_call(
+            client,
+            "v2.delete_manifest_by_digest",
+            url_for,
+            "DELETE",
+            {"repository": repository, "manifest_ref": manifest_info["external_digest"]},
+            expected_code=404,
+            headers=_manifest_auth_headers(repository),
+        )
+
+    assert all(
+        not filter_to_alive_tags(
+            Tag.select().where(
+                Tag.repository == repository_row,
+                Tag.name == tag,
+            ),
+            allow_hidden=True,
+        ).exists()
+        for tag in tags
+    )
+    assert {
+        registration.digest
+        for registration in RepositoryManifestDigest.select().where(
+            RepositoryManifestDigest.repository == repository_row,
+            RepositoryManifestDigest.manifest == manifest_row,
+        )
+    } == aliases
+    assert {
+        relationship.blob_id
+        for relationship in ManifestBlob.select().where(
+            ManifestBlob.repository == repository_row,
+            ManifestBlob.manifest == manifest_row,
+        )
+    } == manifest_info["blob_ids"]
+
+
+def test_story14_deletes_untagged_registered_artifact_and_refreshes_referrers(client, app):
+    repository = "devtable/simple"
+    subject = _sha512_single_manifest(
+        repository,
+        b"story14 native referrer subject",
+        algorithm="sha384",
+    )
+    subject["media_type"] = DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE
+    artifact = _oci_artifact(
+        repository,
+        subject,
+        layer_bytes=b"story14 untagged native artifact",
+        algorithm="sha512",
+    )
+    cache = InMemoryDataModelCache(TEST_CACHE_CONFIG)
+    pull_headers = _manifest_auth_headers(repository, actions=("pull",))
+
+    with (
+        patch.dict(
+            realapp.config,
+            {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384", "sha512"]},
+        ),
+        patch("endpoints.v2.manifest.model_cache", cache),
+        patch("endpoints.v2.referrers.model_cache", cache),
+        toggle_feature("REFERRERS_API", True),
+    ):
+        _put_manifest(
+            client,
+            repository,
+            subject["external_digest"],
+            subject,
+            tag="story14-native-subject",
+        )
+        _put_manifest(client, repository, artifact["external_digest"], artifact)
+        artifact_sha384 = _register_manifest_alias(
+            repository,
+            artifact["canonical_digest"],
+            artifact["bytes"],
+            "sha384",
+        )
+
+        for params in (
+            {},
+            {"artifactType": "application/vnd.example.signature"},
+        ):
+            response = conduct_call(
+                client,
+                "v2.list_manifest_referrers",
+                url_for,
+                "GET",
+                {
+                    "repository": repository,
+                    "manifest_ref": subject["external_digest"],
+                    **params,
+                },
+                headers=pull_headers.copy(),
+            )
+            assert [descriptor["digest"] for descriptor in response.get_json()["manifests"]] == [
+                artifact["external_digest"]
+            ]
+
+        with patch.dict(realapp.config, {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384"]}):
+            conduct_call(
+                client,
+                "v2.delete_manifest_by_digest",
+                url_for,
+                "DELETE",
+                {"repository": repository, "manifest_ref": artifact["external_digest"]},
+                expected_code=202,
+                headers=_manifest_auth_headers(repository),
+            )
+
+        for params in (
+            {},
+            {"artifactType": "application/vnd.example.signature"},
+        ):
+            response = conduct_call(
+                client,
+                "v2.list_manifest_referrers",
+                url_for,
+                "GET",
+                {
+                    "repository": repository,
+                    "manifest_ref": subject["external_digest"],
+                    **params,
+                },
+                headers=pull_headers.copy(),
+            )
+            assert response.get_json()["manifests"] == []
+
+        for alias in (artifact["external_digest"], artifact_sha384):
+            conduct_call(
+                client,
+                "v2.fetch_manifest_by_digest",
+                url_for,
+                "GET",
+                {"repository": repository, "manifest_ref": alias},
+                expected_code=404,
+                headers=pull_headers.copy(),
+            )
+
+    repository_row = model.repository.get_repository("devtable", "simple")
+    artifact_row = Manifest.get(
+        repository=repository_row,
+        digest=artifact["canonical_digest"],
+    )
+    assert not filter_to_alive_tags(
+        Tag.select().where(Tag.manifest == artifact_row), allow_hidden=True
+    ).exists()
+    assert {
+        registration.digest
+        for registration in RepositoryManifestDigest.select().where(
+            RepositoryManifestDigest.repository == repository_row,
+            RepositoryManifestDigest.manifest == artifact_row,
+        )
+    } == {artifact["external_digest"], artifact_sha384}
+
+
+def test_story14_fallback_index_delete_refreshes_primed_referrers_cache(client, app):
+    repository = "devtable/simple"
+    subject = _sha512_single_manifest(
+        repository,
+        b"story14 fallback referrer subject",
+        algorithm="sha512",
+    )
+    subject["media_type"] = DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE
+    fallback_artifact = _sha512_single_manifest(
+        repository,
+        b"story14 fallback-only artifact",
+        algorithm="sha384",
+    )
+    fallback_index = _manifest_index(
+        [
+            {
+                "media_type": DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE,
+                "bytes": fallback_artifact["bytes"],
+                "descriptor_digest": fallback_artifact["external_digest"],
+                "architecture": "amd64",
+            }
+        ],
+        algorithm="sha512",
+    )
+    fallback_tag = subject["external_digest"].replace(":", "-", 1)
+    cache = InMemoryDataModelCache(TEST_CACHE_CONFIG)
+    pull_headers = _manifest_auth_headers(repository, actions=("pull",))
+
+    with (
+        patch.dict(
+            realapp.config,
+            {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384", "sha512"]},
+        ),
+        patch("endpoints.v2.manifest.model_cache", cache),
+        patch("endpoints.v2.referrers.model_cache", cache),
+        toggle_feature("REFERRERS_API", True),
+    ):
+        _put_manifest(
+            client,
+            repository,
+            subject["external_digest"],
+            subject,
+            tag="story14-fallback-subject",
+        )
+        _put_manifest(
+            client,
+            repository,
+            fallback_artifact["external_digest"],
+            fallback_artifact,
+        )
+        _put_manifest(
+            client,
+            repository,
+            fallback_index["external_digest"],
+            fallback_index,
+            tag=fallback_tag,
+        )
+
+        primed = conduct_call(
+            client,
+            "v2.list_manifest_referrers",
+            url_for,
+            "GET",
+            {"repository": repository, "manifest_ref": subject["external_digest"]},
+            headers=pull_headers.copy(),
+        )
+        assert [descriptor["digest"] for descriptor in primed.get_json()["manifests"]] == [
+            fallback_artifact["external_digest"]
+        ]
+
+        conduct_call(
+            client,
+            "v2.delete_manifest_by_digest",
+            url_for,
+            "DELETE",
+            {"repository": repository, "manifest_ref": fallback_index["external_digest"]},
+            expected_code=202,
+            headers=_manifest_auth_headers(repository),
+        )
+
+        refreshed = conduct_call(
+            client,
+            "v2.list_manifest_referrers",
+            url_for,
+            "GET",
+            {"repository": repository, "manifest_ref": subject["external_digest"]},
+            headers=pull_headers.copy(),
+        )
+        assert refreshed.get_json()["manifests"] == []
 
 
 def test_delete_manifest_by_tag_immutable_returns_409(client, app):

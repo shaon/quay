@@ -763,7 +763,9 @@ def delete_tags_for_manifest(manifest):
     with db_transaction():
         # Read alive tags inside the transaction so a tag retargeted/created onto
         # this manifest between an earlier read and Cosign expiry cannot be missed.
-        query = filter_to_alive_tags(Tag.select().where(Tag.manifest == manifest))
+        query = filter_to_alive_tags(
+            Tag.select().where(Tag.manifest == manifest), allow_hidden=True
+        )
         tags = list(query)
 
         if features.IMMUTABLE_TAGS:
