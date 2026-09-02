@@ -26,6 +26,7 @@ from data.database import (
     ManifestLabel,
     ManifestPullStatistics,
     MediaType,
+    RepositoryBlobDigest,
     RepositoryManifestDigest,
     Tag,
     TagNotificationSuccess,
@@ -612,6 +613,52 @@ def test_garbage_collect_storage(default_tag_policy, initialized_db):
             assert storage.exists(
                 {preferred}, storage.blob_path(uploadedblob.blob.content_checksum)
             )
+
+
+def test_story15_purge_repository_removes_digest_registrations(default_tag_policy, initialized_db):
+    repository = model.repository.create_repository("devtable", "newrepo", None)
+    survivor = model.repository.create_repository("devtable", "story15-survivor", None)
+    manifest, _ = create_manifest_for_testing(
+        repository, differentiation_field="story15-delete", include_shared_blob=True
+    )
+    repository_blobs = {
+        link.blob for link in ManifestBlob.select().where(ManifestBlob.repository == repository)
+    }
+    shared_blob = next(iter(repository_blobs))
+
+    model.oci.manifest.register_repository_manifest_digest(
+        repository.id, manifest, f"sha512:{manifest.id:0128x}"
+    )
+    for blob_row in repository_blobs:
+        model.oci.blob.register_repository_blob_digest(
+            repository, blob_row, f"sha512:{blob_row.id:0128x}"
+        )
+    survivor_registration = model.oci.blob.register_repository_blob_digest(
+        survivor, shared_blob, f"sha512:{shared_blob.id:0128x}"
+    )
+    UploadedBlob.create(
+        repository=survivor,
+        blob=shared_blob,
+        expires_at=datetime.utcnow() + timedelta(days=1),
+    )
+
+    repository_id = repository.id
+    shared_blob_id = shared_blob.id
+
+    assert model.gc.purge_repository(repository, force=True)
+
+    assert (
+        not RepositoryManifestDigest.select()
+        .where(RepositoryManifestDigest.repository == repository_id)
+        .exists()
+    )
+    assert (
+        not RepositoryBlobDigest.select()
+        .where(RepositoryBlobDigest.repository == repository_id)
+        .exists()
+    )
+    assert RepositoryBlobDigest.get_by_id(survivor_registration.id).repository_id == survivor.id
+    assert ImageStorage.get_by_id(shared_blob_id).content_checksum.startswith("sha256:")
 
 
 def test_purge_repository_storage_blob(default_tag_policy, initialized_db):

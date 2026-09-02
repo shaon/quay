@@ -1,22 +1,21 @@
-import pytest
-
-from app import namespace_gc_queue
-from data import database, model
+from app import repository_gc_queue
+from data import model
 from data.database import (
-    Manifest,
     ManifestBlob,
+    Repository,
     RepositoryBlobDigest,
     RepositoryManifestDigest,
 )
+from data.model.oci.test.test_oci_manifest import create_manifest_for_testing
 from test.fixtures import *
-from workers.namespacegcworker import NamespaceGCWorker
+from workers.repositorygcworker import RepositoryGCWorker
 
 
-def test_story15_gc_namespace(initialized_db):
-    namespace = model.user.get_namespace_user("buynlarge")
-    repository = model.repository.get_repository("buynlarge", "orgrepo")
-    manifest = Manifest.select().where(Manifest.repository == repository).first()
-    assert manifest is not None
+def test_story15_gc_repository_removes_digest_registrations(initialized_db):
+    repository = model.repository.create_repository("devtable", "newrepo", None)
+    manifest, _ = create_manifest_for_testing(
+        repository, differentiation_field="story15-repository-worker", include_shared_blob=True
+    )
     model.oci.manifest.register_repository_manifest_digest(
         repository.id, manifest, f"sha512:{manifest.id:0128x}"
     )
@@ -26,9 +25,10 @@ def test_story15_gc_namespace(initialized_db):
         )
 
     repository_id = repository.id
-    marker_id = model.user.mark_namespace_for_deletion(namespace, [], namespace_gc_queue)
+    marker_id = model.repository.mark_repository_for_deletion(
+        "devtable", "newrepo", repository_gc_queue
+    )
 
-    assert not database.User.get(id=namespace).enabled
     assert (
         RepositoryManifestDigest.select()
         .where(RepositoryManifestDigest.repository == repository_id)
@@ -40,10 +40,10 @@ def test_story15_gc_namespace(initialized_db):
         .exists()
     )
 
-    worker = NamespaceGCWorker(None)
+    worker = RepositoryGCWorker(None)
     worker._perform_gc({"marker_id": marker_id})
 
-    assert model.user.get_namespace_user("buynlarge") is None
+    assert Repository.get_or_none(Repository.id == repository_id) is None
     assert (
         not RepositoryManifestDigest.select()
         .where(RepositoryManifestDigest.repository == repository_id)

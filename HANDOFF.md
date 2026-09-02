@@ -32,9 +32,11 @@ The feature supports repository-visible SHA-256, SHA-384, and SHA-512 identities
 - Pre-Story 14 subject: `NO-ISSUE: fix(registry): preserve legacy SHA-256 identities`.
 - Story 14 changes make registered manifest deletion include hidden lifecycle tags, suppress deleted native referrers, and invalidate native and fallback referrer caches. No schema, migration, configuration, blob unlink, repository/namespace cleanup, upload expiration, garbage collection, proxy, mirror, import, or Docker schema 1 alternative-identity behavior changed.
 - Story 14 implementation commit: `796bfeba39cdf66c99f41e9e5675e8f149f15365` (`NO-ISSUE: fix(registry): delete registered digest content`).
-- The validation-record correction is committed with subject `NO-ISSUE: docs(registry): correct Story 14 validation record`. Its hash cannot be embedded in its own Git preimage; use `git rev-parse HEAD` and verify the subject.
-- Expected target status after the validation-record commit: clean, with no staged, unstaged, or untracked files.
-- The planning repository had unrelated modified and untracked files before this update. This session changed only its current-session `.PITASKS.md` section and Story 14 status and evidence in `TODO.md`. The planning repository was not committed. `PQC-Features.md` was unchanged because the accepted capability boundary did not change.
+- Story 14 validation-record commit and pre-Story 15 HEAD: `897b55bd15786ebd21f761b6de83f90593803b59` (`NO-ISSUE: docs(registry): correct Story 14 validation record`).
+- Story 15 removes target-repository blob registrations before canonical storage collection and removes residual target-repository manifest registrations before repository deletion. Repository and namespace marking still preserve registrations until their queued purge runs. No upload expiration, ordinary garbage-collection policy, physical orphan recovery, schema, migration, proxy, mirror, import, or Docker schema 1 alternative-identity behavior changed.
+- The Story 15 implementation is committed with subject `NO-ISSUE: fix(gc): remove repository digest registrations`. Its hash cannot be embedded in its own Git preimage; use `git rev-parse HEAD` and verify the subject.
+- Expected target status after the Story 15 commit: clean, with no staged, unstaged, or untracked files.
+- The planning repository had unrelated modified and untracked files before this update. This session changed only its current-session `.PITASKS.md` section and Story 15 status and evidence in `TODO.md`. The planning repository was not committed. `PQC-Features.md` was unchanged because the accepted capability boundary did not change.
 
 ## Delivery status
 
@@ -52,7 +54,8 @@ The feature supports repository-visible SHA-256, SHA-384, and SHA-512 identities
 - Story 12: **Deferred** with external image import.
 - Story 13: **Done**.
 - Story 14: **Done**.
-- Recommended next work: **Story 15, remove digest registrations during repository and namespace deletion**.
+- Story 15: **Done**.
+- Recommended next work: **Story 16, expire abandoned uploads and remove persisted hash state**.
 
 Do not change Story 1 or Story 2 merely because later stories depend on their behavior.
 
@@ -69,7 +72,7 @@ Do not change Story 1 or Story 2 merely because later stories depend on their be
 9. Cache invalidation happens only after lifecycle transactions commit.
 10. Mirror-managed repositories retain their existing SHA-256-only ingestion boundary until a later story changes it.
 
-## Completed behavior through Story 10
+## Completed behavior
 
 ### Stories 1-6 foundations
 
@@ -136,6 +139,15 @@ Do not change Story 1 or Story 2 merely because later stories depend on their be
 - Manifest registrations, canonical manifests, graph links, blobs, and blob registrations remain for later lifecycle garbage collection. Story 14 does not remove canonical content physically.
 - Arbitrary blob DELETE remains HTTP 405 `UNSUPPORTED` for registered and disabled identities because unlinking a referenced blob would corrupt manifest graphs. It does not mutate registrations, upload links, or bytes.
 - Strict malformed/unsupported errors, unknown-content behavior, write authorization, repository isolation, immutable-tag behavior, and normal SHA-256 deletion remain intact.
+
+### Story 15 repository and namespace registration cleanup
+
+- Repository marking, namespace marking, and namespace grace periods retain digest registrations while content remains recoverable. Cleanup begins only when the repository GC path actually purges the hidden repository.
+- Repository purge removes every `RepositoryBlobDigest` row owned by the target before attempting canonical `ImageStorage` collection, preventing registration foreign keys from blocking cleanup.
+- Per-manifest cleanup retains `RepositoryManifestDigest` rows long enough to address all registered scanner identities, then removes them with each manifest. A final repository-scoped sweep removes residual legacy or inconsistent manifest registrations before repository deletion.
+- Namespace GC bulk-marks its repositories and sends each through the same repository purge invariant. Both dedicated repository and namespace workers are covered.
+- Cleanup is repository-scoped and retry-safe. Registrations owned by unrelated repositories and shared canonical SHA-256 storage still referenced outside the deleted repository remain unchanged.
+- No active algorithm allowlist is consulted for lifecycle cleanup. No registration is remapped, and canonical SHA-256 remains Quay's internal storage identity.
 
 ## Story 8 root causes and changed files
 
@@ -225,6 +237,27 @@ Documentation changed:
 - `HANDOFF.md`
 
 No schema or migration changed. Blob unlink remained explicitly unsupported.
+
+## Story 15 root cause and changed files
+
+The registration tables have non-cascading foreign keys, while recursive repository deletion deliberately skips both registration models. Manifest GC already removed manifest registrations one manifest at a time, but repository purge never removed blob registrations before deleting canonical `ImageStorage`. Real placed blobs therefore raised a foreign-key failure and interrupted both dedicated repository GC and namespace GC. Placeholder-only model data could avoid the storage delete and complete through Peewee dependency cleanup, masking the production path gap.
+
+Production file changed:
+
+- `data/model/gc.py`
+
+Test files changed:
+
+- `data/model/test/test_gc.py`
+- `data/model/test/test_user.py`
+- `workers/test/test_namespacegcworker.py`
+- `workers/test/test_repositorygcworker.py`
+
+Documentation changed:
+
+- `HANDOFF.md`
+
+No schema or migration changed.
 
 ## Verification evidence
 
@@ -402,6 +435,40 @@ Final SHA-256 registry deletion and deleted-digest pull selection after the last
 
 Result: **18 passed, 1,441 deselected**.
 
+### Story 15 tests
+
+The first characterization command used the final focused selection but produced **3 test-defect failures and 75 deselections** because a reused manifest fixture helper is fixed to `devtable/newrepo`; it could not populate the differently named repositories. No production conclusion was drawn from that run. After correcting only test setup, the same selection produced **3 product failures, 1 pass, and 74 deselections**. Dedicated repository purge and both worker paths raised `peewee.IntegrityError: FOREIGN KEY constraint failed` while deleting `ImageStorage` referenced by `RepositoryBlobDigest`. The placeholder-storage namespace model case passed because existing storage cleanup deliberately defers placeholders.
+
+Final focused SQLite coverage:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/test/test_gc.py data/model/test/test_user.py workers/test/test_repositorygcworker.py workers/test/test_namespacegcworker.py -k story15`
+
+Result: **4 passed, 74 deselected**.
+
+Focused PostgreSQL coverage:
+
+`TEST=true TEST_DATABASE_URI='postgresql://quay:quay@localhost:5432/quay' PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/test/test_gc.py data/model/test/test_user.py workers/test/test_repositorygcworker.py workers/test/test_namespacegcworker.py -k story15`
+
+Result: **4 passed, 74 deselected**.
+
+Complete affected model and worker suites:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/test/test_gc.py data/model/test/test_user.py workers/test/test_repositorygcworker.py workers/test/test_namespacegcworker.py`
+
+Result: **78 passed**.
+
+Complete repository API endpoint and model-adapter suites:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/api/test/test_repository.py endpoints/api/test/test_repository_models_pre_oci.py`
+
+Result: **49 passed**.
+
+SHA-256 registry deletion regressions:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings test/registry/registry_tests.py -k 'test_delete_manifest or test_attempt_pull_by_manifest_digest_for_deleted_tag'`
+
+Result: **18 passed, 1,441 deselected**.
+
 ### Static checks
 
 Pre-commit passed over every Story 8 target-worktree file. Earlier passes reformatted Python with Black; the final pass made no changes.
@@ -433,6 +500,20 @@ Result: **passed**, no issues in three source files.
 Story 14 compilation and whitespace:
 
 `.venv/bin/python -m compileall -q data/model/oci/tag.py data/model/oci/test/test_oci_tag.py data/registry_model/registry_oci_model.py endpoints/v2/manifest.py endpoints/v2/test/test_blob.py endpoints/v2/test/test_manifest.py && git diff --check && git diff --check master`
+
+Result: **passed**.
+
+Story 15 pre-commit passed over all six changed Quay files. The first run reformatted and reordered imports in the five Python files; the final run made no changes.
+
+Story 15 targeted mypy:
+
+`.venv/bin/mypy data/model/gc.py`
+
+Result: **passed**, no issues in the production file.
+
+Story 15 compilation and whitespace:
+
+`.venv/bin/python -m compileall -q data/model/gc.py data/model/test/test_gc.py data/model/test/test_user.py workers/test/test_namespacegcworker.py workers/test/test_repositorygcworker.py && git diff --check && git diff --check upstream/master`
 
 Result: **passed**.
 
@@ -539,14 +620,25 @@ Live outcomes:
 
 Container restarts produced transient connection resets and one three-second readiness-probe timeout before health returned 200; no registry operation failed. The first read-only `psql -c` command incorrectly assumed client-variable expansion and failed before querying; the corrected literal-safe command passed. This was a validation-script defect, not a product failure. The live repository was not deleted because repository cleanup is Story 15.
 
+## Live Story 15 validation
+
+The running `quay-quay` container was bind-mounted from the target worktree. Instance health returned HTTP 200, and local PostgreSQL was accepting connections. Two pre-existing disposable repositories were purged through the real `mark_repository_for_deletion` and `RepositoryGCWorker._perform_gc` path.
+
+- `testuser/pqc-story14-live-1788331630` had five manifest registrations and six blob registrations before marking. Marking retained all registrations. Worker purge removed the repository and all eleven target rows while leaving every unrelated manifest and blob registration count unchanged.
+- The Story 14 purge attempted existing security-scanner report cleanup, but the optional local scanner at `localhost:6000` was unavailable. The existing cleanup code logged and tolerated those environment failures; repository and registration cleanup completed.
+- `testuser/pqc-story5-destination-01a05e37` had one blob registration pointing to canonical `ImageStorage` shared with another repository. Marking retained it. Worker purge removed the target repository and registration, preserved every unrelated registration, preserved the other repository's registration, and retained the shared canonical SHA-256 storage row.
+- Queue rows created by the direct validation scripts were removed after synchronous worker invocation.
+
+The first read-only repository inventory script called the guarded `FullIndexedCharField.startswith` operation and failed before querying. The corrected script used `match_prefix` and passed. This was a validation-script defect. Later five-second and fifteen-second health probes timed out while the container remained running; restarting only `quay-quay` restored HTTP 200 health on the sixth two-second retry. This was a local environment failure after the successful registry cleanup, not a product-test failure. No live namespace was destroyed; the namespace worker path passed against both SQLite and PostgreSQL test databases.
+
 ## Active limitations and deferred work
 
 - Proxy cache, repository mirroring, organization mirroring, external image import, and all related external-registry or live interoperability validation are explicitly deferred until reassigned.
 - Story 9 remains unimplemented. A partial Story 9 attempt was fully reverted before this handoff update.
 - Complete-image copy is supported only between normal repositories managed by the same Quay deployment while the external-registry deferral is active. Artifact-copy and referrer-copy variations remain unvalidated.
 - Builds, Clair, UI, garbage collection, conformance, and operational tooling remain later stories.
-- Full blob unlink, upload expiration, repository or namespace deletion, registration cleanup, and physical orphan cleanup remain lifecycle work.
-- Story 14 expires manifest lifecycle tags but intentionally leaves registrations, canonical rows, graph links, and bytes for later garbage collection. Arbitrary blob DELETE remains unsupported.
+- Full blob unlink, upload expiration, ordinary registration-aware garbage collection, and physical orphan cleanup remain lifecycle work. Repository and namespace purge now remove their repository-scoped registrations.
+- Story 14 expires manifest lifecycle tags but intentionally leaves registrations, canonical rows, graph links, and bytes until repository deletion or later garbage collection. Arbitrary blob DELETE remains unsupported.
 - PostgreSQL blob and manifest registration races passed again in Story 13; MySQL concurrency remains unrun.
 - SHA-384 resumable hashing passed on local macOS arm64 and an existing Linux aarch64 image. Clean Linux builds, Linux x86_64 packaging, and cross-architecture resume remain unproven.
 - Podman and Skopeo rejected SHA-384 manifest pulls client-side in earlier tests; client interoperability remains tool-specific.
@@ -555,6 +647,6 @@ Container restarts produced transient connection resets and one three-second rea
 
 ## Recommended next story
 
-Proceed with **Story 15: remove digest registrations during repository and namespace deletion**.
+Proceed with **Story 16: expire abandoned uploads and remove persisted hash state**.
 
-Start with characterization of repository and namespace deletion across all `RepositoryBlobDigest` and `RepositoryManifestDigest` rows. Keep upload expiration, garbage collection, physical orphan cleanup, Docker schema 1 alternative identities, and deferred integrations outside Story 15 unless the tracker is deliberately revised.
+Start with characterization of upload cancellation and expiration across `BlobUpload.requested_digest_algorithm` and `BlobUpload.requested_digest_state`, including retry and legacy-session behavior. Keep ordinary garbage collection, physical orphan recovery, Docker schema 1 alternative identities, and deferred integrations outside Story 16 unless the tracker is deliberately revised.

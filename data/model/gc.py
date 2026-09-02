@@ -23,6 +23,7 @@ from data.database import (
     RepositoryActionCount,
     RepositoryAuthorizedEmail,
     RepositoryAutoPrunePolicy,
+    RepositoryBlobDigest,
     RepositoryBuild,
     RepositoryBuildTrigger,
     RepositoryManifestDigest,
@@ -88,14 +89,30 @@ def purge_repository(repo, force=False):
         repo.state = RepositoryState.MARKED_FOR_DELETION
         repo.save()
 
-    # GC to remove the images and storage.
+    # Blob registrations must be removed before canonical storage is collected because they hold
+    # foreign keys to ImageStorage. The repository is already hidden and immutable at this point,
+    # so an interrupted purge can safely retry after these repository-scoped aliases are gone.
+    _chunk_delete_all(repo, RepositoryBlobDigest, force=force)
+
+    # GC to remove the images and storage. Manifest registrations remain available until each
+    # manifest is collected so security-scanner cleanup can address every registered identity.
     _purge_repository_contents(repo)
 
-    # Ensure there are no additional tags, manifests, images or blobs in the repository.
+    # Normal manifest GC removes registrations with each manifest. Remove any residual rows owned
+    # by this repository before deleting it, including rows left by legacy or inconsistent data.
+    _chunk_delete_all(repo, RepositoryManifestDigest, force=force)
+
+    # Ensure there are no additional tags, manifests, images, blobs or digest registrations in the
+    # repository.
     assert Tag.select().where(Tag.repository == repo).count() == 0
     assert Manifest.select().where(Manifest.repository == repo).count() == 0
     assert ManifestBlob.select().where(ManifestBlob.repository == repo).count() == 0
     assert UploadedBlob.select().where(UploadedBlob.repository == repo).count() == 0
+    assert RepositoryBlobDigest.select().where(RepositoryBlobDigest.repository == repo).count() == 0
+    assert (
+        RepositoryManifestDigest.select().where(RepositoryManifestDigest.repository == repo).count()
+        == 0
+    )
     assert (
         ManifestSecurityStatus.select().where(ManifestSecurityStatus.repository == repo).count()
         == 0

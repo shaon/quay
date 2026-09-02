@@ -11,6 +11,10 @@ from data.database import (
     DeletedNamespace,
     EmailConfirmation,
     FederatedLogin,
+    ImageStorage,
+    Manifest,
+    ManifestBlob,
+    MediaType,
     NamespaceNotification,
     OrgMirrorConfig,
     OrgMirrorRepository,
@@ -18,6 +22,8 @@ from data.database import (
     QueueItem,
     QuotaNotificationState,
     Repository,
+    RepositoryBlobDigest,
+    RepositoryManifestDigest,
     RepositoryState,
     SourceRegistryType,
     Team,
@@ -333,6 +339,76 @@ def test_delete_namespace_via_marker(initialized_db):
 
     with pytest.raises(DeletedNamespace.DoesNotExist):
         DeletedNamespace.get(id=marker_id)
+
+
+def test_story15_delete_namespace_removes_all_repository_digest_registrations(initialized_db):
+    user = create_user_noverify("story15namespace", "story15@example.com", email_required=False)
+    repositories = [
+        create_repository("story15namespace", "first", user),
+        create_repository("story15namespace", "second", user),
+    ]
+
+    media_type = MediaType.select().first()
+    for repository in repositories:
+        canonical_blob_digest = f"sha256:{repository.id:064x}"
+        blob = ImageStorage.create(
+            image_size=2,
+            uploading=False,
+            content_checksum=canonical_blob_digest,
+        )
+        canonical_manifest_digest = f"sha256:{repository.id + 1000:064x}"
+        manifest = Manifest.create(
+            repository=repository,
+            digest=canonical_manifest_digest,
+            media_type=media_type,
+            manifest_bytes="{}",
+        )
+        ManifestBlob.create(repository=repository, manifest=manifest, blob=blob)
+        model.oci.manifest.register_repository_manifest_digest(
+            repository.id, manifest, f"sha512:{manifest.id:0128x}"
+        )
+        model.oci.blob.register_repository_blob_digest(repository, blob, f"sha512:{blob.id:0128x}")
+
+    survivor = create_repository("devtable", "story15-namespace-survivor", None)
+    survivor_manifest = Manifest.create(
+        repository=survivor,
+        digest=f"sha256:{survivor.id + 1000:064x}",
+        media_type=media_type,
+        manifest_bytes="{}",
+    )
+    survivor_registration = model.oci.manifest.register_repository_manifest_digest(
+        survivor.id, survivor_manifest, f"sha512:{survivor_manifest.id:0128x}"
+    )
+
+    repository_ids = [repository.id for repository in repositories]
+    queue = WorkQueue("story15namespacegc", lambda db: db.transaction())
+    marker_id = mark_namespace_for_deletion(user, [], queue, available_after=86400)
+
+    assert (
+        RepositoryManifestDigest.select()
+        .where(RepositoryManifestDigest.repository.in_(repository_ids))
+        .exists()
+    )
+    assert (
+        RepositoryBlobDigest.select()
+        .where(RepositoryBlobDigest.repository.in_(repository_ids))
+        .exists()
+    )
+
+    with check_transitive_modifications():
+        assert delete_namespace_via_marker(marker_id, [])
+
+    assert (
+        not RepositoryManifestDigest.select()
+        .where(RepositoryManifestDigest.repository.in_(repository_ids))
+        .exists()
+    )
+    assert (
+        not RepositoryBlobDigest.select()
+        .where(RepositoryBlobDigest.repository.in_(repository_ids))
+        .exists()
+    )
+    assert RepositoryManifestDigest.get_by_id(survivor_registration.id).repository_id == survivor.id
 
 
 def test_delete_namespace_cleans_up_notifications(initialized_db):
