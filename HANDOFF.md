@@ -31,8 +31,9 @@ The feature supports repository-visible SHA-256, SHA-384, and SHA-512 identities
 - Pre-Story 14 HEAD: `943ac2c12dff1bbc8d6310886b5ab81747e29ca4`.
 - Pre-Story 14 subject: `NO-ISSUE: fix(registry): preserve legacy SHA-256 identities`.
 - Story 14 changes make registered manifest deletion include hidden lifecycle tags, suppress deleted native referrers, and invalidate native and fallback referrer caches. No schema, migration, configuration, blob unlink, repository/namespace cleanup, upload expiration, garbage collection, proxy, mirror, import, or Docker schema 1 alternative-identity behavior changed.
-- Story 14 is committed with subject `NO-ISSUE: fix(registry): delete registered digest content`. Its hash cannot be embedded in its own Git preimage; use `git rev-parse HEAD` and verify the subject.
-- Expected target status after the Story 14 commit: clean, with no staged, unstaged, or untracked files.
+- Story 14 implementation commit: `796bfeba39cdf66c99f41e9e5675e8f149f15365` (`NO-ISSUE: fix(registry): delete registered digest content`).
+- The validation-record correction is committed with subject `NO-ISSUE: docs(registry): correct Story 14 validation record`. Its hash cannot be embedded in its own Git preimage; use `git rev-parse HEAD` and verify the subject.
+- Expected target status after the validation-record commit: clean, with no staged, unstaged, or untracked files.
 - The planning repository had unrelated modified and untracked files before this update. This session changed only its current-session `.PITASKS.md` section and Story 14 status and evidence in `TODO.md`. The planning repository was not committed. `PQC-Features.md` was unchanged because the accepted capability boundary did not change.
 
 ## Delivery status
@@ -357,7 +358,7 @@ Initial characterization from the Quay worktree:
 
 `TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/oci/test/test_oci_tag.py endpoints/v2/test/test_manifest.py endpoints/v2/test/test_blob.py -k story14`
 
-Result: **4 failed, 5 passed, 241 deselected**. Three failures demonstrated product gaps: hidden lifecycle tags survived deletion, an untagged registered artifact returned `MANIFEST_UNKNOWN`, and a deleted fallback index remained in a primed referrer cache. One failure was a test defect that passed a database `Repository` row to an API expecting `RepositoryReference`; deletion itself had succeeded. The first attempted command was run from the planning directory and could not find `.venv/bin/python`; it did not execute tests.
+Result: **4 failed, 5 passed, 241 deselected**. Two failures demonstrated product gaps: an untagged registered artifact returned `MANIFEST_UNKNOWN`, and a deleted fallback index remained in a primed referrer cache. Two failures were test defects: one helper created a repository under a name different from the fixture helper's fixed lookup, and one assertion passed a database `Repository` row to an API expecting `RepositoryReference` after deletion had succeeded. After those test defects and the first production gaps were corrected, a later focused run exposed the additional product gap that native referrer hydration did not recheck deleted-artifact reachability. Code tracing and the corrected model characterization also confirmed that hidden lifecycle tags had to be included in deletion. The first attempted command was run from the planning directory and could not find `.venv/bin/python`; it did not execute tests.
 
 Final focused SQLite coverage:
 
