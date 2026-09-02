@@ -2,6 +2,7 @@ import hashlib
 import json
 import random
 import string
+from unittest.mock import patch
 
 import pytest
 from playhouse.test_utils import assert_query_count
@@ -18,6 +19,8 @@ from data.database import (
     ManifestSecurityStatus,
     RepositoryManifestDigest,
     Tag,
+    db,
+    db_transaction,
     get_epoch_timestamp_ms,
 )
 from data.model import ManifestDigestConflictException
@@ -57,6 +60,9 @@ def test_lookup_manifest(initialized_db):
         found = True
         repo = tag.repository
         digest = tag.manifest.digest
+        # The first lookup may lazily register legacy SHA-256. Once materialized, preserve the
+        # one-query manifest read path.
+        assert lookup_manifest(repo, digest) == tag.manifest
         with assert_query_count(1):
             assert lookup_manifest(repo, digest) == tag.manifest
 
@@ -65,6 +71,7 @@ def test_lookup_manifest(initialized_db):
     for tag in Tag.select():
         repo = tag.repository
         digest = tag.manifest.digest
+        assert lookup_manifest(repo, digest, allow_dead=True) == tag.manifest
         with assert_query_count(1):
             assert lookup_manifest(repo, digest, allow_dead=True) == tag.manifest
 
@@ -100,6 +107,55 @@ def test_alternative_manifest_registration_preserves_visible_legacy_sha256(
             RepositoryManifestDigest.manifest == manifest,
         )
     } == {manifest.digest, alternative_digest}
+
+
+def test_story13_legacy_manifest_registration_is_atomic_and_idempotent(initialized_db):
+    tag = filter_to_alive_tags(Tag.select()).where(Tag.hidden == False).get()  # noqa: E712
+    manifest = tag.manifest
+    RepositoryManifestDigest.delete().where(
+        RepositoryManifestDigest.repository == manifest.repository,
+        RepositoryManifestDigest.manifest == manifest,
+    ).execute()
+    previous_transaction_factory = db_transaction.obj
+    db_transaction.initialize(lambda: db.atomic())
+    try:
+        with (
+            patch(
+                "data.model.oci.manifest.create_temporary_tag_if_necessary",
+                side_effect=RuntimeError("forced availability failure"),
+            ),
+            pytest.raises(RuntimeError, match="forced availability failure"),
+        ):
+            lookup_manifest(
+                manifest.repository_id,
+                manifest.digest,
+                allow_hidden=True,
+                require_available=True,
+            )
+    finally:
+        db_transaction.initialize(previous_transaction_factory)
+
+    assert (
+        not RepositoryManifestDigest.select()
+        .where(
+            RepositoryManifestDigest.repository == manifest.repository,
+            RepositoryManifestDigest.manifest == manifest,
+        )
+        .exists()
+    )
+
+    assert lookup_manifest(manifest.repository_id, manifest.digest, allow_hidden=True) == manifest
+    assert lookup_manifest(manifest.repository_id, manifest.digest, allow_hidden=True) == manifest
+    assert (
+        RepositoryManifestDigest.select()
+        .where(
+            RepositoryManifestDigest.repository == manifest.repository,
+            RepositoryManifestDigest.manifest == manifest,
+            RepositoryManifestDigest.digest == manifest.digest,
+        )
+        .count()
+        == 1
+    )
 
 
 @pytest.mark.parametrize("algorithm", ["sha384", "sha512"])

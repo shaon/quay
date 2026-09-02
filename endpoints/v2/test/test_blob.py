@@ -1499,6 +1499,206 @@ def test_repeated_alternative_monolithic_upload_deduplicates(algorithm, client, 
     )
 
 
+@pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
+def test_story13_legacy_blob_sha256_compatibility(algorithm, client, app):
+    repository = "devtable/simple"
+    other_repository = "devtable/complex"
+    repository_row = model.repository.get_repository("devtable", "simple")
+    other_repository_row = model.repository.get_repository("devtable", "complex")
+    content = f"story13 legacy blob {algorithm}".encode("utf-8")
+    canonical_digest = "sha256:" + hashlib.sha256(content).hexdigest()
+    alternative_digest = f"{algorithm}:" + hashlib.new(algorithm, content).hexdigest()
+    blob = model.blob.store_blob_record_and_temp_link_in_repo(
+        repository_row.id,
+        canonical_digest,
+        ImageStorageLocation.get(name="local_us"),
+        len(content),
+        3600,
+    )
+    storage.put_content(["local_us"], get_layer_path(blob), content)
+    headers = _blob_auth_headers(repository, destination_actions=("pull",))
+    test_cache = InMemoryDataModelCache(TEST_CACHE_CONFIG)
+
+    assert (
+        not RepositoryBlobDigest.select()
+        .where(
+            RepositoryBlobDigest.repository == repository_row,
+            RepositoryBlobDigest.image_storage == blob,
+        )
+        .exists()
+    )
+
+    for method, endpoint in (("GET", "v2.download_blob"), ("HEAD", "v2.check_blob_exists")):
+        conduct_call(
+            client,
+            endpoint,
+            url_for,
+            method,
+            {"repository": repository, "digest": canonical_digest},
+            expected_code=401,
+        )
+
+    with patch.dict(realapp.config, {"ALLOWED_HASH_ALGORITHMS": [algorithm]}):
+        for method, endpoint in (
+            ("GET", "v2.download_blob"),
+            ("HEAD", "v2.check_blob_exists"),
+        ):
+            disabled = conduct_call(
+                client,
+                endpoint,
+                url_for,
+                method,
+                {"repository": repository, "digest": canonical_digest},
+                expected_code=400,
+                headers=headers.copy(),
+            )
+            if method == "GET":
+                assert disabled.get_json()["errors"][0]["detail"] == {
+                    "algorithm": "sha256",
+                    "reason": "disabled",
+                }
+
+    assert (
+        not RepositoryBlobDigest.select()
+        .where(
+            RepositoryBlobDigest.repository == repository_row,
+            RepositoryBlobDigest.image_storage == blob,
+        )
+        .exists()
+    )
+
+    with (
+        patch.dict(realapp.config, {"ALLOWED_HASH_ALGORITHMS": ["sha256", algorithm]}),
+        patch("endpoints.v2.blob.model_cache", test_cache),
+    ):
+        for _ in range(2):
+            get_response = conduct_call(
+                client,
+                "v2.download_blob",
+                url_for,
+                "GET",
+                {"repository": repository, "digest": canonical_digest},
+                expected_code=200,
+                headers=headers.copy(),
+            )
+            head_response = conduct_call(
+                client,
+                "v2.check_blob_exists",
+                url_for,
+                "HEAD",
+                {"repository": repository, "digest": canonical_digest},
+                expected_code=200,
+                headers=headers.copy(),
+            )
+            assert get_response.data == content
+            assert get_response.headers["Docker-Content-Digest"] == canonical_digest
+            assert head_response.data == b""
+            assert head_response.headers["Docker-Content-Digest"] == canonical_digest
+            assert head_response.headers["Content-Length"] == str(len(content))
+
+        registration = RepositoryBlobDigest.get(
+            repository=repository_row,
+            digest=canonical_digest,
+        )
+        assert registration.image_storage_id == blob.id
+        assert (
+            RepositoryBlobDigest.select()
+            .where(
+                RepositoryBlobDigest.repository == repository_row,
+                RepositoryBlobDigest.digest == canonical_digest,
+            )
+            .count()
+            == 1
+        )
+
+        for method, endpoint in (
+            ("GET", "v2.download_blob"),
+            ("HEAD", "v2.check_blob_exists"),
+        ):
+            conduct_call(
+                client,
+                endpoint,
+                url_for,
+                method,
+                {"repository": other_repository, "digest": canonical_digest},
+                expected_code=404,
+                headers=_blob_auth_headers(other_repository, destination_actions=("pull",)),
+            )
+        assert (
+            not RepositoryBlobDigest.select()
+            .where(
+                RepositoryBlobDigest.repository == other_repository_row,
+                RepositoryBlobDigest.digest == canonical_digest,
+            )
+            .exists()
+        )
+
+        model.oci.blob.register_repository_blob_digest(
+            repository_row,
+            blob,
+            alternative_digest,
+        )
+        for digest in (canonical_digest, alternative_digest):
+            for method, endpoint in (
+                ("GET", "v2.download_blob"),
+                ("HEAD", "v2.check_blob_exists"),
+            ):
+                response = conduct_call(
+                    client,
+                    endpoint,
+                    url_for,
+                    method,
+                    {"repository": repository, "digest": digest},
+                    expected_code=200,
+                    headers=headers.copy(),
+                )
+                assert response.headers["Docker-Content-Digest"] == digest
+                assert response.data == (content if method == "GET" else b"")
+
+        with patch.dict(realapp.config, {"ALLOWED_HASH_ALGORITHMS": [algorithm]}):
+            for method, endpoint in (
+                ("GET", "v2.download_blob"),
+                ("HEAD", "v2.check_blob_exists"),
+            ):
+                conduct_call(
+                    client,
+                    endpoint,
+                    url_for,
+                    method,
+                    {"repository": repository, "digest": canonical_digest},
+                    expected_code=400,
+                    headers=headers.copy(),
+                )
+                conduct_call(
+                    client,
+                    endpoint,
+                    url_for,
+                    method,
+                    {"repository": repository, "digest": alternative_digest},
+                    expected_code=200,
+                    headers=headers.copy(),
+                )
+
+        conduct_call(
+            client,
+            "v2.download_blob",
+            url_for,
+            "GET",
+            {"repository": repository, "digest": canonical_digest},
+            expected_code=200,
+            headers=headers.copy(),
+        )
+
+    assert ImageStorage.get_by_id(blob.id).content_checksum == canonical_digest
+    assert {
+        registration.digest
+        for registration in RepositoryBlobDigest.select().where(
+            RepositoryBlobDigest.repository == repository_row,
+            RepositoryBlobDigest.image_storage == blob,
+        )
+    } == {canonical_digest, alternative_digest}
+
+
 def test_blob_lookup_digest_errors_are_precise(client, app):
     repository = "devtable/simple"
     headers = _blob_auth_headers(repository)

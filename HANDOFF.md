@@ -23,15 +23,15 @@ The feature supports repository-visible SHA-256, SHA-384, and SHA-512 identities
 - Branch: `shaon-feature-PQC`
 - Base branch: `master`
 - Base and merge base: `d81004d24669132d45df8fbd1eafc86c149e38fa`
-- Pre-Story 10 HEAD: `229069a0180a43f36f89d25f34a5bd72ad7dab7f`
-- Pre-Story 10 subject: `NO-ISSUE: docs(registry): defer external-registry digest work`
+- Pre-Story 13 HEAD: `2afe0fca9ccb30cd97ed1bb777dfc3c5cdd3865d`
+- Pre-Story 13 subject: `NO-ISSUE: test(registry): validate same-Quay digest copy`
 - Story 7 implementation: `b59c747e7482f174dee81508dd3aca363ef7d7e6`
 - Story 8 implementation: `bc21299727b875af15fa67a689677e69b9f688ff`
 - External-registry deferral: `229069a0180a43f36f89d25f34a5bd72ad7dab7f`
-- Story 10 changes add endpoint coverage and this handoff; no production file, schema, migration, configuration, proxy, mirror, or import path changed.
-- Story 10 validation is committed with subject `NO-ISSUE: test(registry): validate same-Quay digest copy`. Its hash cannot be embedded in its own Git preimage; use `git rev-parse HEAD` and verify the subject.
-- Expected target status after the Story 10 commit: clean, with no staged, unstaged, or untracked files.
-- The planning repository had unrelated modified and untracked files before this update. This session changed only its current-session `.PITASKS.md` section, Story 10 scope in `PQC-Features.md`, and Story 10 status and evidence in `TODO.md`. The planning repository was not committed.
+- Story 13 changes add lazy legacy SHA-256 registration, endpoint and model coverage, and this handoff. No schema, migration, configuration, proxy, mirror, import, or lifecycle path changed.
+- Story 13 is committed with subject `NO-ISSUE: fix(registry): preserve legacy SHA-256 identities`. Its hash cannot be embedded in its own Git preimage; use `git rev-parse HEAD` and verify the subject.
+- Expected target status after the Story 13 commit: clean, with no staged, unstaged, or untracked files.
+- The planning repository had unrelated modified and untracked files before this update. This session changed only its current-session `.PITASKS.md` section and Story 13 status and evidence in `TODO.md`. The planning repository was not committed. `PQC-Features.md` was unchanged because the accepted capability boundary did not change.
 
 ## Delivery status
 
@@ -47,7 +47,8 @@ The feature supports repository-visible SHA-256, SHA-384, and SHA-512 identities
 - Story 10: **Done**, limited to client-mediated copies between normal repositories managed by this Quay deployment.
 - Story 11: **Deferred** with repository and organization mirroring.
 - Story 12: **Deferred** with external image import.
-- Recommended next work: **Story 13, preserve SHA-256 compatibility for legacy registry content**.
+- Story 13: **Done**.
+- Recommended next work: **Story 14, delete content through registered digest identities**.
 
 Do not change Story 1 or Story 2 merely because later stories depend on their behavior.
 
@@ -111,6 +112,16 @@ Do not change Story 1 or Story 2 merely because later stories depend on their be
 - Repeated mount and publication requests are idempotent. Existing authorization, repository isolation, conflict rollback, and hard-disable contracts apply unchanged.
 - Mirror-managed repositories remain SHA-256-only. Mirror workers, external registries, proxy cache, import, and artifact-copy variations are outside Story 10.
 
+### Story 13 legacy SHA-256 compatibility
+
+- A successful canonical SHA-256 blob or manifest lookup materializes the historically valid repository-scoped SHA-256 registration when the repository/content pair has no registrations.
+- Legacy tag resolution materializes the canonical manifest registration only when SHA-256 is enabled and selected for the successful client-visible response.
+- Lazy writes recheck on the primary database, use the existing idempotent unique-index registration helpers, and participate in the caller's transaction. The steady-state registered manifest read remains one query.
+- Legacy single manifests, their configuration and layer blobs, direct digest GET/HEAD, and tag GET/HEAD retain exact bytes and SHA-256 response identities.
+- Adding SHA-384 or SHA-512 identities after lazy registration leaves canonical SHA-256 visible. Registrations and fallback remain repository-scoped.
+- Disabling SHA-256 blocks legacy and explicitly registered SHA-256 reads before cache lookup without deleting registrations or canonical content. Enabled alternative identities remain usable, and re-enabling SHA-256 restores canonical access and tag preference.
+- Unauthorized, malformed, disabled, and unknown requests retain their established registry errors. Normal SHA-256 publication, pull, and mount behavior remains compatible.
+
 ## Story 8 root causes and changed files
 
 The unfinished behavior had six causes:
@@ -148,6 +159,30 @@ Target-worktree files changed:
 - `HANDOFF.md`
 
 The planning repository also received the scoped Story 10 updates described under repository state. No schema or migration changed.
+
+## Story 13 root cause and changed files
+
+The legacy fallback was lookup-only. Before Story 13, canonical SHA-256 content with no registration row remained readable, and publication or mount paths preserved that identity before adding an alternative registration, but successful legacy blob GET/HEAD, manifest GET/HEAD, and tag resolution did not lazily persist the historical SHA-256 identity required by the contract.
+
+Production files changed:
+
+- `data/model/oci/blob.py`
+- `data/model/oci/manifest.py`
+- `data/registry_model/interface.py`
+- `data/registry_model/registry_oci_model.py`
+- `endpoints/v2/manifest.py`
+
+Test files changed:
+
+- `data/model/oci/test/test_oci_manifest.py`
+- `endpoints/v2/test/test_blob.py`
+- `endpoints/v2/test/test_manifest.py`
+
+Documentation changed:
+
+- `HANDOFF.md`
+
+No schema or migration changed.
 
 ## Verification evidence
 
@@ -227,6 +262,54 @@ Relevant SHA-256 registry protocol push, pull, and mount coverage:
 
 Result: **255 passed, 1,204 deselected**.
 
+### Story 13 tests
+
+Initial characterization before production changes:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_blob.py endpoints/v2/test/test_manifest.py -k story13`
+
+Result: **4 failed, 141 deselected**. Legacy content was readable, but no lazy blob or manifest SHA-256 registration was created.
+
+Focused final Story 13 coverage:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_blob.py endpoints/v2/test/test_manifest.py data/model/oci/test/test_oci_manifest.py -k story13`
+
+Result: **5 passed, 164 deselected**.
+
+Complete affected manifest and blob endpoint suites:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py endpoints/v2/test/test_blob.py`
+
+Result: **145 passed**.
+
+Complete relevant OCI manifest model and registry-interface suites:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/oci/test/test_oci_manifest.py data/registry_model/test/test_interface.py`
+
+Result: **144 passed, 2 skipped**. The skips are the PostgreSQL-only registration races covered separately below.
+
+PostgreSQL Story 13 atomicity and registration-race coverage:
+
+`TEST=true TEST_DATABASE_URI='postgresql://quay:quay@localhost:5432/quay' PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/oci/test/test_oci_manifest.py data/registry_model/test/test_interface.py -k 'story13 or repository_digest_registration_live_concurrency'`
+
+Result: **2 passed, 144 deselected**.
+
+`TEST=true TEST_DATABASE_URI='postgresql://quay:quay@localhost:5432/quay' PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_interface.py::test_repository_digest_registration_live_concurrency data/registry_model/test/test_interface.py::test_repository_manifest_digest_registration_live_concurrency`
+
+Result: **2 passed**.
+
+Existing SHA-256 registry protocol push, pull, and mount regressions:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings test/registry/registry_tests.py -k 'test_basic_push_pull_by_manifest or blob_mount'`
+
+Result: **255 passed, 1,204 deselected**.
+
+Targeted mypy:
+
+`.venv/bin/mypy data/model/oci/blob.py data/model/oci/manifest.py data/registry_model/interface.py data/registry_model/registry_oci_model.py endpoints/v2/manifest.py`
+
+Result: **passed**, no issues in five source files.
+
 ### Static checks
 
 Pre-commit passed over every Story 8 target-worktree file. Earlier passes reformatted Python with Black; the final pass made no changes.
@@ -244,6 +327,8 @@ Compilation and whitespace:
 Result: **passed**.
 
 Story 10 pre-commit passed for `endpoints/v2/test/test_manifest.py` after the first Black pass reformatted the file. Python compilation and `git diff --check` also passed.
+
+Story 13 pre-commit passed for every changed Quay file after the first pass reformatted five Python files. Python compilation and `git diff --check` passed.
 
 ## Live Story 8 validation
 
@@ -293,6 +378,35 @@ Live outcomes:
 
 The first live health probe hung while the long-running local container was otherwise present. Restarting only `quay-quay` restored service. The first read-only database inspection script omitted application initialization and failed before querying; the corrected script passed. These were environment and validation-script issues, not copy failures. The live repository was not deleted because repository cleanup remains later lifecycle work.
 
+## Live Story 13 validation
+
+The running `quay-quay` container was bind-mounted from the target worktree. After one restart repaired an unhealthy local service key and loaded the changed code, instance health returned HTTP 200 and the active allowlist was SHA-256, SHA-384, and SHA-512.
+
+A fresh OCI single manifest and its configuration and layer were published to `localhost:8080/testuser/pqc-story13-live:legacy`. The three SHA-256 registration rows were then removed directly from the dedicated local validation repository to simulate content predating the registration tables.
+
+Key identities:
+
+- Manifest SHA-256: `sha256:79503b66a3368375691e60ce9466ec219eb0623630ee0396ffaab554aca12e96`
+- Configuration SHA-256: `sha256:1469859180c47a3ef84f3c0e939ca79282ad0875c07eb5190f1ef01653d2c1de`
+- Layer SHA-256: `sha256:d7f71ce14f226b9d64143dad86d197fbc60588fe837ef13dcc5e11172b805321`
+- Manifest SHA-512: `sha512:fa35dee192b657c691347a52b07ba35c7ee11432431666473a620bbb3048a8cebe6c664d3f6b66b28c245f03a1aaf4779565b6534098ddc1ce69bdae91ac472a`
+- Configuration SHA-512: `sha512:615023b5bdc18c85f3de512d279b3748cb40219348abdd2188d0b66b6fddbf13dece2a8557ab28a26a01c3cb72bab703e285237a027f49d069c406854a961b9b`
+- Layer SHA-512: `sha512:7619b0352ead07abc02f1fb67c8132ca0a48a636850361bc8aced4e27e14b010dc83e3404f983429c34c649fb3d63e5dc7093fb3aa861dcc27129bd0414f8746`
+
+Live outcomes:
+
+- Tag and canonical digest manifest GET/HEAD returned HTTP 200, exact bytes, media type, and canonical digest headers.
+- Configuration and layer GET/HEAD returned HTTP 200, exact bytes, lengths, and canonical digest headers.
+- Repeated requests produced exactly one manifest and two blob SHA-256 registrations with the expected canonical mappings.
+- Manifest and blob GET/HEAD in an unrelated existing repository returned HTTP 404 and created no registration there.
+- SHA-512 blob uploads and digest-addressed manifest publication added alternative registrations while both canonical SHA-256 identities remained readable.
+- With SHA-256 removed from the active allowlist, canonical manifest and blob GET/HEAD returned HTTP 400 `UNSUPPORTED` with `reason: disabled`; SHA-512 GET/HEAD remained HTTP 200; and the legacy tag selected the enabled SHA-512 identity.
+- Database inspection while disabled still showed two manifest registrations and four blob registrations. Canonical rows and bytes were not deleted.
+- The configuration file was restored byte-for-byte, Quay was restarted, health returned HTTP 200, canonical manifest and blob access returned HTTP 200, and the tag again preferred SHA-256.
+- Unauthenticated manifest and blob requests returned HTTP 401. Malformed SHA-256 returned HTTP 400 `DIGEST_INVALID/malformed`. Unknown canonical values returned `MANIFEST_UNKNOWN` or `BLOB_UNKNOWN` with HTTP 404.
+
+The first `regctl` copy attempts returned unauthorized because the running stack's service key was unhealthy; a direct request confirmed `Unknown service key`, and restarting only `quay-quay` repaired the environment. Three temporary validation commands were also defective: the first SQL query used the nonexistent `quayuser` table instead of quoted `user`, one `psql -c` command incorrectly expected variable interpolation, and the first HEAD loop used `curl -X HEAD`, which waited for a body. Corrected commands passed. These were environment or validation-script failures, not product test failures. The dedicated live repository and two empty repositories from the failed copy attempts were not deleted because repository cleanup is outside Story 13.
+
 ## Active limitations and deferred work
 
 - Proxy cache, repository mirroring, organization mirroring, external image import, and all related external-registry or live interoperability validation are explicitly deferred until reassigned.
@@ -300,7 +414,7 @@ The first live health probe hung while the long-running local container was othe
 - Complete-image copy is supported only between normal repositories managed by the same Quay deployment while the external-registry deferral is active. Artifact-copy and referrer-copy variations remain unvalidated.
 - Builds, Clair, UI, deletion, garbage collection, conformance, and operational tooling remain later stories.
 - Full blob unlink, upload expiration, repository or namespace deletion, registration cleanup, and physical orphan cleanup remain lifecycle work.
-- PostgreSQL registration races passed in earlier sessions; MySQL concurrency remains unrun.
+- PostgreSQL blob and manifest registration races passed again in Story 13; MySQL concurrency remains unrun.
 - SHA-384 resumable hashing passed on local macOS arm64 and an existing Linux aarch64 image. Clean Linux builds, Linux x86_64 packaging, and cross-architecture resume remain unproven.
 - Podman and Skopeo rejected SHA-384 manifest pulls client-side in earlier tests; client interoperability remains tool-specific.
 - No OCI Distribution conformance, broad client matrix, mixed-version, mixed-region, object-storage, replication, performance, or production-readiness claim is made.
@@ -308,6 +422,6 @@ The first live health probe hung while the long-running local container was othe
 
 ## Recommended next story
 
-Proceed with **Story 13: preserve SHA-256 compatibility for legacy registry content**.
+Proceed with **Story 14: delete content through registered digest identities**.
 
-Evaluate the existing lazy legacy fallback and registration behavior independently. Preserve enabled legacy SHA-256 pulls and tags, materialize registrations only where required by the agreed contract, keep alternative registrations from hiding historically valid SHA-256 content, and enforce hard-disable without deleting canonical bytes. Do not expand into deletion, garbage collection, schema 1 alternatives, API, UI, Clair, build, mirror, proxy, import, or operational-tool stories.
+Evaluate manifest and blob deletion semantics independently before changing production code. Keep repository and namespace cleanup, upload expiration, garbage collection, Docker schema 1 alternative identities, and deferred integrations outside Story 14 unless the tracker is deliberately revised.

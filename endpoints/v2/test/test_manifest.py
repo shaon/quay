@@ -51,7 +51,9 @@ from image.oci import (
     OCI_IMAGE_MANIFEST_CONTENT_TYPE,
     OCI_IMAGE_TAR_LAYER_CONTENT_TYPE,
 )
+from image.shared.schemas import parse_manifest_from_bytes
 from test.fixtures import *  # noqa: F401, F403
+from util.bytes import Bytes
 from util.security.registry_jwt import build_context_and_subject, generate_bearer_token
 
 
@@ -531,6 +533,429 @@ def test_push_malformed_manifest_oci_manifest(client, app):
         headers=headers,
         raw_body=INVALID_OCI_MANIFEST,
     )
+
+
+def _store_story13_legacy_single_manifest(repository_name, tag_name, algorithm):
+    manifest_info = _sha512_single_manifest(
+        repository_name,
+        layer_bytes=f"story13 legacy layer {algorithm}".encode("utf-8"),
+        algorithm="sha256",
+    )
+    repository = model.repository.get_repository(*repository_name.split("/", 1))
+    parsed = parse_manifest_from_bytes(
+        Bytes.for_string_or_unicode(manifest_info["bytes"]),
+        DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE,
+    )
+    created = model.oci.manifest.get_or_create_manifest(
+        repository.id,
+        parsed,
+        storage,
+        for_tagging=True,
+        raise_on_error=True,
+    )
+    model.oci.tag.retarget_tag(tag_name, created.manifest, raise_on_error=True)
+
+    RepositoryManifestDigest.delete().where(
+        RepositoryManifestDigest.repository == repository,
+        RepositoryManifestDigest.manifest == created.manifest,
+    ).execute()
+    RepositoryBlobDigest.delete().where(
+        RepositoryBlobDigest.repository == repository,
+        RepositoryBlobDigest.image_storage.in_(manifest_info["blob_ids"]),
+    ).execute()
+    return repository, created.manifest, manifest_info
+
+
+@pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
+def test_story13_legacy_single_manifest_graph_compatibility(algorithm, client, app):
+    repository = "devtable/simple"
+    other_repository = "devtable/complex"
+    tag_name = f"story13-legacy-{algorithm}"
+    repository_row, manifest_row, manifest_info = _store_story13_legacy_single_manifest(
+        repository,
+        tag_name,
+        algorithm,
+    )
+    other_repository_row = model.repository.get_repository("devtable", "complex")
+    alternative_manifest_digest = (
+        f"{algorithm}:" + hashlib.new(algorithm, manifest_info["bytes"]).hexdigest()
+    )
+    auth_headers = _manifest_auth_headers(repository, actions=("pull",))
+    manifest_headers = {
+        **auth_headers,
+        "Accept": DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE,
+    }
+    test_cache = InMemoryDataModelCache(TEST_CACHE_CONFIG)
+
+    assert (
+        not RepositoryManifestDigest.select()
+        .where(
+            RepositoryManifestDigest.repository == repository_row,
+            RepositoryManifestDigest.manifest == manifest_row,
+        )
+        .exists()
+    )
+    assert (
+        not RepositoryBlobDigest.select()
+        .where(
+            RepositoryBlobDigest.repository == repository_row,
+            RepositoryBlobDigest.image_storage.in_(manifest_info["blob_ids"]),
+        )
+        .exists()
+    )
+
+    unauthorized_requests = [
+        (
+            "v2.fetch_manifest_by_tagname",
+            {"manifest_ref": tag_name},
+        ),
+        (
+            "v2.fetch_manifest_by_digest",
+            {"manifest_ref": manifest_info["canonical_digest"]},
+        ),
+        (
+            "v2.download_blob",
+            {"digest": manifest_info["referenced_blobs"][0]["canonical_digest"]},
+        ),
+    ]
+    for endpoint, params in unauthorized_requests:
+        conduct_call(
+            client,
+            endpoint,
+            url_for,
+            "GET",
+            {"repository": repository, **params},
+            expected_code=401,
+            headers={"Accept": DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE},
+        )
+
+    with patch.dict(realapp.config, {"ALLOWED_HASH_ALGORITHMS": [algorithm]}):
+        disabled_requests = [
+            (
+                "v2.fetch_manifest_by_tagname",
+                {"manifest_ref": tag_name},
+            ),
+            (
+                "v2.fetch_manifest_by_digest",
+                {"manifest_ref": manifest_info["canonical_digest"]},
+            ),
+            (
+                "v2.download_blob",
+                {"digest": manifest_info["referenced_blobs"][0]["canonical_digest"]},
+            ),
+        ]
+        for endpoint, params in disabled_requests:
+            disabled = conduct_call(
+                client,
+                endpoint,
+                url_for,
+                "GET",
+                {"repository": repository, **params},
+                expected_code=400,
+                headers=manifest_headers.copy(),
+            )
+            assert disabled.get_json()["errors"][0]["detail"] == {
+                "algorithm": "sha256",
+                "reason": "disabled",
+            }
+
+    assert (
+        not RepositoryManifestDigest.select()
+        .where(
+            RepositoryManifestDigest.repository == repository_row,
+            RepositoryManifestDigest.manifest == manifest_row,
+        )
+        .exists()
+    )
+    assert (
+        not RepositoryBlobDigest.select()
+        .where(
+            RepositoryBlobDigest.repository == repository_row,
+            RepositoryBlobDigest.image_storage.in_(manifest_info["blob_ids"]),
+        )
+        .exists()
+    )
+
+    with (
+        patch.dict(realapp.config, {"ALLOWED_HASH_ALGORITHMS": ["sha256", algorithm]}),
+        patch("endpoints.v2.manifest.model_cache", test_cache),
+        patch("endpoints.v2.blob.model_cache", test_cache),
+    ):
+        for _ in range(2):
+            for method in ("GET", "HEAD"):
+                tag_response = conduct_call(
+                    client,
+                    "v2.fetch_manifest_by_tagname",
+                    url_for,
+                    method,
+                    {"repository": repository, "manifest_ref": tag_name},
+                    expected_code=200,
+                    headers=manifest_headers.copy(),
+                )
+                digest_response = conduct_call(
+                    client,
+                    "v2.fetch_manifest_by_digest",
+                    url_for,
+                    method,
+                    {
+                        "repository": repository,
+                        "manifest_ref": manifest_info["canonical_digest"],
+                    },
+                    expected_code=200,
+                    headers=manifest_headers.copy(),
+                )
+                for response in (tag_response, digest_response):
+                    assert (
+                        response.headers["Docker-Content-Digest"]
+                        == manifest_info["canonical_digest"]
+                    )
+                    assert response.headers["Content-Type"] == DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE
+                    assert response.data == (manifest_info["bytes"] if method == "GET" else b"")
+
+        manifest_registration = RepositoryManifestDigest.get(
+            repository=repository_row,
+            digest=manifest_info["canonical_digest"],
+        )
+        assert manifest_registration.manifest_id == manifest_row.id
+        assert (
+            RepositoryManifestDigest.select()
+            .where(
+                RepositoryManifestDigest.repository == repository_row,
+                RepositoryManifestDigest.digest == manifest_info["canonical_digest"],
+            )
+            .count()
+            == 1
+        )
+
+        for descriptor in manifest_info["referenced_blobs"]:
+            for _ in range(2):
+                for method, endpoint in (
+                    ("GET", "v2.download_blob"),
+                    ("HEAD", "v2.check_blob_exists"),
+                ):
+                    response = conduct_call(
+                        client,
+                        endpoint,
+                        url_for,
+                        method,
+                        {"repository": repository, "digest": descriptor["canonical_digest"]},
+                        expected_code=200,
+                        headers=auth_headers.copy(),
+                    )
+                    assert (
+                        response.headers["Docker-Content-Digest"] == descriptor["canonical_digest"]
+                    )
+                    assert response.data == (descriptor["bytes"] if method == "GET" else b"")
+                    if method == "GET":
+                        assert (
+                            "sha256:" + hashlib.sha256(response.data).hexdigest()
+                            == descriptor["canonical_digest"]
+                        )
+
+            blob_registration = RepositoryBlobDigest.get(
+                repository=repository_row,
+                digest=descriptor["canonical_digest"],
+            )
+            assert (
+                blob_registration.image_storage.content_checksum == descriptor["canonical_digest"]
+            )
+            assert (
+                RepositoryBlobDigest.select()
+                .where(
+                    RepositoryBlobDigest.repository == repository_row,
+                    RepositoryBlobDigest.digest == descriptor["canonical_digest"],
+                )
+                .count()
+                == 1
+            )
+
+        for method in ("GET", "HEAD"):
+            conduct_call(
+                client,
+                "v2.fetch_manifest_by_digest",
+                url_for,
+                method,
+                {
+                    "repository": other_repository,
+                    "manifest_ref": manifest_info["canonical_digest"],
+                },
+                expected_code=404,
+                headers=_manifest_auth_headers(other_repository, actions=("pull",)),
+            )
+            for descriptor in manifest_info["referenced_blobs"]:
+                conduct_call(
+                    client,
+                    "v2.download_blob" if method == "GET" else "v2.check_blob_exists",
+                    url_for,
+                    method,
+                    {"repository": other_repository, "digest": descriptor["canonical_digest"]},
+                    expected_code=404,
+                    headers=_manifest_auth_headers(other_repository, actions=("pull",)),
+                )
+
+        assert (
+            not RepositoryManifestDigest.select()
+            .where(
+                RepositoryManifestDigest.repository == other_repository_row,
+                RepositoryManifestDigest.digest == manifest_info["canonical_digest"],
+            )
+            .exists()
+        )
+        assert (
+            not RepositoryBlobDigest.select()
+            .where(
+                RepositoryBlobDigest.repository == other_repository_row,
+                RepositoryBlobDigest.digest.in_(
+                    [item["canonical_digest"] for item in manifest_info["referenced_blobs"]]
+                ),
+            )
+            .exists()
+        )
+
+        model.oci.manifest.register_repository_manifest_digest(
+            repository_row,
+            manifest_row,
+            alternative_manifest_digest,
+        )
+        alternative_blob_digests = []
+        for descriptor in manifest_info["referenced_blobs"]:
+            alternative_digest = (
+                f"{algorithm}:" + hashlib.new(algorithm, descriptor["bytes"]).hexdigest()
+            )
+            alternative_blob_digests.append(alternative_digest)
+            blob_row = ImageStorage.get(content_checksum=descriptor["canonical_digest"])
+            model.oci.blob.register_repository_blob_digest(
+                repository_row,
+                blob_row,
+                alternative_digest,
+            )
+
+        for digest in (manifest_info["canonical_digest"], alternative_manifest_digest):
+            for method in ("GET", "HEAD"):
+                response = conduct_call(
+                    client,
+                    "v2.fetch_manifest_by_digest",
+                    url_for,
+                    method,
+                    {"repository": repository, "manifest_ref": digest},
+                    expected_code=200,
+                    headers=manifest_headers.copy(),
+                )
+                assert response.headers["Docker-Content-Digest"] == digest
+                assert response.data == (manifest_info["bytes"] if method == "GET" else b"")
+
+        with patch.dict(realapp.config, {"ALLOWED_HASH_ALGORITHMS": [algorithm]}):
+            for method in ("GET", "HEAD"):
+                conduct_call(
+                    client,
+                    "v2.fetch_manifest_by_digest",
+                    url_for,
+                    method,
+                    {
+                        "repository": repository,
+                        "manifest_ref": manifest_info["canonical_digest"],
+                    },
+                    expected_code=400,
+                    headers=manifest_headers.copy(),
+                )
+                alternative_response = conduct_call(
+                    client,
+                    "v2.fetch_manifest_by_digest",
+                    url_for,
+                    method,
+                    {"repository": repository, "manifest_ref": alternative_manifest_digest},
+                    expected_code=200,
+                    headers=manifest_headers.copy(),
+                )
+                assert alternative_response.headers["Docker-Content-Digest"] == (
+                    alternative_manifest_digest
+                )
+                tag_response = conduct_call(
+                    client,
+                    "v2.fetch_manifest_by_tagname",
+                    url_for,
+                    method,
+                    {"repository": repository, "manifest_ref": tag_name},
+                    expected_code=200,
+                    headers=manifest_headers.copy(),
+                )
+                assert tag_response.headers["Docker-Content-Digest"] == alternative_manifest_digest
+
+                for descriptor, alternative_digest in zip(
+                    manifest_info["referenced_blobs"], alternative_blob_digests
+                ):
+                    conduct_call(
+                        client,
+                        "v2.download_blob" if method == "GET" else "v2.check_blob_exists",
+                        url_for,
+                        method,
+                        {"repository": repository, "digest": descriptor["canonical_digest"]},
+                        expected_code=400,
+                        headers=auth_headers.copy(),
+                    )
+                    conduct_call(
+                        client,
+                        "v2.download_blob" if method == "GET" else "v2.check_blob_exists",
+                        url_for,
+                        method,
+                        {"repository": repository, "digest": alternative_digest},
+                        expected_code=200,
+                        headers=auth_headers.copy(),
+                    )
+
+        restored_tag = conduct_call(
+            client,
+            "v2.fetch_manifest_by_tagname",
+            url_for,
+            "GET",
+            {"repository": repository, "manifest_ref": tag_name},
+            expected_code=200,
+            headers=manifest_headers.copy(),
+        )
+        assert restored_tag.headers["Docker-Content-Digest"] == manifest_info["canonical_digest"]
+
+        malformed = conduct_call(
+            client,
+            "v2.fetch_manifest_by_digest",
+            url_for,
+            "GET",
+            {"repository": repository, "manifest_ref": "sha256:1234"},
+            expected_code=400,
+            headers=manifest_headers.copy(),
+        )
+        unknown = conduct_call(
+            client,
+            "v2.fetch_manifest_by_digest",
+            url_for,
+            "GET",
+            {
+                "repository": repository,
+                "manifest_ref": "sha256:" + hashlib.sha256(b"story13 unknown").hexdigest(),
+            },
+            expected_code=404,
+            headers=manifest_headers.copy(),
+        )
+        assert malformed.get_json()["errors"][0]["detail"]["reason"] == "malformed"
+        assert unknown.get_json()["errors"][0]["code"] == "MANIFEST_UNKNOWN"
+
+    assert Manifest.get_by_id(manifest_row.id).digest == manifest_info["canonical_digest"]
+    assert {
+        registration.digest
+        for registration in RepositoryManifestDigest.select().where(
+            RepositoryManifestDigest.repository == repository_row,
+            RepositoryManifestDigest.manifest == manifest_row,
+        )
+    } == {manifest_info["canonical_digest"], alternative_manifest_digest}
+    assert {
+        registration.digest
+        for registration in RepositoryBlobDigest.select().where(
+            RepositoryBlobDigest.repository == repository_row,
+            RepositoryBlobDigest.image_storage.in_(manifest_info["blob_ids"]),
+        )
+    } == {
+        *[item["canonical_digest"] for item in manifest_info["referenced_blobs"]],
+        *alternative_blob_digests,
+    }
 
 
 @pytest.mark.parametrize("algorithm", ["sha384", "sha512"])

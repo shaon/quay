@@ -247,13 +247,14 @@ class OCIModel(RegistryDataInterface):
         assert found_tag is None or not found_tag.hidden
         return Tag.for_tag(found_tag, self._legacy_image_id_handler)
 
-    def get_manifest_for_tag(self, tag, allowed_algorithms=None):
+    def get_manifest_for_tag(self, tag, allowed_algorithms=None, materialize_legacy=False):
         """
         Returns the manifest associated with the given tag.
 
         Tag requests do not carry a digest algorithm. When an allowlist is supplied, select an
         enabled repository-visible registration for the exact manifest bytes instead of exposing
-        canonical SHA-256 unconditionally.
+        canonical SHA-256 unconditionally. A successful client tag resolution can also materialize
+        a previously implicit legacy SHA-256 identity.
         """
         assert tag is not None
         manifest = tag.manifest
@@ -267,6 +268,15 @@ class OCIModel(RegistryDataInterface):
         )
         if digest is None:
             return None
+
+        if materialize_legacy and digest == tag._manifest_row.digest:
+            digest = oci.manifest.materialize_legacy_manifest_registration(
+                tag.repository._db_id,
+                tag._manifest_row,
+                allowed_algorithms=allowed_algorithms,
+            )
+            if digest is None:
+                return None
 
         return Manifest.for_manifest(
             tag._manifest_row,

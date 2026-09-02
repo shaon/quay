@@ -127,6 +127,7 @@ def fetch_manifest_by_tagname(namespace_name, repo_name, manifest_ref, registry_
     manifest = registry_model.get_manifest_for_tag(
         tag,
         allowed_algorithms=app.config.get("ALLOWED_HASH_ALGORITHMS", ["sha256"]),
+        materialize_legacy=True,
     )
     if manifest is None:
         # The tag exists, but none of its repository-visible identities are currently enabled.

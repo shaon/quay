@@ -6,6 +6,8 @@ from data.database import (
     RepositoryBlobDigest,
     UploadedBlob,
     db,
+    db_disallow_replica_use,
+    db_transaction,
 )
 from data.model import BlobDigestConflictException, BlobDoesNotExist
 from data.model.storage import InvalidImageException, get_storage_by_uuid
@@ -30,13 +32,21 @@ def lookup_repository_blob_by_digest(repository, blob_digest):
         return storage
 
     # Preserve lookup for SHA-256 repository/blob pairs created before digest registrations
-    # existed. Once any registration exists for the pair, only exact registered digests resolve.
+    # existed. Materialize that historical identity on the primary database so later alternative
+    # registrations cannot hide it. Once any registration exists for the pair, only exact
+    # registered digests resolve.
     if blob_digest.startswith("sha256:"):
-        storage = _lookup_blob_uploaded(repository, blob_digest)
-        if storage is None:
-            storage = _lookup_blob_in_repository(repository, blob_digest)
-        if storage is not None and not has_repository_blob_registration(repository, storage):
-            return storage
+        with db_disallow_replica_use(), db_transaction():
+            storage = _lookup_blob_by_registered_digest(repository, blob_digest)
+            if storage is not None and _repository_references_storage(repository, storage):
+                return storage
+
+            storage = _lookup_blob_uploaded(repository, blob_digest)
+            if storage is None:
+                storage = _lookup_blob_in_repository(repository, blob_digest)
+            if storage is not None and not has_repository_blob_registration(repository, storage):
+                register_repository_blob_digest(repository, storage, blob_digest)
+                return storage
 
     return None
 

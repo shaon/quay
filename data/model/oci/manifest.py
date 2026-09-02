@@ -21,6 +21,7 @@ from data.database import (
     RepositoryNotification,
     Tag,
     db,
+    db_disallow_replica_use,
     db_transaction,
     get_epoch_timestamp_ms,
 )
@@ -142,13 +143,40 @@ def lookup_manifest(
     manifests only while the repository/manifest pair has no explicit registrations.
     """
     if not require_available:
-        return _lookup_manifest(
-            repository_id, manifest_digest, allow_dead=allow_dead, allow_hidden=allow_hidden
-        )
-
-    with db_transaction():
         found = _lookup_manifest(
             repository_id, manifest_digest, allow_dead=allow_dead, allow_hidden=allow_hidden
+        )
+        if (
+            found is None
+            or not manifest_digest.startswith("sha256:")
+            or found.digest != manifest_digest
+            or found._requested_digest_registered
+        ):
+            return found
+
+        # Recheck visibility and registration state on the primary before materializing the
+        # historical identity. The registration helper is idempotent under concurrent readers.
+        with db_disallow_replica_use(), db_transaction():
+            found = _lookup_manifest(
+                repository_id,
+                manifest_digest,
+                allow_dead=allow_dead,
+                allow_hidden=allow_hidden,
+            )
+            return _materialize_legacy_manifest_registration(
+                repository_id,
+                manifest_digest,
+                found,
+            )
+
+    with db_disallow_replica_use(), db_transaction():
+        found = _lookup_manifest(
+            repository_id, manifest_digest, allow_dead=allow_dead, allow_hidden=allow_hidden
+        )
+        found = _materialize_legacy_manifest_registration(
+            repository_id,
+            manifest_digest,
+            found,
         )
         if found is None:
             return None
@@ -202,7 +230,10 @@ def _lookup_manifest(repository_id, manifest_digest, allow_dead=False, allow_hid
             (Manifest.digest == manifest_digest) & ~any_registration_exists
         )
 
-    query = Manifest.select().where(
+    query = Manifest.select(
+        Manifest,
+        matching_registration_exists.alias("_requested_digest_registered"),
+    ).where(
         Manifest.repository == repository_id,
         identity_condition,
     )
@@ -257,6 +288,43 @@ def _manifest_is_available(manifest, allow_hidden=False):
         }
 
     return False
+
+
+def _materialize_legacy_manifest_registration(repository_id, manifest_digest, manifest):
+    if (
+        manifest is not None
+        and manifest_digest.startswith("sha256:")
+        and manifest.digest == manifest_digest
+        and not has_repository_manifest_registration(repository_id, manifest)
+    ):
+        register_repository_manifest_digest(repository_id, manifest, manifest_digest)
+    return manifest
+
+
+def materialize_legacy_manifest_registration(
+    repository_id,
+    manifest,
+    allowed_algorithms=None,
+):
+    """Persist and select a tag-visible legacy identity using primary-database state."""
+    manifest_id = getattr(manifest, "id", manifest)
+    with db_disallow_replica_use(), db_transaction():
+        current = Manifest.get_or_none(
+            Manifest.id == manifest_id,
+            Manifest.repository == repository_id,
+        )
+        if current is None:
+            return None
+        _materialize_legacy_manifest_registration(
+            repository_id,
+            current.digest,
+            current,
+        )
+        return get_repository_manifest_digest(
+            repository_id,
+            current,
+            allowed_algorithms=allowed_algorithms,
+        )
 
 
 def has_repository_manifest_registration(repository_id, manifest):

@@ -57,7 +57,7 @@ class RegistryDataInterface(object):
         """
 
     @abstractmethod
-    def get_manifest_for_tag(self, tag, allowed_algorithms=None):
+    def get_manifest_for_tag(self, tag, allowed_algorithms=None, materialize_legacy=False):
         """
         Returns the manifest associated with the given tag.
 
