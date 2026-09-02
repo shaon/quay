@@ -20,10 +20,10 @@ class BlobUploadCleanupWorkerDataInterface(object):
     """
 
     @abstractmethod
-    def get_stale_blob_upload(self, stale_threshold):
+    def get_stale_blob_upload(self, stale_threshold, excluded_upload_uuids=None):
         """
         Returns a BlobUpload that was created on or before the current date/time minus the stale
-        threshold.
+        threshold and is not in the optional excluded UUID collection.
 
         If none, returns None.
         """

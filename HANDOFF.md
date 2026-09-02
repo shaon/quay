@@ -36,7 +36,10 @@ The feature supports repository-visible SHA-256, SHA-384, and SHA-512 identities
 - Story 15 removes target-repository blob registrations before canonical storage collection and removes residual target-repository manifest registrations before repository deletion. Repository and namespace marking still preserve registrations until their queued purge runs. No upload expiration, ordinary garbage-collection policy, physical orphan recovery, schema, migration, proxy, mirror, import, or Docker schema 1 alternative-identity behavior changed.
 - The Story 15 implementation is committed with subject `NO-ISSUE: fix(gc): remove repository digest registrations`. Its hash cannot be embedded in its own Git preimage; use `git rev-parse HEAD` and verify the subject.
 - Expected target status after the Story 15 commit: clean, with no staged, unstaged, or untracked files.
-- The planning repository had unrelated modified and untracked files before this update. This session changed only its current-session `.PITASKS.md` section and Story 15 status and evidence in `TODO.md`. The planning repository was not committed. `PQC-Features.md` was unchanged because the accepted capability boundary did not change.
+- Story 16 makes abandoned-upload expiration retry storage cancellation before deleting the `BlobUpload` row that owns storage metadata and requested-digest hash state. A failed UUID is skipped only for the rest of the current worker pass, so unrelated stale uploads continue and the failed upload is retried on the next pass. Missing storage is idempotent success.
+- The Story 16 implementation is committed with subject `NO-ISSUE: fix(registry): retry abandoned upload cleanup`. Its hash cannot be embedded in its own Git preimage; use `git rev-parse HEAD` and verify the subject.
+- Expected target status after the Story 16 commit: clean, with no staged, unstaged, or untracked files.
+- The planning repository had unrelated modified and untracked files before this update. This session changed only its current-session `.PITASKS.md` section and Story 16 status and evidence in `TODO.md`. The planning repository was not committed. `PQC-Features.md` was unchanged because the accepted capability boundary did not change.
 
 ## Delivery status
 
@@ -55,7 +58,8 @@ The feature supports repository-visible SHA-256, SHA-384, and SHA-512 identities
 - Story 13: **Done**.
 - Story 14: **Done**.
 - Story 15: **Done**.
-- Recommended next work: **Story 16, expire abandoned uploads and remove persisted hash state**.
+- Story 16: **Done**.
+- Recommended next work: **Story 17, garbage-collect unreferenced digest registrations and canonical content**.
 
 Do not change Story 1 or Story 2 merely because later stories depend on their behavior.
 
@@ -148,6 +152,17 @@ Do not change Story 1 or Story 2 merely because later stories depend on their be
 - Namespace GC bulk-marks its repositories and sends each through the same repository purge invariant. Both dedicated repository and namespace workers are covered.
 - Cleanup is repository-scoped and retry-safe. Registrations owned by unrelated repositories and shared canonical SHA-256 storage still referenced outside the deleted repository remain unchanged.
 - No active algorithm allowlist is consulted for lifecycle cleanup. No registration is remapped, and canonical SHA-256 remains Quay's internal storage identity.
+
+### Story 16 abandoned-upload and hash-state cleanup
+
+- `requested_digest_algorithm`, `requested_digest_state`, canonical resumable SHA-256 state, byte counts, and storage metadata are all owned by one `BlobUpload` row. Deleting that row removes all persisted requested-digest state; no separate alternative-hash table, temporary link, or storage metadata row exists.
+- Explicit cancellation and successful monolithic or resumed finalization already deleted the whole row. Cancellation restores no hash state and therefore works for disabled, unsupported legacy, missing, partial, and corrupt persisted values without unsafe deserialization.
+- Successful finalization still writes exact bytes to the canonical SHA-256 CAS path, creates the repository-scoped requested identity and temporary `UploadedBlob` reachability in one database transaction, then deletes the upload row. `ImageStorage.content_checksum` remains SHA-256.
+- Abandoned-upload expiration now deletes a row only after targeted storage cancellation succeeds or reports `FileNotFoundError`. A transient storage failure retains the row, requested hash state, and storage metadata for the next scheduled pass.
+- A failed UUID is excluded only from the remainder of the current pass. Other stale uploads, including uploads in other repositories, continue to expire. The exclusion set resets on the next pass so failures are retried without a hot loop or starvation.
+- Concurrent upload or repository purge that removes the row after worker selection is a safe no-op at database deletion. Repeated worker cleanup and already-missing chunks are idempotent.
+- The worker never parses or restores requested hash state and never consults `ALLOWED_HASH_ALGORITHMS`. SHA-256, hintless legacy, SHA-384, SHA-512, disabled, unknown, partially populated, and corrupt rows follow the same cleanup path.
+- The Swift chunk cleanup worker remains storage-only. It idempotently removes queued segments and does not terminate or mutate a `BlobUpload` session.
 
 ## Story 8 root causes and changed files
 
@@ -258,6 +273,35 @@ Documentation changed:
 - `HANDOFF.md`
 
 No schema or migration changed.
+
+## Story 16 root causes and changed files
+
+The persistence trace found one production gap and two pre-existing test defects:
+
+1. Requested-digest state is not separately persisted: it lives only in `BlobUpload`. Existing successful commit and explicit cancellation therefore already removed it correctly by deleting the row.
+2. The abandoned-upload worker caught every storage cancellation exception and then unconditionally deleted `BlobUpload`. A transient storage failure could leave chunks behind while discarding the only targeted `storage_metadata`, making the failed cleanup impossible to retry.
+3. Preserving that row without excluding it from the current selection loop would repeatedly select the same failed UUID and block unrelated stale uploads. Stale lookup therefore gained an optional per-pass exclusion collection.
+4. The existing cleanup test called `blob_upload_exists` without asserting its false value, and the corrupt-state uploader test incorrectly assumed fixture repositories had zero digest registrations. These test defects were corrected without changing product behavior.
+
+Production files changed:
+
+- `data/model/blob.py`
+- `workers/blobuploadcleanupworker/blobuploadcleanupworker.py`
+- `workers/blobuploadcleanupworker/models_interface.py`
+- `workers/blobuploadcleanupworker/models_pre_oci.py`
+
+Test files changed:
+
+- `data/registry_model/test/test_blobuploader.py`
+- `endpoints/v2/test/test_blob.py`
+- `workers/blobuploadcleanupworker/test/test_blobuploadcleanupworker.py`
+- `workers/test/test_chunkcleanupworker.py`
+
+Documentation changed:
+
+- `HANDOFF.md`
+
+No schema, migration, configuration, digest registration, manifest/blob garbage collection, repository/namespace deletion, proxy, mirror, import, or Docker schema 1 behavior changed.
 
 ## Verification evidence
 
@@ -469,7 +513,89 @@ SHA-256 registry deletion regressions:
 
 Result: **18 passed, 1,441 deselected**.
 
+### Story 16 tests
+
+The first three baseline commands were mistakenly launched from the planning directory. Each returned `/bin/bash: .venv/bin/python: No such file or directory`; no tests ran. The corrected baseline commands ran from the Quay worktree.
+
+Corrected pre-change baseline:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_blobuploader.py`
+
+Result: **2 failed, 29 passed**. Both failures were pre-existing test defects: the corrupt-state test assumed an initialized repository had zero digest registrations.
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings workers/blobuploadcleanupworker/test/test_blobuploadcleanupworker.py`
+
+Result: **8 passed**. The existing row-removal check did not assert its result, so this did not prove state deletion.
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_blob.py -k 'cancel or alternative_chunked_blob_upload_resume_and_pull or alternative_monolithic_upload_infers_algorithm_without_hint or final_sha256_is_authoritative'`
+
+Result: **6 passed, 54 deselected**.
+
+Initial Story 16 characterization before production changes:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_blobuploader.py -k story16`
+
+Result: **4 passed, 31 deselected**.
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings workers/blobuploadcleanupworker/test/test_blobuploadcleanupworker.py -k story16`
+
+Result: **2 failed, 1 passed, 8 deselected**. One failure demonstrated the product gap: the row and retry metadata disappeared after storage cancellation failed. The other was a test defect caused by attempting to hash `mock.call` objects.
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_blob.py -k story16`
+
+Result: **2 passed, 60 deselected**.
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings workers/test/test_chunkcleanupworker.py`
+
+Result: **1 passed**.
+
+After production correction, the same four selections passed with **4**, **4**, **2**, and **1** tests respectively. A later direct repository-deletion characterization produced **1 test-defect failure and 4 passes** because it bypassed Quay's required purge sequence and hit expected foreign-key protection. It was removed; repository purge removes the upload row before the repository, which is the same missing-row race already covered.
+
+Complete affected upload model, uploader, endpoint, and worker suites:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/test/test_blob.py data/model/test/test_model_blob.py data/registry_model/test/test_blobuploader.py endpoints/v2/test/test_blob.py workers/blobuploadcleanupworker/test/test_blobuploadcleanupworker.py workers/test/test_chunkcleanupworker.py`
+
+Result: **115 passed**.
+
+Complete storage suites:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings storage/test`
+
+Result: **159 passed**.
+
+Existing SHA-256 upload, finalization, cancellation, chunk, overlap, and resume regressions:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings test/registry/registry_tests.py -k 'test_basic_push_pull_by_manifest or test_cancel_upload or test_chunked_blob_uploading or test_chunked_uploading_mismatched_chunks or test_chunked_uploading_missing_first_chunk'`
+
+Result: **24 passed, 1,435 deselected**.
+
+Relevant PostgreSQL coverage:
+
+`TEST=true TEST_DATABASE_URI='postgresql://quay:quay@localhost:5432/quay' PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/test/test_blob.py data/model/test/test_model_blob.py data/registry_model/test/test_blobuploader.py endpoints/v2/test/test_blob.py workers/blobuploadcleanupworker/test/test_blobuploadcleanupworker.py workers/test/test_chunkcleanupworker.py -k 'story16 or cancel_upload or basic_upload_blob or blobupload_sha_state or blobuploadcleanupworker'`
+
+Result: **29 passed, 86 deselected**.
+
+After Black formatting, the final focused selection passed:
+
+`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_blobuploader.py endpoints/v2/test/test_blob.py workers/blobuploadcleanupworker/test/test_blobuploadcleanupworker.py workers/test/test_chunkcleanupworker.py -k 'story16 or alternative_monolithic_upload_infers_algorithm_without_hint'`
+
+Result: **13 passed, 97 deselected**.
+
 ### Static checks
+
+Story 16's first pre-commit pass reformatted `workers/blobuploadcleanupworker/test/test_blobuploadcleanupworker.py` with Black, so that pass correctly returned nonzero. The final pass over every changed Quay file passed without changes.
+
+Story 16 targeted mypy:
+
+`.venv/bin/mypy data/model/blob.py workers/blobuploadcleanupworker/blobuploadcleanupworker.py workers/blobuploadcleanupworker/models_interface.py workers/blobuploadcleanupworker/models_pre_oci.py`
+
+Result: **passed**, no issues in four source files.
+
+Story 16 compilation and whitespace:
+
+`.venv/bin/python -m compileall -q data/model/blob.py data/registry_model/test/test_blobuploader.py endpoints/v2/test/test_blob.py workers/blobuploadcleanupworker/blobuploadcleanupworker.py workers/blobuploadcleanupworker/models_interface.py workers/blobuploadcleanupworker/models_pre_oci.py workers/blobuploadcleanupworker/test/test_blobuploadcleanupworker.py workers/test/test_chunkcleanupworker.py && git diff --check && git diff --check upstream/master`
+
+Result: **passed**.
 
 Pre-commit passed over every Story 8 target-worktree file. Earlier passes reformatted Python with Black; the final pass made no changes.
 
@@ -631,13 +757,34 @@ The running `quay-quay` container was bind-mounted from the target worktree. Ins
 
 The first read-only repository inventory script called the guarded `FullIndexedCharField.startswith` operation and failed before querying. The corrected script used `match_prefix` and passed. This was a validation-script defect. Later five-second and fifteen-second health probes timed out while the container remained running; restarting only `quay-quay` restored HTTP 200 health on the sixth two-second retry. This was a local environment failure after the successful registry cleanup, not a product-test failure. No live namespace was destroyed; the namespace worker path passed against both SQLite and PostgreSQL test databases.
 
+## Live Story 16 validation
+
+The running `quay-quay` container was bind-mounted from the target worktree. Instance health returned HTTP 200, local PostgreSQL was healthy, and the active allowlist was SHA-256, SHA-384, and SHA-512. Before the test, PostgreSQL contained zero `BlobUpload` rows and zero uploads older than the two-day cleanup threshold, so invoking expiration after aging only the dedicated upload was safe.
+
+The dedicated repository was `localhost:8080/testuser/pqc-story16-live-1788335016`. Four chunked sessions were created: a SHA-512 finalization session, SHA-384 cancellation session, SHA-512 expiration session, and unrelated active SHA-384 session. Read-only PostgreSQL inspection after the chunks showed all four rows with non-null requested hash state and storage metadata, with byte counts 21, 25, 23, and 31 respectively.
+
+Key identities:
+
+- Requested SHA-512: `sha512:f2cc8db58e36410acf437557b30f7d19e5f14f5aa60141ce6cb89637bdaed84807c7d92bb5b68bd8a25ae837f6830106c0d8fd0202dc1552cb7979dbe5d4f2d4`
+- Canonical SHA-256: `sha256:a6be1b18cc1f2272cdfc292b9d6cc2471a075ee264f16ec17d1a122687514f5a`
+
+Live outcomes:
+
+- The SHA-512 upload finalized from a second chunk with HTTP 201. Its upload row disappeared, one canonical SHA-256 `ImageStorage` row and one requested SHA-512 repository registration existed, and exact GET bytes independently hashed to the requested SHA-512 value.
+- The SHA-384 upload canceled with HTTP 204 and its row, requested state, metadata, and temporary upload disappeared.
+- The dedicated SHA-512 abandoned upload was aged by 60 days only after confirming no unrelated stale upload existed. Direct invocation of the real `BlobUploadCleanupWorker._cleanup_uploads` removed its row and local temporary upload.
+- The unrelated fresh SHA-384 row and non-null requested state remained after expiration. It was then canceled normally, leaving no dedicated live upload rows.
+- The finalized canonical row, requested registration, exact bytes, unrelated content, and instance health remained intact throughout cleanup.
+
+One initial container configuration inspection used `podman exec` without stdin attachment and printed no output. The corrected `python -c` command showed the three-algorithm allowlist. This was a validation-command defect, not a product failure. No configuration was changed. The dedicated finalized repository remains for inspection.
+
 ## Active limitations and deferred work
 
 - Proxy cache, repository mirroring, organization mirroring, external image import, and all related external-registry or live interoperability validation are explicitly deferred until reassigned.
 - Story 9 remains unimplemented. A partial Story 9 attempt was fully reverted before this handoff update.
 - Complete-image copy is supported only between normal repositories managed by the same Quay deployment while the external-registry deferral is active. Artifact-copy and referrer-copy variations remain unvalidated.
 - Builds, Clair, UI, garbage collection, conformance, and operational tooling remain later stories.
-- Full blob unlink, upload expiration, ordinary registration-aware garbage collection, and physical orphan cleanup remain lifecycle work. Repository and namespace purge now remove their repository-scoped registrations.
+- Full blob unlink, ordinary registration-aware garbage collection, and physical orphan cleanup remain lifecycle work. Upload cancellation and expiration now remove requested hash state and retry failed targeted storage cleanup. Repository and namespace purge continue to remove upload rows through their existing bulk path; changing repository deletion storage orchestration remains outside Story 16.
 - Story 14 expires manifest lifecycle tags but intentionally leaves registrations, canonical rows, graph links, and bytes until repository deletion or later garbage collection. Arbitrary blob DELETE remains unsupported.
 - PostgreSQL blob and manifest registration races passed again in Story 13; MySQL concurrency remains unrun.
 - SHA-384 resumable hashing passed on local macOS arm64 and an existing Linux aarch64 image. Clean Linux builds, Linux x86_64 packaging, and cross-architecture resume remain unproven.
@@ -647,6 +794,6 @@ The first read-only repository inventory script called the guarded `FullIndexedC
 
 ## Recommended next story
 
-Proceed with **Story 16: expire abandoned uploads and remove persisted hash state**.
+Proceed with **Story 17: garbage-collect unreferenced digest registrations and canonical content**.
 
-Start with characterization of upload cancellation and expiration across `BlobUpload.requested_digest_algorithm` and `BlobUpload.requested_digest_state`, including retry and legacy-session behavior. Keep ordinary garbage collection, physical orphan recovery, Docker schema 1 alternative identities, and deferred integrations outside Story 16 unless the tracker is deliberately revised.
+Start with characterization of ordinary manifest and blob garbage collection after tags and temporary `UploadedBlob` links expire. Prove registration-removal ordering, shared canonical-content preservation, retries, concurrency, and repository isolation. Keep physical orphan recovery, Docker schema 1 alternative identities, and deferred integrations outside Story 17 unless the tracker is deliberately revised.

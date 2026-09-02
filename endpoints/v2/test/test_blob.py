@@ -1148,6 +1148,7 @@ def test_alternative_monolithic_upload_infers_algorithm_without_hint(algorithm, 
     repository = "devtable/simple"
     content = b"monolithic alternative digest"
     requested_digest = f"{algorithm}:" + hashlib.new(algorithm, content).hexdigest()
+    upload_count = BlobUpload.select().count()
 
     with patch.dict(realapp.config, {"ALLOWED_HASH_ALGORITHMS": ["sha256", algorithm]}):
         response = conduct_call(
@@ -1163,6 +1164,7 @@ def test_alternative_monolithic_upload_infers_algorithm_without_hint(algorithm, 
 
     assert response.headers["Docker-Content-Digest"] == requested_digest
     assert response.headers["Location"].endswith("/blobs/" + requested_digest)
+    assert BlobUpload.select().count() == upload_count
 
 
 @pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
@@ -1304,6 +1306,98 @@ def test_blob_upload_returns_precise_digest_errors_and_rejects_disabled_patch(cl
         url_for,
         "DELETE",
         {"repository": repository, "upload_uuid": upload_uuid},
+        expected_code=204,
+        headers=headers.copy(),
+    )
+
+
+@pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
+def test_story16_cancel_ignores_disabled_algorithm_and_corrupt_state(algorithm, client, app):
+    repository = "devtable/simple"
+    other_repository = "devtable/complex"
+    headers = _blob_auth_headers(repository)
+    initial_content_rows = (
+        ImageStorage.select().count(),
+        UploadedBlob.select().count(),
+        RepositoryBlobDigest.select().count(),
+    )
+
+    with patch.dict(
+        realapp.config,
+        {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384", "sha512"]},
+    ):
+        response = conduct_call(
+            client,
+            "v2.start_blob_upload",
+            url_for,
+            "POST",
+            {"repository": repository, "digest-algorithm": algorithm},
+            expected_code=202,
+            headers=headers.copy(),
+        )
+        upload_uuid = response.headers["Docker-Upload-UUID"]
+        conduct_call(
+            client,
+            "v2.upload_chunk",
+            url_for,
+            "PATCH",
+            {"repository": repository, "upload_uuid": upload_uuid},
+            raw_body=b"abandoned endpoint upload",
+            expected_code=202,
+            headers=headers.copy(),
+        )
+        other = conduct_call(
+            client,
+            "v2.start_blob_upload",
+            url_for,
+            "POST",
+            {"repository": repository},
+            expected_code=202,
+            headers=headers.copy(),
+        )
+        other_upload_uuid = other.headers["Docker-Upload-UUID"]
+
+    BlobUpload.update(requested_digest_state="corrupt-state").where(
+        BlobUpload.uuid == upload_uuid
+    ).execute()
+
+    conduct_call(
+        client,
+        "v2.cancel_upload",
+        url_for,
+        "DELETE",
+        {"repository": other_repository, "upload_uuid": upload_uuid},
+        expected_code=404,
+        headers=_blob_auth_headers(other_repository),
+    )
+
+    with patch.dict(realapp.config, {"ALLOWED_HASH_ALGORITHMS": ["sha256"]}):
+        conduct_call(
+            client,
+            "v2.cancel_upload",
+            url_for,
+            "DELETE",
+            {"repository": repository, "upload_uuid": upload_uuid},
+            expected_code=204,
+            headers=headers.copy(),
+        )
+
+    assert not BlobUpload.select().where(BlobUpload.uuid == upload_uuid).exists()
+    preserved = BlobUpload.get(uuid=other_upload_uuid)
+    assert preserved.requested_digest_algorithm is None
+    assert preserved.requested_digest_state is None
+    assert (
+        ImageStorage.select().count(),
+        UploadedBlob.select().count(),
+        RepositoryBlobDigest.select().count(),
+    ) == initial_content_rows
+
+    conduct_call(
+        client,
+        "v2.cancel_upload",
+        url_for,
+        "DELETE",
+        {"repository": repository, "upload_uuid": other_upload_uuid},
         expected_code=204,
         headers=headers.copy(),
     )

@@ -186,7 +186,7 @@ def lookup_expired_uploaded_blobs(repository):
     )
 
 
-def get_stale_blob_upload(stale_timespan):
+def get_stale_blob_upload(stale_timespan, excluded_upload_uuids=None):
     """
     Returns a blob upload which was created before the stale timespan.
     """
@@ -198,6 +198,8 @@ def get_stale_blob_upload(stale_timespan):
             .join(ImageStorageLocation)
             .where(BlobUpload.created <= stale_threshold)
         )
+        if excluded_upload_uuids:
+            candidates = candidates.where(BlobUpload.uuid.not_in(excluded_upload_uuids))
 
         return candidates.get()
     except BlobUpload.DoesNotExist:

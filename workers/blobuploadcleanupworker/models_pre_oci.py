@@ -9,8 +9,10 @@ from workers.blobuploadcleanupworker.models_interface import (
 
 
 class PreOCIModel(BlobUploadCleanupWorkerDataInterface):
-    def get_stale_blob_upload(self, stale_threshold):
-        blob_upload = model.blob.get_stale_blob_upload(stale_threshold)
+    def get_stale_blob_upload(self, stale_threshold, excluded_upload_uuids=None):
+        blob_upload = model.blob.get_stale_blob_upload(
+            stale_threshold, excluded_upload_uuids=excluded_upload_uuids
+        )
         if blob_upload is None:
             return None
 

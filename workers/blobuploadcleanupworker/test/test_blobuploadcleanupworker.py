@@ -1,10 +1,13 @@
 from contextlib import contextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import boto3
 from mock import Mock, patch
 
 from app import app as realapp
+from data import model as data_model
+from data.database import BlobUpload as BlobUploadTable
+from digest import digest_tools
 from test.fixtures import *
 from workers.blobuploadcleanupworker.blobuploadcleanupworker import (
     LOCK_TTL,
@@ -12,6 +15,53 @@ from workers.blobuploadcleanupworker.blobuploadcleanupworker import (
     BlobUploadCleanupWorker,
 )
 from workers.blobuploadcleanupworker.models_pre_oci import pre_oci_model as model
+
+
+@contextmanager
+def _keep_test_database_connected(_):
+    yield
+
+
+def _run_upload_cleanup(storage_mock):
+    with (
+        patch(
+            "workers.blobuploadcleanupworker.blobuploadcleanupworker.UseThenDisconnect",
+            _keep_test_database_connected,
+        ),
+        patch("workers.blobuploadcleanupworker.blobuploadcleanupworker.storage", storage_mock),
+    ):
+        BlobUploadCleanupWorker()._cleanup_uploads()
+
+
+def _create_upload(
+    upload_uuid,
+    repository_name="simple",
+    requested_digest_algorithm=None,
+    requested_digest_state=None,
+    stale=True,
+):
+    repository = data_model.repository.get_repository("devtable", repository_name)
+    upload = data_model.blob.initiate_upload_for_repo(
+        repository,
+        upload_uuid,
+        "local_us",
+        {"upload": upload_uuid},
+        requested_digest_algorithm=requested_digest_algorithm,
+        requested_digest_state=requested_digest_state,
+    )
+    if stale:
+        upload.created = datetime.now() - timedelta(days=60)
+        upload.save()
+    return upload
+
+
+def _requested_digest_state(algorithm):
+    return digest_tools.serialize_resumable_hasher(
+        algorithm,
+        digest_tools.create_resumable_hasher(algorithm),
+        bytes_hashed=0,
+        origin=digest_tools.RESUMABLE_HASH_ORIGIN_HINT,
+    )
 
 
 def test_blobuploadcleanupworker(initialized_db):
@@ -37,7 +87,138 @@ def test_blobuploadcleanupworker(initialized_db):
     storage_mock.cancel_chunked_upload.assert_called_once()
 
     # Ensure the blob no longer exists.
-    model.blob_upload_exists(blob_upload.uuid)
+    assert not model.blob_upload_exists(blob_upload.uuid)
+
+
+def test_story16_expiration_removes_all_hash_state_variants_and_is_isolated(initialized_db):
+    stale_uploads = [
+        _create_upload("story16-legacy"),
+        _create_upload("story16-sha256", requested_digest_algorithm="sha256"),
+        _create_upload(
+            "story16-sha384",
+            requested_digest_algorithm="sha384",
+            requested_digest_state=_requested_digest_state("sha384"),
+        ),
+        _create_upload(
+            "story16-sha512-disabled",
+            requested_digest_algorithm="sha512",
+            requested_digest_state=_requested_digest_state("sha512"),
+        ),
+        _create_upload("story16-missing-state", requested_digest_algorithm="sha384"),
+        _create_upload("story16-orphan-state", requested_digest_state="orphaned-state"),
+        _create_upload(
+            "story16-corrupt-state",
+            requested_digest_algorithm="sha512",
+            requested_digest_state="corrupt-state",
+        ),
+        _create_upload(
+            "story16-unknown-algorithm",
+            requested_digest_algorithm="sha999",
+            requested_digest_state="unknown-state",
+        ),
+    ]
+    fresh_upload = _create_upload(
+        "story16-fresh-other-repository",
+        repository_name="complex",
+        requested_digest_algorithm="sha512",
+        requested_digest_state=_requested_digest_state("sha512"),
+        stale=False,
+    )
+    storage_mock = Mock()
+
+    with patch.dict(realapp.config, {"ALLOWED_HASH_ALGORITHMS": ["sha256"]}):
+        _run_upload_cleanup(storage_mock)
+
+    assert (
+        not BlobUploadTable.select()
+        .where(BlobUploadTable.id << [upload.id for upload in stale_uploads])
+        .exists()
+    )
+    preserved = BlobUploadTable.get_by_id(fresh_upload.id)
+    assert preserved.requested_digest_algorithm == "sha512"
+    assert preserved.requested_digest_state == fresh_upload.requested_digest_state
+    assert storage_mock.cancel_chunked_upload.call_count == len(stale_uploads)
+    actual_cancellations = {
+        (tuple(cancellation.args[0]), cancellation.args[1], cancellation.args[2]["upload"])
+        for cancellation in storage_mock.cancel_chunked_upload.call_args_list
+    }
+    assert actual_cancellations == {
+        (("local_us",), upload.uuid, upload.uuid) for upload in stale_uploads
+    }
+
+
+def test_story16_expiration_retries_storage_failure_before_discarding_state(initialized_db):
+    state = _requested_digest_state("sha512")
+    upload = _create_upload(
+        "story16-retry",
+        requested_digest_algorithm="sha512",
+        requested_digest_state=state,
+    )
+    independent_upload = _create_upload(
+        "story16-retry-independent",
+        repository_name="complex",
+        requested_digest_algorithm="sha384",
+        requested_digest_state=_requested_digest_state("sha384"),
+    )
+    storage_mock = Mock()
+
+    def fail_one_upload(_locations, upload_uuid, _metadata):
+        if upload_uuid == upload.uuid:
+            raise OSError("temporary storage failure")
+
+    storage_mock.cancel_chunked_upload.side_effect = fail_one_upload
+    _run_upload_cleanup(storage_mock)
+
+    persisted = BlobUploadTable.get_by_id(upload.id)
+    assert persisted.requested_digest_algorithm == "sha512"
+    assert persisted.requested_digest_state == state
+    assert not BlobUploadTable.select().where(BlobUploadTable.id == independent_upload.id).exists()
+
+    storage_mock.cancel_chunked_upload.side_effect = None
+    _run_upload_cleanup(storage_mock)
+
+    assert not BlobUploadTable.select().where(BlobUploadTable.id == upload.id).exists()
+    assert storage_mock.cancel_chunked_upload.call_count == 3
+
+
+def test_story16_expiration_treats_missing_storage_as_idempotent_success(initialized_db):
+    upload = _create_upload(
+        "story16-storage-missing",
+        requested_digest_algorithm="sha512",
+        requested_digest_state="corrupt-state",
+    )
+    storage_mock = Mock()
+    storage_mock.cancel_chunked_upload.side_effect = FileNotFoundError("already removed")
+
+    _run_upload_cleanup(storage_mock)
+    _run_upload_cleanup(storage_mock)
+
+    assert not BlobUploadTable.select().where(BlobUploadTable.id == upload.id).exists()
+    storage_mock.cancel_chunked_upload.assert_called_once_with(
+        ["local_us"], upload.uuid, {"upload": upload.uuid}
+    )
+
+
+def test_story16_expiration_tolerates_upload_disappearance_and_repeated_cleanup(initialized_db):
+    upload = _create_upload(
+        "story16-disappears",
+        requested_digest_algorithm="sha384",
+        requested_digest_state="corrupt-state",
+    )
+    storage_mock = Mock()
+
+    def remove_upload_during_storage_cleanup(*_args):
+        BlobUploadTable.delete().where(BlobUploadTable.id == upload.id).execute()
+
+    storage_mock.cancel_chunked_upload.side_effect = remove_upload_during_storage_cleanup
+
+    _run_upload_cleanup(storage_mock)
+    _run_upload_cleanup(storage_mock)
+
+    assert not BlobUploadTable.select().where(BlobUploadTable.id == upload.id).exists()
+    storage_mock.cancel_chunked_upload.assert_called_once_with(
+        ["local_us"], upload.uuid, {"upload": upload.uuid}
+    )
 
 
 def test_blobuploadcleanupworker_calls_mpu_cleanup(initialized_db):

@@ -105,16 +105,20 @@ class BlobUploadCleanupWorker(Worker):
         Performs cleanup on the blobupload table.
         """
         logger.debug("Performing blob upload cleanup")
+        failed_uploads = set()
 
         while True:
             # Find all blob uploads older than the threshold (typically a week) and delete them.
             with UseThenDisconnect(app.config):
-                stale_upload = model.get_stale_blob_upload(DELETION_DATE_THRESHOLD)
+                stale_upload = model.get_stale_blob_upload(
+                    DELETION_DATE_THRESHOLD, excluded_upload_uuids=failed_uploads
+                )
                 if stale_upload is None:
                     logger.debug("No additional stale blob uploads found")
                     return
 
-            # Remove the stale upload from storage.
+            # Remove the stale upload from storage before deleting the only copy of its storage
+            # metadata and requested-digest hash state.
             logger.debug("Removing stale blob upload %s", stale_upload.uuid)
             assert stale_upload.created <= (datetime.utcnow() - DELETION_DATE_THRESHOLD)
 
@@ -122,14 +126,18 @@ class BlobUploadCleanupWorker(Worker):
                 storage.cancel_chunked_upload(
                     [stale_upload.location_name], stale_upload.uuid, stale_upload.storage_metadata
                 )
+            except FileNotFoundError:
+                logger.debug("Stale blob upload %s was already removed", stale_upload.uuid)
             except Exception as ex:
-                logger.debug(
-                    "Got error when trying to cancel chunked upload %s: %s",
+                logger.warning(
+                    "Could not cancel stale blob upload %s; retaining it for retry: %s",
                     stale_upload.uuid,
                     str(ex),
                 )
+                failed_uploads.add(stale_upload.uuid)
+                continue
 
-            # Delete the stale upload's row.
+            # Delete the stale upload's row only after storage cleanup succeeds or is already done.
             with UseThenDisconnect(app.config):
                 model.delete_blob_upload(stale_upload)
 

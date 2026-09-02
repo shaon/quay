@@ -321,6 +321,11 @@ def test_corrupt_requested_digest_state_is_rejected(algorithm, registry_model):
     storage = DistributedStorage({"local_us": FakeStorage(None)}, ["local_us"])
     settings = BlobUploadSettings("2M", 3600)
     app_config = {"TESTING": True}
+    registration_count = (
+        RepositoryBlobDigest.select()
+        .where(RepositoryBlobDigest.repository == repository_ref.id)
+        .count()
+    )
     manager = create_blob_upload(
         repository_ref, storage, settings, requested_digest_algorithm=algorithm
     )
@@ -336,9 +341,60 @@ def test_corrupt_requested_digest_state_is_rejected(algorithm, registry_model):
         RepositoryBlobDigest.select()
         .where(RepositoryBlobDigest.repository == repository_ref.id)
         .count()
-        == 0
+        == registration_count
     )
     manager.cancel_upload()
+
+
+@pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
+def test_story16_cancel_removes_requested_digest_state_and_temporary_bytes(
+    algorithm, registry_model
+):
+    repository_ref = registry_model.lookup_repository("devtable", "complex")
+    storage = DistributedStorage({"local_us": FakeStorage(None)}, ["local_us"])
+    settings = BlobUploadSettings("2M", 3600)
+    manager = create_blob_upload(
+        repository_ref, storage, settings, requested_digest_algorithm=algorithm
+    )
+    manager.upload_chunk({"TESTING": True}, BytesIO(b"abandoned alternative upload"))
+    upload_id = manager.blob_upload_id
+
+    persisted = BlobUpload.get(uuid=upload_id)
+    assert persisted.requested_digest_algorithm == algorithm
+    assert persisted.requested_digest_state is not None
+    assert storage.exists(["local_us"], upload_id)
+
+    manager.cancel_upload()
+
+    assert not BlobUpload.select().where(BlobUpload.uuid == upload_id).exists()
+    assert not storage.exists(["local_us"], upload_id)
+
+
+@pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
+def test_story16_successful_resume_removes_hash_state_and_keeps_canonical_content(
+    algorithm, registry_model
+):
+    repository_ref = registry_model.lookup_repository("devtable", "complex")
+    storage = DistributedStorage({"local_us": FakeStorage(None)}, ["local_us"])
+    settings = BlobUploadSettings("2M", 3600)
+    content = b"successfully finalized alternative upload"
+    requested_digest = Digest.parse_digest(
+        f"{algorithm}:" + hashlib.new(algorithm, content).hexdigest(), strict=True
+    )
+    manager = create_blob_upload(
+        repository_ref, storage, settings, requested_digest_algorithm=algorithm
+    )
+    manager.upload_chunk({"TESTING": True}, BytesIO(content[:17]))
+    upload_id = manager.blob_upload_id
+
+    manager = retrieve_blob_upload_manager(repository_ref, upload_id, storage, settings)
+    manager.upload_chunk({"TESTING": True}, BytesIO(content[17:]))
+    blob = manager.commit_to_blob({"TESTING": True}, requested_digest)
+
+    assert not BlobUpload.select().where(BlobUpload.uuid == upload_id).exists()
+    assert blob.digest == "sha256:" + hashlib.sha256(content).hexdigest()
+    assert storage.get_content(["local_us"], blob.storage_path) == content
+    assert registry_model.get_repo_blob_by_digest(repository_ref, str(requested_digest)) == blob
 
 
 def test_legacy_null_requested_digest_state_resumes_sha256(registry_model):
