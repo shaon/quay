@@ -5,7 +5,7 @@ from six import add_metaclass
 
 
 class BlobUpload(
-    namedtuple("BlobUpload", ["uuid", "storage_metadata", "location_name", "created"])
+    namedtuple("BlobUpload", ["id", "uuid", "storage_metadata", "location_name", "created"])
 ):
     """
     BlobUpload represents a single upload of a blob in progress or previously started.
@@ -20,10 +20,15 @@ class BlobUploadCleanupWorkerDataInterface(object):
     """
 
     @abstractmethod
-    def get_stale_blob_upload(self, stale_threshold, excluded_upload_uuids=None):
+    def get_blob_upload_max_id(self):
+        """Returns the current maximum BlobUpload primary key, or None if the table is empty."""
+        pass
+
+    @abstractmethod
+    def get_stale_blob_upload(self, stale_before, after_upload_id, max_upload_id):
         """
-        Returns a BlobUpload that was created on or before the current date/time minus the stale
-        threshold and is not in the optional excluded UUID collection.
+        Returns the next BlobUpload created on or before the fixed stale cutoff, ordered by primary
+        key within the exclusive lower and inclusive upper ID bounds.
 
         If none, returns None.
         """

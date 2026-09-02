@@ -5,6 +5,7 @@ import random
 import string
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+from io import BytesIO
 from unittest.mock import patch as mock_patch
 
 import pytest
@@ -15,6 +16,7 @@ from playhouse.test_utils import assert_query_count
 from app import docker_v2_signing_key, model_cache, storage
 from data import database, model
 from data.database import (
+    BlobUpload,
     ExternalNotificationMethod,
     ImageStorage,
     ImageStorageLocation,
@@ -659,6 +661,40 @@ def test_story15_purge_repository_removes_digest_registrations(default_tag_polic
     )
     assert RepositoryBlobDigest.get_by_id(survivor_registration.id).repository_id == survivor.id
     assert ImageStorage.get_by_id(shared_blob_id).content_checksum.startswith("sha256:")
+
+
+def test_story16_repository_purge_discards_upload_metadata_without_storage_cancellation(
+    default_tag_policy, initialized_db
+):
+    repository = model.repository.create_repository("devtable", "story16-purge-upload", None)
+    upload_uuid, metadata = storage.initiate_chunked_upload(["local_us"])
+    content = b"repository purge leaves temporary upload storage"
+    written, metadata, error = storage.stream_upload_chunk(
+        ["local_us"], upload_uuid, 0, len(content), BytesIO(content), metadata
+    )
+    assert error is None
+    assert written == len(content)
+    upload = model.blob.initiate_upload_for_repo(
+        repository,
+        upload_uuid,
+        "local_us",
+        metadata,
+        requested_digest_algorithm="sha512",
+        requested_digest_state="persisted-requested-state",
+    )
+
+    try:
+        assert storage.exists(["local_us"], upload_uuid)
+        with mock_patch.object(
+            storage, "cancel_chunked_upload", wraps=storage.cancel_chunked_upload
+        ) as cancel:
+            assert model.gc.purge_repository(repository, force=True)
+
+        cancel.assert_not_called()
+        assert BlobUpload.get_or_none(BlobUpload.id == upload.id) is None
+        assert storage.exists(["local_us"], upload_uuid)
+    finally:
+        storage.cancel_chunked_upload(["local_us"], upload_uuid, metadata)
 
 
 def test_purge_repository_storage_blob(default_tag_policy, initialized_db):

@@ -2,6 +2,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 
 import boto3
+from freezegun import freeze_time
 from mock import Mock, patch
 
 from app import app as realapp
@@ -10,6 +11,7 @@ from data.database import BlobUpload as BlobUploadTable
 from digest import digest_tools
 from test.fixtures import *
 from workers.blobuploadcleanupworker.blobuploadcleanupworker import (
+    DELETION_DATE_THRESHOLD,
     LOCK_TTL,
     MPU_DELETION_DATE_THRESHOLD,
     BlobUploadCleanupWorker,
@@ -147,6 +149,68 @@ def test_story16_expiration_removes_all_hash_state_variants_and_is_isolated(init
     }
 
 
+def test_story16_expiration_bounds_high_failure_cardinality(initialized_db):
+    uploads = [_create_upload(f"story16-bounded-failure-{index}") for index in range(64)]
+    storage_mock = Mock()
+    inserted_during_pass = None
+
+    def fail_and_insert(_locations, _upload_uuid, _metadata):
+        nonlocal inserted_during_pass
+        if inserted_during_pass is None:
+            inserted_during_pass = _create_upload("story16-inserted-during-pass")
+        raise OSError("storage unavailable")
+
+    storage_mock.cancel_chunked_upload.side_effect = fail_and_insert
+    database = BlobUploadTable._meta.database.obj
+
+    with patch.object(database, "execute_sql", wraps=database.execute_sql) as execute_sql:
+        _run_upload_cleanup(storage_mock)
+
+    selection_queries = [
+        call
+        for call in execute_sql.call_args_list
+        if call.args
+        and call.args[0].lstrip().upper().startswith("SELECT")
+        and 'FROM "blobupload" AS "t1"' in call.args[0]
+        and 'JOIN "imagestoragelocation"' in call.args[0]
+    ]
+    assert len(selection_queries) == len(uploads) + 1
+    assert all("NOT IN" not in call.args[0].upper() for call in selection_queries)
+    assert all('ORDER BY "t1"."id"' in call.args[0] for call in selection_queries)
+    assert all('"requested_digest_state"' not in call.args[0] for call in selection_queries)
+    assert max(len(call.args[1]) for call in selection_queries) <= 5
+    assert [call.args[1] for call in storage_mock.cancel_chunked_upload.call_args_list] == [
+        upload.uuid for upload in uploads
+    ]
+    assert BlobUploadTable.select().where(
+        BlobUploadTable.id << [upload.id for upload in uploads]
+    ).count() == len(uploads)
+    assert inserted_during_pass is not None
+    assert BlobUploadTable.get_by_id(inserted_during_pass.id).uuid == inserted_during_pass.uuid
+
+
+def test_story16_expiration_uses_fixed_stale_cutoff(initialized_db):
+    start = datetime(2026, 1, 1, 0, 0, 0)
+    with freeze_time(start) as frozen_time:
+        stale_upload = _create_upload("story16-fixed-cutoff-stale")
+        newly_stale_upload = _create_upload("story16-fixed-cutoff-new", stale=False)
+        newly_stale_upload.created = datetime.now() - DELETION_DATE_THRESHOLD + timedelta(seconds=1)
+        newly_stale_upload.save()
+        storage_mock = Mock()
+
+        def fail_after_time_advance(_locations, _upload_uuid, _metadata):
+            frozen_time.move_to(start + timedelta(seconds=2))
+            raise OSError("storage unavailable")
+
+        storage_mock.cancel_chunked_upload.side_effect = fail_after_time_advance
+        _run_upload_cleanup(storage_mock)
+
+    storage_mock.cancel_chunked_upload.assert_called_once_with(
+        ["local_us"], stale_upload.uuid, {"upload": stale_upload.uuid}
+    )
+    assert BlobUploadTable.get_by_id(newly_stale_upload.id).uuid == newly_stale_upload.uuid
+
+
 def test_story16_expiration_retries_storage_failure_before_discarding_state(initialized_db):
     state = _requested_digest_state("sha512")
     upload = _create_upload(
@@ -207,15 +271,27 @@ def test_story16_expiration_tolerates_upload_disappearance_and_repeated_cleanup(
     )
     storage_mock = Mock()
 
-    def remove_upload_during_storage_cleanup(*_args):
+    replacement = None
+
+    def replace_upload_during_storage_cleanup(*_args):
+        nonlocal replacement
         BlobUploadTable.delete().where(BlobUploadTable.id == upload.id).execute()
+        replacement = _create_upload(
+            upload.uuid,
+            requested_digest_algorithm="sha512",
+            requested_digest_state="replacement-state",
+            stale=False,
+        )
 
-    storage_mock.cancel_chunked_upload.side_effect = remove_upload_during_storage_cleanup
+    storage_mock.cancel_chunked_upload.side_effect = replace_upload_during_storage_cleanup
 
     _run_upload_cleanup(storage_mock)
     _run_upload_cleanup(storage_mock)
 
-    assert not BlobUploadTable.select().where(BlobUploadTable.id == upload.id).exists()
+    assert replacement is not None
+    persisted = BlobUploadTable.get_by_id(replacement.id)
+    assert persisted.requested_digest_algorithm == "sha512"
+    assert persisted.requested_digest_state == "replacement-state"
     storage_mock.cancel_chunked_upload.assert_called_once_with(
         ["local_us"], upload.uuid, {"upload": upload.uuid}
     )

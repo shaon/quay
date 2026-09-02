@@ -105,17 +105,23 @@ class BlobUploadCleanupWorker(Worker):
         Performs cleanup on the blobupload table.
         """
         logger.debug("Performing blob upload cleanup")
-        failed_uploads = set()
+        stale_before = datetime.utcnow() - DELETION_DATE_THRESHOLD
+        last_upload_id = 0
+
+        with UseThenDisconnect(app.config):
+            max_upload_id = model.get_blob_upload_max_id()
 
         while True:
-            # Find all blob uploads older than the threshold (typically a week) and delete them.
+            # Walk a fixed primary-key range in deterministic order. Advancing the cursor before
+            # storage cleanup ensures that each selected row is attempted only once in this pass.
             with UseThenDisconnect(app.config):
                 stale_upload = model.get_stale_blob_upload(
-                    DELETION_DATE_THRESHOLD, excluded_upload_uuids=failed_uploads
+                    stale_before, last_upload_id, max_upload_id
                 )
                 if stale_upload is None:
                     logger.debug("No additional stale blob uploads found")
                     return
+                last_upload_id = stale_upload.id
 
             # Remove the stale upload from storage before deleting the only copy of its storage
             # metadata and requested-digest hash state.
@@ -134,7 +140,6 @@ class BlobUploadCleanupWorker(Worker):
                     stale_upload.uuid,
                     str(ex),
                 )
-                failed_uploads.add(stale_upload.uuid)
                 continue
 
             # Delete the stale upload's row only after storage cleanup succeeds or is already done.

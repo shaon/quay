@@ -2,7 +2,7 @@ import logging
 from datetime import datetime, timedelta
 from uuid import uuid4
 
-from peewee import IntegrityError
+from peewee import IntegrityError, fn
 
 from data.database import (
     BlobUpload,
@@ -186,22 +186,35 @@ def lookup_expired_uploaded_blobs(repository):
     )
 
 
-def get_stale_blob_upload(stale_timespan, excluded_upload_uuids=None):
-    """
-    Returns a blob upload which was created before the stale timespan.
-    """
-    stale_threshold = datetime.now() - stale_timespan
+def get_blob_upload_max_id():
+    """Returns the current maximum blob upload ID, or None when no uploads exist."""
+    return BlobUpload.select(fn.Max(BlobUpload.id)).scalar()
+
+
+def get_stale_blob_upload(stale_before, after_upload_id, max_upload_id):
+    """Returns the next stale blob upload in a bounded primary-key range."""
+    if max_upload_id is None:
+        return None
 
     try:
-        candidates = (
-            BlobUpload.select(BlobUpload, ImageStorageLocation)
+        return (
+            BlobUpload.select(
+                BlobUpload.id,
+                BlobUpload.uuid,
+                BlobUpload.storage_metadata,
+                BlobUpload.location,
+                BlobUpload.created,
+                ImageStorageLocation,
+            )
             .join(ImageStorageLocation)
-            .where(BlobUpload.created <= stale_threshold)
+            .where(
+                BlobUpload.created <= stale_before,
+                BlobUpload.id > after_upload_id,
+                BlobUpload.id <= max_upload_id,
+            )
+            .order_by(BlobUpload.id)
+            .get()
         )
-        if excluded_upload_uuids:
-            candidates = candidates.where(BlobUpload.uuid.not_in(excluded_upload_uuids))
-
-        return candidates.get()
     except BlobUpload.DoesNotExist:
         return None
 
