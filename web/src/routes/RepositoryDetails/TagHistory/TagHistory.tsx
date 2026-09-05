@@ -2,7 +2,11 @@ import {useMemo, useState} from 'react';
 import {Spinner} from '@patternfly/react-core';
 import {Table, Tbody, Td, Th, Thead, Tr} from '@patternfly/react-table';
 import {useAllTags} from 'src/hooks/UseTags';
-import {Tag} from 'src/resources/TagResource';
+import {ManifestDigestIdentity, Tag} from 'src/resources/TagResource';
+import {
+  preferredManifestDigest,
+  retainedManifestDigest,
+} from 'src/libs/manifestDigests';
 import {formatDate, isNullOrUndefined} from 'src/libs/utils';
 import {RepositoryDetails} from 'src/resources/RepositoryResource';
 import Conditional from 'src/components/empty/Conditional';
@@ -179,6 +183,16 @@ function processTags(tags: Tag[], showFuture: boolean) {
     action: TagAction,
     digest: string = null,
     oldDigest: string = null,
+    digestIdentities: ManifestDigestIdentity[] = tag.manifest_digests,
+    oldDigestIdentities: ManifestDigestIdentity[] = undefined,
+    cleanupDigest: string = retainedManifestDigest(
+      digestIdentities,
+      tag.manifest_digest,
+    ),
+    cleanupOldDigest: string = retainedManifestDigest(
+      oldDigestIdentities,
+      tag.manifest_digest,
+    ),
   ) => {
     if (!showFuture && time && time * 1000 >= new Date().getTime()) {
       return;
@@ -187,8 +201,24 @@ function processTags(tags: Tag[], showFuture: boolean) {
       action: action,
       time: time * 1000,
       tag: tag,
-      digest: digest != null ? digest : tag.manifest_digest,
+      digest:
+        digest != null
+          ? digest
+          : (preferredManifestDigest(
+              tag.manifest_digests,
+              tag.manifest_digest,
+            ) ?? tag.manifest_digest),
+      digestIdentities,
+      canRestoreDigest:
+        digestIdentities === undefined ||
+        digestIdentities.some((identity) => identity.is_enabled),
+      cleanupDigest,
       oldDigest: oldDigest,
+      oldDigestIdentities,
+      canRestoreOldDigest:
+        oldDigestIdentities === undefined ||
+        oldDigestIdentities.some((identity) => identity.is_enabled),
+      cleanupOldDigest,
     };
     tagList.push(entry);
     tagEntries.get(tag.name).push(entry);
@@ -231,7 +261,12 @@ function processTags(tags: Tag[], showFuture: boolean) {
           tag.end_ts,
           futureTag.reversion ? TagAction.Revert : TagAction.Move,
           futureEntry.digest,
-          tag.manifest_digest,
+          preferredManifestDigest(tag.manifest_digests, tag.manifest_digest) ??
+            tag.manifest_digest,
+          futureEntry.digestIdentities,
+          tag.manifest_digests,
+          futureEntry.cleanupDigest,
+          retainedManifestDigest(tag.manifest_digests, tag.manifest_digest),
         );
       } else {
         addEntry(tag, tag.end_ts, TagAction.Delete);

@@ -261,6 +261,25 @@ class OCIModel(RegistryDataInterface):
         if allowed_algorithms is None:
             return manifest
 
+        if manifest.media_type in DOCKER_SCHEMA1_CONTENT_TYPES:
+            if "sha256" not in allowed_algorithms:
+                return None
+            digest = tag._manifest_row.digest
+            if materialize_legacy:
+                digest = oci.manifest.materialize_legacy_manifest_registration(
+                    tag.repository._db_id,
+                    tag._manifest_row,
+                    allowed_algorithms=allowed_algorithms,
+                )
+                if digest is None:
+                    return None
+            return Manifest.for_manifest(
+                tag._manifest_row,
+                self._legacy_image_id_handler,
+                legacy_image_row=manifest._legacy_image_row,
+                digest=digest,
+            )
+
         digest = oci.manifest.get_repository_manifest_digest(
             tag.repository._db_id,
             tag._manifest_row,
@@ -283,6 +302,15 @@ class OCIModel(RegistryDataInterface):
             self._legacy_image_id_handler,
             legacy_image_row=manifest._legacy_image_row,
             digest=digest,
+        )
+
+    def get_repository_manifest_digest_infos(
+        self, repository_ref, manifests, allowed_algorithms=None
+    ):
+        return oci.manifest.get_repository_manifest_digest_infos(
+            repository_ref._db_id,
+            [manifest.id for manifest in manifests],
+            allowed_algorithms=allowed_algorithms,
         )
 
     def lookup_manifest_by_digest(

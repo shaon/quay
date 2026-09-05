@@ -32,18 +32,22 @@ export default function TablePopover(props: TablePopoverProps) {
           >
             {`podman pull ${domain}/${props.org}/${props.repo}:${props.tag}`}
           </ClipboardCopy>
-          <br />
-          <Content component="p" style={{fontWeight: 'bold'}}>
-            Podman Pull (By Digest)
-          </Content>
-          <ClipboardCopy
-            data-testid="copy-digest-podman"
-            isReadOnly
-            hoverTip="Copy"
-            clickTip="Copied"
-          >
-            {`podman pull ${domain}/${props.org}/${props.repo}@${props.digest}`}
-          </ClipboardCopy>
+          {props.digest && (
+            <>
+              <br />
+              <Content component="p" style={{fontWeight: 'bold'}}>
+                Podman Pull (By Digest)
+              </Content>
+              <ClipboardCopy
+                data-testid="copy-digest-podman"
+                isReadOnly
+                hoverTip="Copy"
+                clickTip="Copied"
+              >
+                {`podman pull ${domain}/${props.org}/${props.repo}@${props.digest}`}
+              </ClipboardCopy>
+            </>
+          )}
           <br />
           <Content component="p" style={{fontWeight: 'bold'}}>
             Docker Pull (By Tag)
@@ -56,18 +60,22 @@ export default function TablePopover(props: TablePopoverProps) {
           >
             {`docker pull ${domain}/${props.org}/${props.repo}:${props.tag}`}
           </ClipboardCopy>
-          <br />
-          <Content component="p" style={{fontWeight: 'bold'}}>
-            Docker Pull (By Digest)
-          </Content>
-          <ClipboardCopy
-            data-testid="copy-digest-docker"
-            isReadOnly
-            hoverTip="Copy"
-            clickTip="Copied"
-          >
-            {`docker pull ${domain}/${props.org}/${props.repo}@${props.digest}`}
-          </ClipboardCopy>
+          {props.digest && (
+            <>
+              <br />
+              <Content component="p" style={{fontWeight: 'bold'}}>
+                Docker Pull (By Digest)
+              </Content>
+              <ClipboardCopy
+                data-testid="copy-digest-docker"
+                isReadOnly
+                hoverTip="Copy"
+                clickTip="Copied"
+              >
+                {`docker pull ${domain}/${props.org}/${props.repo}@${props.digest}`}
+              </ClipboardCopy>
+            </>
+          )}
         </div>
       }
     >
@@ -86,6 +94,6 @@ type TablePopoverProps = {
   org: string;
   repo: string;
   tag: string;
-  digest: string;
+  digest?: string;
   children: React.ReactNode;
 };

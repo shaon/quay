@@ -2,13 +2,18 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 
 import features
+from app import app
 from auth.permissions import ReadRepositoryPermission
 from data import model
 from data.database import Repository as RepositoryTable
 from data.database import RepositoryState
 from data.registry_model import registry_model
 from data.registry_model.datatypes import RepositoryReference
-from endpoints.api import allow_if_global_readonly_superuser, allow_if_superuser
+from endpoints.api import (
+    allow_if_global_readonly_superuser,
+    allow_if_superuser,
+    format_manifest_digest_infos,
+)
 from endpoints.api.repository_models_interface import (
     Count,
     ImageRepositoryRepository,
@@ -250,8 +255,17 @@ class PreOCIModel(RepositoryDataInterface):
         tags = None
         repo_ref = RepositoryReference.for_repo_obj(repo)
         if include_tags:
-            tags, _ = registry_model.list_repository_tag_history(
+            registry_tags, _ = registry_model.list_repository_tag_history(
                 repo_ref, page=1, size=max_tags, active_tags_only=True
+            )
+            manifests_by_id = {}
+            for tag in registry_tags:
+                manifest = tag.manifest
+                manifests_by_id[manifest.id] = manifest
+            digest_infos = registry_model.get_repository_manifest_digest_infos(
+                repo_ref,
+                manifests_by_id.values(),
+                allowed_algorithms=app.config.get("ALLOWED_HASH_ALGORITHMS", ["sha256"]),
             )
             tags = [
                 Tag(
@@ -259,9 +273,10 @@ class PreOCIModel(RepositoryDataInterface):
                     tag.manifest_layers_size,
                     tag.lifetime_start_ts,
                     tag.manifest_digest,
+                    format_manifest_digest_infos(digest_infos[tag.manifest.id]),
                     tag.lifetime_end_ts,
                 )
-                for tag in tags
+                for tag in registry_tags
             ]
 
         start_date = datetime.now() - timedelta(days=MAX_DAYS_IN_3_MONTHS)

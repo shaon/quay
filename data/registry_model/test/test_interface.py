@@ -1069,15 +1069,12 @@ def test_repository_digest_registration_live_concurrency(registry_model):
 )
 def test_repository_manifest_digest_registration_live_concurrency(registry_model):
     repository = registry_model.lookup_repository("devtable", "simple")
-    manifest_id = (
-        Manifest.select(Manifest.id)
-        .where(Manifest.repository == repository.id)
-        .order_by(Manifest.id)
-        .get()
-        .id
+    manifest = (
+        Manifest.select().where(Manifest.repository == repository.id).order_by(Manifest.id).get()
     )
+    manifest_id = manifest.id
     storage_id = ImageStorage.select(ImageStorage.id).order_by(ImageStorage.id).get().id
-    digest = "sha512:" + hashlib.sha512(uuid.uuid4().bytes).hexdigest()
+    digest = manifest.digest
     barrier = threading.Barrier(2, timeout=10)
     thread_state = threading.local()
     errors = []

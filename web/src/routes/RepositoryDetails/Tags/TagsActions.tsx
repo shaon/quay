@@ -38,6 +38,7 @@ export default function TagActions(props: TagActionsProps) {
   const dropdownItems = [
     <DropdownItem
       key="add-tag-action"
+      isDisabled={!props.manifest}
       onClick={() => {
         setIsOpen(false);
         setIsAddTagModalOpen(true);
@@ -47,6 +48,7 @@ export default function TagActions(props: TagActionsProps) {
     </DropdownItem>,
     <DropdownItem
       key="edit-labels-action"
+      isDisabled={!props.manifest}
       onClick={() => {
         setIsOpen(false);
         setIsEditLabelsModalOpen(true);
@@ -65,8 +67,8 @@ export default function TagActions(props: TagActionsProps) {
         isNonNormalRepo
           ? {content: 'Tag expiration cannot be modified on this repository'}
           : props.isImmutable
-          ? {content: 'Cannot change expiration of immutable tag'}
-          : undefined
+            ? {content: 'Cannot change expiration of immutable tag'}
+            : undefined
       }
     >
       Change expiration

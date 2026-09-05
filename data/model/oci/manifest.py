@@ -16,6 +16,7 @@ from data.database import (
     ManifestBlob,
     ManifestChild,
     ManifestSecurityStatus,
+    MediaType,
     Repository,
     RepositoryManifestDigest,
     RepositoryNotification,
@@ -36,7 +37,7 @@ from data.model.oci.tag import (
     get_child_manifests,
 )
 from data.model.quota import QuotaOperation, update_quota
-from image.docker.schema1 import ManifestException
+from image.docker.schema1 import DOCKER_SCHEMA1_CONTENT_TYPES, ManifestException
 from image.docker.schema2 import EMPTY_LAYER_BLOB_DIGEST, EMPTY_LAYER_BYTES
 from image.docker.schema2.list import MalformedSchema2ManifestList
 from image.shared.interfaces import ManifestInterface, ManifestListInterface
@@ -68,6 +69,9 @@ def is_manifest_present(manifest) -> bool:
 
 
 CreatedManifest = namedtuple("CreatedManifest", ["manifest", "newly_created", "labels_to_apply"])
+RepositoryManifestDigestInfo = namedtuple(
+    "RepositoryManifestDigestInfo", ["digest", "is_enabled", "is_preferred"]
+)
 
 
 class CreateManifestException(Exception):
@@ -207,6 +211,13 @@ def lookup_canonical_manifest(
     return found
 
 
+def _is_schema1_manifest(manifest):
+    media_type = manifest.media_type
+    if not isinstance(media_type, str):
+        media_type = Manifest.media_type.get_name(manifest.media_type_id)
+    return media_type in DOCKER_SCHEMA1_CONTENT_TYPES
+
+
 def _lookup_manifest(repository_id, manifest_digest, allow_dead=False, allow_hidden=False):
     matching_registration = RepositoryManifestDigest.alias()
     matching_registration_exists = fn.EXISTS(
@@ -226,8 +237,12 @@ def _lookup_manifest(repository_id, manifest_digest, allow_dead=False, allow_hid
                 any_registration.manifest == Manifest.id,
             )
         )
+        schema1_media_type_ids = [
+            Manifest.media_type.get_id(media_type) for media_type in DOCKER_SCHEMA1_CONTENT_TYPES
+        ]
         identity_condition = matching_registration_exists | (
-            (Manifest.digest == manifest_digest) & ~any_registration_exists
+            (Manifest.digest == manifest_digest)
+            & (~any_registration_exists | Manifest.media_type.in_(schema1_media_type_ids))
         )
 
     query = Manifest.select(
@@ -295,7 +310,17 @@ def _materialize_legacy_manifest_registration(repository_id, manifest_digest, ma
         manifest is not None
         and manifest_digest.startswith("sha256:")
         and manifest.digest == manifest_digest
-        and not has_repository_manifest_registration(repository_id, manifest)
+        and (
+            _is_schema1_manifest(manifest)
+            or not has_repository_manifest_registration(repository_id, manifest)
+        )
+        and not RepositoryManifestDigest.select()
+        .where(
+            RepositoryManifestDigest.repository == repository_id,
+            RepositoryManifestDigest.manifest == manifest,
+            RepositoryManifestDigest.digest == manifest_digest,
+        )
+        .exists()
     ):
         register_repository_manifest_digest(repository_id, manifest, manifest_digest)
     return manifest
@@ -341,6 +366,8 @@ def has_repository_manifest_registration(repository_id, manifest):
 def register_repository_manifest_digest(repository_id, manifest, manifest_digest):
     repository_pk = getattr(repository_id, "id", repository_id)
     if manifest.repository_id != repository_pk:
+        raise ManifestDigestConflictException(manifest_digest)
+    if _is_schema1_manifest(manifest) and manifest_digest != manifest.digest:
         raise ManifestDigestConflictException(manifest_digest)
     if manifest_digest.startswith("sha256:") and manifest.digest != manifest_digest:
         raise ManifestDigestConflictException(manifest_digest)
@@ -388,13 +415,84 @@ def get_repository_manifest_digests(repository_id, manifest):
     return [registration.digest for registration in registrations]
 
 
+def get_repository_manifest_digest_infos(repository_id, manifest_ids, allowed_algorithms=None):
+    """Returns explicit repository registrations grouped by manifest ID.
+
+    Unlike ``get_repository_manifest_digests``, this inventory never falls back to a manifest's
+    canonical storage digest. Docker schema 1 inventory is restricted to its historical canonical
+    SHA-256 registration even if stale alternative rows exist.
+    """
+    repository_pk = getattr(repository_id, "id", repository_id)
+    requested_ids = list(
+        dict.fromkeys(getattr(manifest, "id", manifest) for manifest in manifest_ids)
+    )
+    grouped = {manifest_id: [] for manifest_id in requested_ids}
+    if not requested_ids:
+        return grouped
+
+    registrations = (
+        RepositoryManifestDigest.select(
+            RepositoryManifestDigest.manifest.alias("manifest_id"),
+            RepositoryManifestDigest.digest,
+            Manifest.digest.alias("canonical_digest"),
+            MediaType.name.alias("media_type_name"),
+        )
+        .join(Manifest)
+        .join(MediaType)
+        .where(
+            RepositoryManifestDigest.repository == repository_pk,
+            RepositoryManifestDigest.manifest.in_(requested_ids),
+            Manifest.repository == repository_pk,
+        )
+        .order_by(RepositoryManifestDigest.id)
+        .dicts()
+    )
+
+    canonical_by_manifest = {}
+    for registration in registrations:
+        manifest_id = registration["manifest_id"]
+        canonical_digest = registration["canonical_digest"]
+        canonical_by_manifest[manifest_id] = canonical_digest
+        if (
+            registration["media_type_name"] in DOCKER_SCHEMA1_CONTENT_TYPES
+            and registration["digest"] != canonical_digest
+        ):
+            continue
+        grouped[manifest_id].append(registration["digest"])
+
+    allowed = set(allowed_algorithms) if allowed_algorithms is not None else None
+    result = {}
+    for manifest_id, digests in grouped.items():
+        enabled = [
+            digest for digest in digests if allowed is None or digest.partition(":")[0] in allowed
+        ]
+        canonical_digest = canonical_by_manifest.get(manifest_id)
+        preferred = (
+            canonical_digest if canonical_digest in enabled else (enabled[0] if enabled else None)
+        )
+        result[manifest_id] = [
+            RepositoryManifestDigestInfo(
+                digest=digest,
+                is_enabled=digest in enabled,
+                is_preferred=digest == preferred,
+            )
+            for digest in digests
+        ]
+    return result
+
+
 def get_repository_manifest_digest(repository_id, manifest, allowed_algorithms=None):
     """Returns a deterministic enabled repository-visible identity.
 
     When ``allowed_algorithms`` is omitted, this preserves the existing selection behavior. When
-    supplied, registrations using disabled algorithms are excluded. Canonical SHA-256 remains
-    preferred only when it is both repository-visible and enabled.
+    supplied, registrations using disabled algorithms are excluded. Docker schema 1 remains
+    strictly canonical SHA-256 even if stale alternative registrations exist.
     """
+    if _is_schema1_manifest(manifest):
+        if allowed_algorithms is not None and "sha256" not in allowed_algorithms:
+            return None
+        return manifest.digest
+
     digests = get_repository_manifest_digests(repository_id, manifest)
     if allowed_algorithms is not None:
         allowed = set(allowed_algorithms)
@@ -406,11 +504,30 @@ def get_repository_manifest_digest(repository_id, manifest, allowed_algorithms=N
     return digests[0]
 
 
-def get_repository_manifest_scanner_digest(repository_id, manifest):
-    """Returns the stable repository-visible identity used as the external scanner report key."""
+def get_legacy_repository_manifest_scanner_digest(repository_id, manifest):
+    """Return the report key used before Clair reports became canonical SHA-256."""
     manifest_row = manifest if hasattr(manifest, "digest") else Manifest.get_by_id(manifest)
     registrations = get_repository_manifest_digests(repository_id, manifest_row)
     return registrations[0] if registrations else manifest_row.digest
+
+
+def legacy_repository_manifest_scanner_digest_exists(manifest_digest):
+    """Return whether an existing manifest still uses a legacy scanner report key."""
+    earlier_registration = RepositoryManifestDigest.alias()
+    return (
+        RepositoryManifestDigest.select(RepositoryManifestDigest.id)
+        .where(
+            RepositoryManifestDigest.digest == manifest_digest,
+            ~fn.EXISTS(
+                earlier_registration.select(earlier_registration.id).where(
+                    earlier_registration.repository == RepositoryManifestDigest.repository,
+                    earlier_registration.manifest == RepositoryManifestDigest.manifest,
+                    earlier_registration.id < RepositoryManifestDigest.id,
+                )
+            ),
+        )
+        .exists()
+    )
 
 
 def resolve_repository_manifest_descriptor(
@@ -423,6 +540,8 @@ def resolve_repository_manifest_descriptor(
     manifest = lookup_manifest(repository_id, digest, allow_dead=True, allow_hidden=True)
     if manifest is None:
         raise unknown_exception(digest)
+    if _is_schema1_manifest(manifest) and not str(digest).startswith("sha256:"):
+        raise ManifestDigestConflictException(digest)
 
     if size is not None and len(manifest.manifest_bytes.encode("utf-8")) != size:
         raise ManifestDescriptorMismatchException(digest, "size")

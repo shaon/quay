@@ -61,7 +61,16 @@ angular.module('quay').directive('repoTagHistory', function () {
             return
           }
           var tagName = tag.name;
-          var manifestDigest = tag.manifest_digest;
+          var identities = tag.manifest_digests === undefined ? [{
+            'digest': tag.manifest_digest,
+            'is_enabled': true,
+            'is_preferred': true,
+          }] : tag.manifest_digests;
+          var enabled = identities.filter(function(identity) { return identity.is_enabled; });
+          var preferred = enabled.filter(function(identity) { return identity.is_preferred; })[0];
+          var manifestDigest = preferred ? preferred.digest :
+            (enabled.length ? enabled[0].digest :
+              (tag.manifest_digests === undefined ? tag.manifest_digest : null));
 
           if (!tagEntries[tagName]) {
             tagEntries[tagName] = [];
@@ -72,7 +81,11 @@ angular.module('quay').directive('repoTagHistory', function () {
             tagEntries[entry.tag_name].splice(tagEntries[entry.tag_name].indexOf(entry), 1);
           };
 
-          var addEntry = function(action, time, opt_manifest_digest, opt_old_manifest_digest) {
+          var addEntry = function(action, time, opt_manifest_digest, opt_old_manifest_digest,
+                                  opt_manifest_digests, opt_old_manifest_digests,
+                                  opt_cleanup_manifest_digest, opt_cleanup_old_manifest_digest) {
+            var entryIdentities = opt_manifest_digests || identities;
+            var oldEntryIdentities = opt_old_manifest_digests || [];
             var entry = {
               'tag': tag,
               'tag_name': tagName,
@@ -81,8 +94,23 @@ angular.module('quay').directive('repoTagHistory', function () {
               'end_ts': tag.end_ts,
               'reversion': tag.reversion,
               'time': time * 1000, // JS expects ms, not s since epoch.
-              'manifest_digest': opt_manifest_digest || manifestDigest,
-              'old_manifest_digest': opt_old_manifest_digest || null
+              'manifest_digest': opt_manifest_digest !== undefined ?
+                opt_manifest_digest : manifestDigest,
+              'manifest_digests': entryIdentities,
+              'can_restore_manifest_digest': entryIdentities.some(function(identity) {
+                return identity.is_enabled;
+              }),
+              'old_manifest_digest': opt_old_manifest_digest || null,
+              'old_manifest_digests': oldEntryIdentities,
+              'can_restore_old_manifest_digest': oldEntryIdentities.some(function(identity) {
+                return identity.is_enabled;
+              }),
+              'cleanup_manifest_digest': opt_cleanup_manifest_digest ||
+                (entryIdentities.length ?
+                  (manifestDigest || entryIdentities[0].digest) : null),
+              'cleanup_old_manifest_digest': opt_cleanup_old_manifest_digest ||
+                (oldEntryIdentities.length ?
+                  (opt_old_manifest_digest || oldEntryIdentities[0].digest) : null)
             };
 
             if (!$scope.options.showFuture && time && (time * 1000) >= new Date().getTime()) {
@@ -104,7 +132,11 @@ angular.module('quay').directive('repoTagHistory', function () {
               removeEntry(futureEntry);
               addEntry(futureEntry.reversion ? 'revert': 'move', tag.end_ts,
                        futureEntry.manifest_digest,
-                       manifestDigest);
+                       manifestDigest,
+                       futureEntry.manifest_digests,
+                       identities,
+                       futureEntry.cleanup_manifest_digest,
+                       tag.manifest_digest);
             } else {
               addEntry('delete', tag.end_ts)
             }
@@ -169,10 +201,10 @@ angular.module('quay').directive('repoTagHistory', function () {
         if ($scope.repository.can_write) {
           var manifest_digest = null;
           if(entity.action == "delete"){
-            manifest_digest = entity.manifest_digest
+            manifest_digest = entity.cleanup_manifest_digest
           }
           else if(entity.action == "move" || entity.action == "revert"){
-            manifest_digest = entity.old_manifest_digest
+            manifest_digest = entity.cleanup_old_manifest_digest
           }
           $scope.tagActionHandler.askPermanentlyDeleteTag(entity.tag, manifest_digest);
         }

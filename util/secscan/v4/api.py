@@ -234,9 +234,15 @@ class ClairSecurityScannerAPI(SecurityScannerAPIInterface):
 
             body["layers"].append(
                 {
-                    "hash": str(l.layer_info.blob_digest),
+                    "hash": str(
+                        l.layer_info.blob_digest if l.layer_info.is_remote else l.blob.digest
+                    ),
                     "uri": (
-                        self._blob_url_retriever.url_for_download(manifest.repository, l.blob)
+                        self._blob_url_retriever.url_for_download(
+                            manifest.repository,
+                            l.blob,
+                            repository_digest=str(l.layer_info.blob_digest),
+                        )
                         if not l.layer_info.is_remote
                         else l.layer_info.urls[0]
                     ),
@@ -273,7 +279,13 @@ class ClairSecurityScannerAPI(SecurityScannerAPIInterface):
             resp = self._perform(actions["DeleteIndexReport"](manifest_digest))
         except BadRequestResponseException as ex:
             raise InvalidContentSent(ex)
-        except (Non200ResponseException, IncompatibleAPIResponse) as ex:
+        except Non200ResponseException as ex:
+            # Deleting a report is idempotent. A prior successful attempt may have removed it
+            # before durable queue completion.
+            if ex.response.status_code == 404:
+                return None
+            raise APIRequestFailure(ex)
+        except IncompatibleAPIResponse as ex:
             raise APIRequestFailure(ex)
 
         return resp.json()
@@ -327,7 +339,7 @@ class ClairSecurityScannerAPI(SecurityScannerAPIInterface):
 
     def _perform(self, action):
         request_start_time = time.time()
-        (method, path, body, timeout) = action.payload
+        method, path, body, timeout = action.payload
         url = urljoin(self.secscan_api_endpoint, path)
 
         headers = {}

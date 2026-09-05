@@ -66,6 +66,15 @@ class RegistryDataInterface(object):
         """
 
     @abstractmethod
+    def get_repository_manifest_digest_infos(
+        self, repository_ref, manifests, allowed_algorithms=None
+    ):
+        """Returns explicit repository digest registrations grouped by manifest ID.
+
+        No canonical fallback is synthesized for manifests without registrations.
+        """
+
+    @abstractmethod
     def lookup_manifest_by_digest(
         self,
         repository_ref,

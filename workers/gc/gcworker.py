@@ -5,7 +5,7 @@ from contextlib import contextmanager
 import features
 from app import app
 from data.database import Repository, RepositoryState, UseThenDisconnect
-from data.model.gc import garbage_collect_repo
+from data.model.gc import garbage_collect_repo, garbage_collect_secscan_reports
 from data.model.repository import get_random_gc_policy
 from data.registry_model import registry_model
 from notifications.notificationevent import RepoImageExpiryEvent
@@ -46,6 +46,7 @@ class GarbageCollectionWorker(Worker):
         Performs garbage collection on repositories.
         """
         with UseThenDisconnect(app.config):
+            garbage_collect_secscan_reports()
             policy = get_random_gc_policy()
             if policy is None:
                 logger.debug("No GC policies found")

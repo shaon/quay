@@ -10,6 +10,7 @@ import {
 } from '@patternfly/react-core';
 import {TagAction, TagEntry} from './types';
 import ManifestDigest from 'src/components/ManifestDigest';
+import ManifestDigestSelector from 'src/components/ManifestDigestSelector';
 import {useEffect, useState} from 'react';
 import {usePermanentlyDeleteTag} from 'src/hooks/UseTags';
 import {AlertVariant, useUI} from 'src/contexts/UIContext';
@@ -19,17 +20,21 @@ export default function PermanentlyDeleteTag(props: RestoreTagProps) {
   const {tagEntry} = props;
   const {addAlert} = useUI();
   const [isModalOpen, setIsModalOpen] = useState<boolean>(false);
+  const cleanupIdentities =
+    tagEntry.action === TagAction.Delete
+      ? tagEntry.digestIdentities
+      : tagEntry.oldDigestIdentities;
+  const initialCleanupDigest =
+    tagEntry.action === TagAction.Delete
+      ? tagEntry.cleanupDigest
+      : tagEntry.cleanupOldDigest;
+  const [digest, setDigest] = useState(initialCleanupDigest);
   const {permanentlyDeleteTag, success, error} = usePermanentlyDeleteTag(
     props.org,
     props.repo,
   );
 
-  let digest: string = null;
-  if (tagEntry.action === TagAction.Delete) {
-    digest = tagEntry.digest;
-  } else if (tagEntry.action === TagAction.Revert) {
-    digest = tagEntry.oldDigest;
-  }
+  useEffect(() => setDigest(initialCleanupDigest), [initialCleanupDigest]);
 
   useEffect(() => {
     if (success) {
@@ -37,7 +42,7 @@ export default function PermanentlyDeleteTag(props: RestoreTagProps) {
         variant: AlertVariant.Success,
         title: `Permanently deleted tag ${
           tagEntry.tag.name
-        } with manifest ${digest.slice(0, 14)} from time machine`,
+        } with manifest ${digest?.slice(0, 14)} from time machine`,
       });
       setIsModalOpen(false);
     }
@@ -49,11 +54,15 @@ export default function PermanentlyDeleteTag(props: RestoreTagProps) {
         variant: AlertVariant.Failure,
         title: `Could not permanently delete tag ${
           tagEntry.tag.name
-        } with digest ${digest.slice(0, 14)}`,
+        } with digest ${digest?.slice(0, 14)}`,
       });
       setIsModalOpen(false);
     }
   }, [error]);
+
+  if (!digest) {
+    return null;
+  }
 
   return (
     <>
@@ -78,7 +87,14 @@ export default function PermanentlyDeleteTag(props: RestoreTagProps) {
           />
           Are you sure you want to permanently delete tag{' '}
           <Label isCompact>{tagEntry.tag.name}</Label> @{' '}
-          <ManifestDigest digest={digest} />?
+          <ManifestDigestSelector
+            identities={cleanupIdentities}
+            legacyDigest={digest}
+            selectedDigest={digest}
+            onSelect={setDigest}
+            allowDisabled
+          />
+          ?
         </ModalBody>
         <ModalFooter>
           <Button

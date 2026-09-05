@@ -6,6 +6,7 @@ import string
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from io import BytesIO
+from unittest.mock import call
 from unittest.mock import patch as mock_patch
 
 import pytest
@@ -28,8 +29,11 @@ from data.database import (
     ManifestLabel,
     ManifestPullStatistics,
     MediaType,
+    QueueItem,
+    Repository,
     RepositoryBlobDigest,
     RepositoryManifestDigest,
+    RepositoryState,
     Tag,
     TagNotificationSuccess,
     TagPullStatistics,
@@ -50,6 +54,7 @@ from image.shared.schemas import parse_manifest_from_bytes
 from test.fixtures import *
 from test.helpers import check_transitive_modifications
 from util.bytes import Bytes
+from util.secscan.v4.api import APIRequestFailure
 
 ADMIN_ACCESS_USER = "devtable"
 PUBLIC_USER = "public"
@@ -521,11 +526,15 @@ def test_gc_removes_manifest_digest_registrations(default_tag_policy, initialize
     with (
         mock_patch("data.model.gc.features.SECURITY_SCANNER", True),
         mock_patch.dict(model.gc.config.app_config, {"SECURITY_SCANNER_V4_MANIFEST_CLEANUP": True}),
-        mock_patch("data.model.gc.secscan_model.garbage_collect_manifest_report") as cleanup_report,
+        mock_patch(
+            "data.model.gc.secscan_model.garbage_collect_manifest_report", return_value=True
+        ) as cleanup_report,
     ):
         model.gc._run_garbage_collection(context)
+        assert cleanup_report.call_count == 0
+        assert model.gc.garbage_collect_secscan_reports() == 2
 
-    cleanup_report.assert_called_once_with(external_digest)
+    assert cleanup_report.call_args_list == [call(manifest.digest), call(external_digest)]
     assert (
         not RepositoryManifestDigest.select()
         .where(
@@ -535,6 +544,174 @@ def test_gc_removes_manifest_digest_registrations(default_tag_policy, initialize
         .exists()
     )
     assert Manifest.get_or_none(Manifest.id == manifest.id) is None
+
+
+def test_story17_manifest_gc_removes_registrations_and_canonical_scanner_report(
+    default_tag_policy, initialized_db
+):
+    # create_manifest_for_testing uses the fixed devtable/newrepo blob fixture.
+    repo = model.repository.create_repository("devtable", "newrepo", None)
+    manifest, _ = create_manifest_for_testing(
+        repo, differentiation_field="story17-manifest", include_shared_blob=True
+    )
+    manifest_bytes = (
+        manifest.manifest_bytes
+        if isinstance(manifest.manifest_bytes, bytes)
+        else manifest.manifest_bytes.encode("utf-8")
+    )
+    registered_digests = [
+        "sha512:" + hashlib.sha512(manifest_bytes).hexdigest(),
+        "sha384:" + hashlib.sha384(manifest_bytes).hexdigest(),
+        manifest.digest,
+    ]
+    for digest in registered_digests:
+        model.oci.manifest.register_repository_manifest_digest(repo.id, manifest, digest)
+
+    model.oci.tag.retarget_tag("story17-final", manifest)
+    assert ManifestBlob.select().where(ManifestBlob.manifest == manifest).exists()
+    model.oci.tag.delete_tags_for_manifest(manifest)
+
+    with (
+        mock_patch("data.model.gc.features.SECURITY_SCANNER", True),
+        mock_patch("data.model.gc.features.QUOTA_MANAGEMENT", True),
+        mock_patch.dict(
+            model.gc.config.app_config,
+            {
+                "ALLOWED_HASH_ALGORITHMS": ["sha256"],
+                "SECURITY_SCANNER_V4_MANIFEST_CLEANUP": True,
+            },
+        ),
+        mock_patch("data.model.gc.update_quota") as update_quota,
+        mock_patch(
+            "data.model.gc.secscan_model.garbage_collect_manifest_report", return_value=True
+        ) as cleanup_report,
+    ):
+        assert gc_now(repo)
+        assert not gc_now(repo)
+        assert cleanup_report.call_count == 0
+        assert model.gc.garbage_collect_secscan_reports() == 2
+
+    assert cleanup_report.call_args_list == [call(manifest.digest), call(registered_digests[0])]
+    update_quota.assert_called_once()
+    assert (
+        not RepositoryManifestDigest.select()
+        .where(
+            RepositoryManifestDigest.repository == repo,
+            RepositoryManifestDigest.manifest == manifest.id,
+        )
+        .exists()
+    )
+    assert Manifest.get_or_none(Manifest.id == manifest.id) is None
+    assert not ManifestBlob.select().where(ManifestBlob.manifest == manifest.id).exists()
+    assert (
+        not ManifestChild.select()
+        .where(
+            (ManifestChild.manifest == manifest.id) | (ManifestChild.child_manifest == manifest.id)
+        )
+        .exists()
+    )
+
+
+def test_story17_manifest_gc_retries_after_database_failure(default_tag_policy, initialized_db):
+    repo = model.repository.create_repository("devtable", "newrepo", None)
+    manifest, _ = create_manifest_for_testing(
+        repo, differentiation_field="story17-manifest-retry", include_shared_blob=True
+    )
+    registered_digest = "sha512:" + "b" * 128
+    model.oci.manifest.register_repository_manifest_digest(repo.id, manifest, registered_digest)
+    model.oci.tag.delete_tags_for_manifest(manifest)
+    initial_quota_size = model.quota.get_repository_size(repo.id).size_bytes
+    assert initial_quota_size > 0
+
+    with (
+        mock_patch("data.model.gc.features.SECURITY_SCANNER", True),
+        mock_patch.dict(
+            model.gc.config.app_config,
+            {"SECURITY_SCANNER_V4_MANIFEST_CLEANUP": True},
+        ),
+        mock_patch("data.model.gc.db_transaction", database.db.atomic),
+        mock_patch.object(
+            Manifest,
+            "delete_instance",
+            autospec=True,
+            side_effect=RuntimeError("injected database failure"),
+        ),
+        pytest.raises(RuntimeError, match="injected database failure"),
+    ):
+        gc_now(repo)
+
+    assert Manifest.get_by_id(manifest.id)
+    assert ManifestBlob.select().where(ManifestBlob.manifest == manifest.id).exists()
+    assert (
+        RepositoryManifestDigest.select()
+        .where(
+            RepositoryManifestDigest.repository == repo,
+            RepositoryManifestDigest.manifest == manifest.id,
+        )
+        .exists()
+    )
+    assert model.quota.get_repository_size(repo.id).size_bytes == initial_quota_size
+    assert not QueueItem.select().where(QueueItem.body == manifest.digest).exists()
+
+    with (
+        mock_patch("data.model.gc.features.SECURITY_SCANNER", True),
+        mock_patch.dict(
+            model.gc.config.app_config,
+            {"SECURITY_SCANNER_V4_MANIFEST_CLEANUP": True},
+        ),
+    ):
+        assert gc_now(repo)
+    assert QueueItem.select().where(QueueItem.body == manifest.digest).exists()
+    assert Manifest.get_or_none(Manifest.id == manifest.id) is None
+    assert (
+        not RepositoryManifestDigest.select()
+        .where(
+            RepositoryManifestDigest.repository == repo,
+            RepositoryManifestDigest.manifest == manifest.id,
+        )
+        .exists()
+    )
+    assert model.quota.get_repository_size(repo.id).size_bytes == 0
+
+
+def test_story17_blob_gc_retries_after_storage_placement_delete_failure(
+    default_tag_policy, initialized_db
+):
+    repo = model.repository.create_repository("devtable", "story17-storage-retry", None)
+    blob, digests = _create_story17_registered_blob(
+        repo,
+        b"story17-storage-retry",
+        datetime.utcnow() - timedelta(seconds=1),
+        ("sha512",),
+    )
+    digest = digests[0]
+    blob_path = storage.blob_path(blob.content_checksum)
+
+    with (
+        mock_patch("data.model.gc.db_transaction", database.db.atomic),
+        mock_patch("data.model.storage.db_transaction", database.db.atomic),
+        mock_patch.object(
+            ImageStoragePlacement,
+            "delete",
+            side_effect=RuntimeError("injected placement delete failure"),
+        ),
+        pytest.raises(RuntimeError, match="injected placement delete failure"),
+    ):
+        gc_now(repo)
+
+    assert ImageStorage.get_by_id(blob.id)
+    assert ImageStoragePlacement.select().where(ImageStoragePlacement.storage == blob).exists()
+    assert RepositoryBlobDigest.get(repository=repo, digest=digest).image_storage_id == blob.id
+    assert storage.exists({"local_us"}, blob_path)
+
+    assert gc_now(repo)
+    assert not gc_now(repo)
+    assert ImageStorage.get_or_none(ImageStorage.id == blob.id) is None
+    assert (
+        not ImageStoragePlacement.select().where(ImageStoragePlacement.storage == blob.id).exists()
+    )
+    assert not RepositoryBlobDigest.select().where(RepositoryBlobDigest.digest == digest).exists()
+    assert not storage.exists({"local_us"}, blob_path)
 
 
 def test_manifest_with_tags(default_tag_policy, initialized_db):
@@ -615,6 +792,611 @@ def test_garbage_collect_storage(default_tag_policy, initialized_db):
             assert storage.exists(
                 {preferred}, storage.blob_path(uploadedblob.blob.content_checksum)
             )
+
+
+def _create_story17_registered_blob(repository, content, expires_at, algorithms):
+    location = ImageStorageLocation.get(name="local_us")
+    canonical_digest = sha256_digest(content)
+    blob = ImageStorage.create(
+        content_checksum=canonical_digest,
+        image_size=len(content),
+        uncompressed_size=len(content),
+        uploading=False,
+        cas_path=True,
+    )
+    ImageStoragePlacement.create(storage=blob, location=location)
+    storage.put_content([location.name], storage.blob_path(canonical_digest), content)
+    UploadedBlob.create(repository=repository, blob=blob, expires_at=expires_at)
+
+    digests = []
+    for algorithm in algorithms:
+        digest = f"{algorithm}:{hashlib.new(algorithm, content).hexdigest()}"
+        model.oci.blob.register_repository_blob_digest(repository, blob, digest)
+        digests.append(digest)
+    return blob, digests
+
+
+def test_story17_blob_gc_removes_disabled_aliases_and_canonical_storage(
+    default_tag_policy, initialized_db
+):
+    repo = model.repository.create_repository("devtable", "story17-blob", None)
+    blob, registered_digests = _create_story17_registered_blob(
+        repo,
+        b"story17 registered blob",
+        datetime.utcnow() - timedelta(seconds=1),
+        ("sha256", "sha384", "sha512"),
+    )
+    blob_id = blob.id
+    preferred = storage.preferred_locations[0]
+
+    assert [
+        registration.digest
+        for registration in RepositoryBlobDigest.select()
+        .where(RepositoryBlobDigest.repository == repo)
+        .order_by(RepositoryBlobDigest.id)
+    ] == registered_digests
+
+    with mock_patch.dict(model.gc.config.app_config, {"ALLOWED_HASH_ALGORITHMS": ["sha256"]}):
+        assert gc_now(repo)
+        assert not gc_now(repo)
+
+    assert (
+        not RepositoryBlobDigest.select()
+        .where(
+            RepositoryBlobDigest.repository == repo,
+            RepositoryBlobDigest.image_storage == blob_id,
+        )
+        .exists()
+    )
+    assert ImageStorage.get_or_none(ImageStorage.id == blob_id) is None
+    assert (
+        not ImageStoragePlacement.select().where(ImageStoragePlacement.storage == blob_id).exists()
+    )
+    assert not storage.exists({preferred}, storage.blob_path(blob.content_checksum))
+
+
+def test_story17_shared_blob_registration_is_repository_scoped(default_tag_policy, initialized_db):
+    first = model.repository.create_repository("devtable", "story17-shared-first", None)
+    second = model.repository.create_repository("devtable", "story17-shared-second", None)
+    blob, first_digests = _create_story17_registered_blob(
+        first,
+        b"story17 shared alternative-only blob",
+        datetime.utcnow() - timedelta(seconds=1),
+        ("sha384", "sha512"),
+    )
+    second_digests = []
+    content = b"story17 shared alternative-only blob"
+    for algorithm in ("sha384", "sha512"):
+        digest = f"{algorithm}:{hashlib.new(algorithm, content).hexdigest()}"
+        model.oci.blob.register_repository_blob_digest(second, blob, digest)
+        second_digests.append(digest)
+    UploadedBlob.create(
+        repository=second,
+        blob=blob,
+        expires_at=datetime.utcnow() - timedelta(seconds=1),
+    )
+    blob_id = blob.id
+
+    assert not any(digest.startswith("sha256:") for digest in first_digests + second_digests)
+    assert gc_now(first)
+    assert (
+        not RepositoryBlobDigest.select()
+        .where(
+            RepositoryBlobDigest.repository == first,
+            RepositoryBlobDigest.image_storage == blob_id,
+        )
+        .exists()
+    )
+    assert [
+        registration.digest
+        for registration in RepositoryBlobDigest.select()
+        .where(
+            RepositoryBlobDigest.repository == second,
+            RepositoryBlobDigest.image_storage == blob_id,
+        )
+        .order_by(RepositoryBlobDigest.id)
+    ] == second_digests
+    assert ImageStorage.get_by_id(blob_id).content_checksum == blob.content_checksum
+
+    assert gc_now(second)
+    assert (
+        not RepositoryBlobDigest.select()
+        .where(
+            RepositoryBlobDigest.repository == second,
+            RepositoryBlobDigest.image_storage == blob_id,
+        )
+        .exists()
+    )
+    assert ImageStorage.get_or_none(ImageStorage.id == blob_id) is None
+
+
+def test_story17_mount_only_registration_waits_for_upload_expiration(
+    default_tag_policy, initialized_db
+):
+    repo = model.repository.create_repository("devtable", "story17-mount", None)
+    blob, digests = _create_story17_registered_blob(
+        repo,
+        b"story17 recent mount",
+        datetime.utcnow() + timedelta(days=1),
+        ("sha512",),
+    )
+
+    assert not gc_now(repo)
+    assert (
+        RepositoryBlobDigest.select()
+        .where(
+            RepositoryBlobDigest.repository == repo,
+            RepositoryBlobDigest.digest == digests[0],
+        )
+        .exists()
+    )
+    assert ImageStorage.get_by_id(blob.id)
+
+    UploadedBlob.update(expires_at=datetime.utcnow() - timedelta(seconds=1)).where(
+        UploadedBlob.repository == repo,
+        UploadedBlob.blob == blob,
+    ).execute()
+    assert gc_now(repo)
+    assert (
+        not RepositoryBlobDigest.select()
+        .where(
+            RepositoryBlobDigest.repository == repo,
+            RepositoryBlobDigest.image_storage == blob.id,
+        )
+        .exists()
+    )
+    assert ImageStorage.get_or_none(ImageStorage.id == blob.id) is None
+
+
+def test_story17_live_manifest_link_preserves_registration(default_tag_policy, initialized_db):
+    repo = model.repository.create_repository("devtable", "story17-live-link", None)
+    blob, digests = _create_story17_registered_blob(
+        repo,
+        b"story17 live manifest link",
+        datetime.utcnow() - timedelta(seconds=1),
+        ("sha512",),
+    )
+    media_type = MediaType.get(name="application/vnd.oci.image.manifest.v1+json")
+    manifest = Manifest.create(
+        repository=repo,
+        digest="sha256:" + "c" * 64,
+        media_type=media_type,
+        manifest_bytes=b"{}",
+    )
+    ManifestBlob.create(repository=repo, manifest=manifest, blob=blob)
+
+    assert gc_now(repo)
+    assert (
+        RepositoryBlobDigest.select()
+        .where(
+            RepositoryBlobDigest.repository == repo,
+            RepositoryBlobDigest.digest == digests[0],
+        )
+        .exists()
+    )
+    assert ImageStorage.get_by_id(blob.id)
+
+    ManifestBlob.delete().where(ManifestBlob.manifest == manifest).execute()
+    manifest.delete_instance()
+    assert gc_now(repo)
+    assert (
+        not RepositoryBlobDigest.select()
+        .where(
+            RepositoryBlobDigest.repository == repo,
+            RepositoryBlobDigest.image_storage == blob.id,
+        )
+        .exists()
+    )
+    assert ImageStorage.get_or_none(ImageStorage.id == blob.id) is None
+
+
+def test_story17_legacy_blob_with_and_without_registration(default_tag_policy, initialized_db):
+    repo = model.repository.create_repository("devtable", "story17-legacy", None)
+    unregistered, _ = _create_story17_registered_blob(
+        repo,
+        b"story17 legacy without registration",
+        datetime.utcnow() - timedelta(seconds=1),
+        (),
+    )
+    registered, registered_digests = _create_story17_registered_blob(
+        repo,
+        b"story17 legacy with canonical registration",
+        datetime.utcnow() - timedelta(seconds=1),
+        ("sha256",),
+    )
+
+    assert gc_now(repo)
+    assert ImageStorage.get_or_none(ImageStorage.id == unregistered.id) is None
+    assert ImageStorage.get_or_none(ImageStorage.id == registered.id) is None
+    assert (
+        not RepositoryBlobDigest.select()
+        .where(
+            RepositoryBlobDigest.repository == repo,
+            RepositoryBlobDigest.digest == registered_digests[0],
+        )
+        .exists()
+    )
+
+
+def test_story17_blob_gc_retries_after_transaction_failure(default_tag_policy, initialized_db):
+    repo = model.repository.create_repository("devtable", "story17-retry", None)
+    blob, _ = _create_story17_registered_blob(
+        repo,
+        b"story17 retry blob",
+        datetime.utcnow() - timedelta(seconds=1),
+        ("sha512",),
+    )
+
+    with (
+        mock_patch("data.model.storage.db_transaction", database.db.atomic),
+        mock_patch("data.model.storage._is_storage_orphaned", side_effect=RuntimeError("injected")),
+        pytest.raises(RuntimeError, match="injected"),
+    ):
+        gc_now(repo)
+
+    assert (
+        RepositoryBlobDigest.select()
+        .where(
+            RepositoryBlobDigest.repository == repo,
+            RepositoryBlobDigest.image_storage == blob.id,
+        )
+        .exists()
+    )
+    assert ImageStorage.get_by_id(blob.id)
+
+    assert gc_now(repo)
+    assert (
+        not RepositoryBlobDigest.select()
+        .where(
+            RepositoryBlobDigest.repository == repo,
+            RepositoryBlobDigest.image_storage == blob.id,
+        )
+        .exists()
+    )
+    assert ImageStorage.get_or_none(ImageStorage.id == blob.id) is None
+
+
+def test_story17_gc_finder_discovers_mount_only_expiration(default_tag_policy, initialized_db):
+    Tag.update(lifetime_end_ms=None).execute()
+    UploadedBlob.delete().execute()
+    repo = model.repository.create_repository("devtable", "story17-finder", None)
+    _create_story17_registered_blob(
+        repo,
+        b"story17 finder blob",
+        datetime.utcnow() - timedelta(seconds=1),
+        ("sha512",),
+    )
+
+    assert model.oci.tag.find_repository_with_garbage(0).id == repo.id
+
+
+def _story17_create_manifest(repository, suffix):
+    media_type = MediaType.get(name="application/vnd.oci.image.manifest.v1+json")
+    return Manifest.create(
+        repository=repository,
+        digest=str(sha256_digest(suffix.encode("utf-8"))),
+        media_type=media_type,
+        manifest_bytes=b"{}",
+    )
+
+
+def _story17_candidate_ids(policy, source_start_ids=(0, 0, 0, 0)):
+    return {
+        row.repository_id
+        for row in model.oci.tag._find_repository_garbage_candidates(
+            policy,
+            source_start_ids=source_start_ids,
+        )
+    }
+
+
+def _story17_reset_garbage_sources():
+    Tag.update(lifetime_end_ms=None).execute()
+    UploadedBlob.delete().execute()
+    RepositoryBlobDigest.delete().execute()
+    RepositoryManifestDigest.delete().execute()
+
+
+def test_story17_gc_finder_is_bounded_and_source_driven(default_tag_policy, initialized_db):
+    query = model.oci.tag._find_repository_garbage_candidates(
+        0,
+        source_start_ids=(11, 12, 13, 14),
+    )
+    sql, parameters = query.sql()
+    normalized = " ".join(sql.upper().split())
+
+    assert normalized.count("UNION ALL") == 3
+    assert normalized.count("LIMIT") >= 5
+    assert normalized.count("ORDER BY") >= 4
+    assert normalized.count('"ID" <') >= 4
+    assert 'FROM (SELECT "T' in normalized
+    assert 'FROM "TAG"' in normalized
+    assert 'FROM "UPLOADEDBLOB"' in normalized
+    assert 'FROM "REPOSITORYBLOBDIGEST"' in normalized
+    assert 'FROM "REPOSITORYMANIFESTDIGEST"' in normalized
+    assert len(parameters) <= 40
+
+
+def test_story17_gc_finder_covers_all_sources_and_bounds_result_count(
+    default_tag_policy, initialized_db
+):
+    _story17_reset_garbage_sources()
+    expiration = datetime.utcnow() - timedelta(seconds=1)
+
+    tag_repo = model.repository.create_repository("devtable", "story17-source-tag", None)
+    tag_manifest = _story17_create_manifest(tag_repo, "story17-source-tag")
+    model.oci.tag.retarget_tag("expired", tag_manifest)
+    Tag.update(lifetime_end_ms=0).where(Tag.repository == tag_repo).execute()
+    RepositoryManifestDigest.delete().where(
+        RepositoryManifestDigest.repository == tag_repo
+    ).execute()
+
+    upload_repo = model.repository.create_repository("devtable", "story17-source-upload", None)
+    _create_story17_registered_blob(
+        upload_repo,
+        b"story17 source upload",
+        expiration,
+        (),
+    )
+
+    blob_repo = model.repository.create_repository("devtable", "story17-source-blob", None)
+    blob, _ = _create_story17_registered_blob(
+        blob_repo,
+        b"story17 source blob registration",
+        expiration,
+        ("sha512",),
+    )
+    UploadedBlob.delete().where(UploadedBlob.blob == blob).execute()
+
+    manifest_repo = model.repository.create_repository("devtable", "story17-source-manifest", None)
+    manifest = _story17_create_manifest(manifest_repo, "story17-source-manifest")
+    model.oci.manifest.register_repository_manifest_digest(
+        manifest_repo.id,
+        manifest,
+        "sha512:" + "d" * 128,
+    )
+
+    expected = {tag_repo.id, upload_repo.id, blob_repo.id, manifest_repo.id}
+    assert expected <= _story17_candidate_ids(0)
+
+    with mock_patch.object(model.oci.tag, "GC_CANDIDATE_COUNT", 2):
+        assert len(_story17_candidate_ids(0)) <= 2
+
+
+def test_story17_gc_finder_returns_no_candidate_for_live_source_rows(
+    default_tag_policy, initialized_db
+):
+    _story17_reset_garbage_sources()
+    repo = model.repository.create_repository("devtable", "story17-no-garbage", None)
+    blob, _ = _create_story17_registered_blob(
+        repo,
+        b"story17 live source rows",
+        datetime.utcnow() + timedelta(days=1),
+        ("sha512",),
+    )
+    manifest = _story17_create_manifest(repo, "story17-live-source-manifest")
+    ManifestBlob.create(repository=repo, manifest=manifest, blob=blob)
+    model.oci.manifest.register_repository_manifest_digest(
+        repo.id,
+        manifest,
+        "sha512:" + "f" * 128,
+    )
+    model.oci.tag.retarget_tag("live", manifest)
+
+    assert repo.id not in _story17_candidate_ids(0)
+
+
+def test_story17_gc_finder_applies_policy_and_repository_filters(
+    default_tag_policy, initialized_db
+):
+    _story17_reset_garbage_sources()
+    database.User.update(removed_tag_expiration_s=60).where(
+        database.User.username == "public"
+    ).execute()
+
+    wrong_policy_repo = model.repository.create_repository(
+        "public", "story17-policy-mismatch", None
+    )
+    wrong_policy_manifest = _story17_create_manifest(wrong_policy_repo, "story17-policy-mismatch")
+    model.oci.tag.retarget_tag("expired", wrong_policy_manifest)
+    Tag.update(lifetime_end_ms=0).where(Tag.repository == wrong_policy_repo).execute()
+    RepositoryManifestDigest.delete().where(
+        RepositoryManifestDigest.repository == wrong_policy_repo
+    ).execute()
+    policy_sixty = _story17_candidate_ids(60)
+
+    immutable_repo = model.repository.create_repository("devtable", "story17-immutable", None)
+    immutable_manifest = _story17_create_manifest(immutable_repo, "story17-immutable")
+    model.oci.tag.retarget_tag("expired", immutable_manifest)
+    Tag.update(lifetime_end_ms=0, immutable=True).where(Tag.repository == immutable_repo).execute()
+    RepositoryManifestDigest.delete().where(
+        RepositoryManifestDigest.repository == immutable_repo
+    ).execute()
+
+    disabled_repo = model.repository.create_repository("public", "story17-disabled", None)
+    _create_story17_registered_blob(
+        disabled_repo,
+        b"story17 disabled namespace",
+        datetime.utcnow() - timedelta(seconds=1),
+        (),
+    )
+    database.User.update(enabled=False).where(database.User.username == "public").execute()
+
+    marked_repo = model.repository.create_repository("devtable", "story17-marked", None)
+    _create_story17_registered_blob(
+        marked_repo,
+        b"story17 marked repository",
+        datetime.utcnow() - timedelta(seconds=1),
+        (),
+    )
+    Repository.update(state=RepositoryState.MARKED_FOR_DELETION).where(
+        Repository.id == marked_repo.id
+    ).execute()
+
+    with (
+        mock_patch.object(model.oci.tag.features, "IMMUTABLE_TAGS", True),
+        mock_patch.dict(
+            model.oci.tag.config.app_config,
+            {"FEATURE_IMMUTABLE_TAGS_CAN_EXPIRE": False},
+        ),
+    ):
+        policy_zero = _story17_candidate_ids(0)
+
+    assert wrong_policy_repo.id not in policy_zero
+    assert wrong_policy_repo.id in policy_sixty
+    assert immutable_repo.id not in policy_zero
+    assert disabled_repo.id not in policy_zero
+    assert marked_repo.id not in policy_zero
+
+
+def _story17_secscan_queue_items():
+    return QueueItem.select().where(
+        QueueItem.queue_name.startswith(model.gc.SECURITY_SCANNER_GC_QUEUE_NAME + "/")
+    )
+
+
+def test_story17_blob_gc_rechecks_reachability_after_candidate_discovery(
+    default_tag_policy, initialized_db
+):
+    repo = model.repository.create_repository("devtable", "story17-reachability-race", None)
+    blob, digests = _create_story17_registered_blob(
+        repo,
+        b"story17 reachability race",
+        datetime.utcnow() - timedelta(seconds=1),
+        ("sha512",),
+    )
+    manifest = _story17_create_manifest(repo, "story17-reachability-owner")
+    garbage_collect_storage = storage_model.garbage_collect_storage
+
+    def add_reachability_before_storage_recheck(*args, **kwargs):
+        ManifestBlob.get_or_create(repository=repo, manifest=manifest, blob=blob)
+        return garbage_collect_storage(*args, **kwargs)
+
+    with mock_patch(
+        "data.model.gc.storage.garbage_collect_storage",
+        side_effect=add_reachability_before_storage_recheck,
+    ):
+        assert gc_now(repo)
+
+    assert RepositoryBlobDigest.get(repository=repo, digest=digests[0]).image_storage_id == blob.id
+    assert ImageStorage.get_by_id(blob.id)
+    assert ManifestBlob.get(repository=repo, manifest=manifest, blob=blob)
+
+
+def test_story17_canonical_scanner_failure_is_durably_retried(default_tag_policy, initialized_db):
+    repo = model.repository.create_repository("devtable", "story17-scanner-retry", None)
+    manifest = _story17_create_manifest(repo, "story17-scanner-retry")
+    manifest_bytes = (
+        manifest.manifest_bytes
+        if isinstance(manifest.manifest_bytes, bytes)
+        else manifest.manifest_bytes.encode("utf-8")
+    )
+    registered_digests = [
+        "sha512:" + hashlib.sha512(manifest_bytes).hexdigest(),
+        "sha384:" + hashlib.sha384(manifest_bytes).hexdigest(),
+        manifest.digest,
+    ]
+    for digest in registered_digests:
+        model.oci.manifest.register_repository_manifest_digest(repo.id, manifest, digest)
+    model.oci.tag.retarget_tag("story17-scanner-retry", manifest)
+    model.oci.tag.delete_tags_for_manifest(manifest)
+
+    with (
+        mock_patch("data.model.gc.features.SECURITY_SCANNER", True),
+        mock_patch.dict(
+            model.gc.config.app_config,
+            {"SECURITY_SCANNER_V4_MANIFEST_CLEANUP": True},
+        ),
+        mock_patch(
+            "data.model.gc.secscan_model.garbage_collect_manifest_report",
+            side_effect=APIRequestFailure(),
+        ) as cleanup_report,
+    ):
+        assert gc_now(repo)
+        assert cleanup_report.call_count == 0
+        assert [item.body for item in _story17_secscan_queue_items().order_by(QueueItem.id)] == [
+            manifest.digest,
+            registered_digests[0],
+        ]
+
+        assert model.gc.garbage_collect_secscan_reports() == 2
+        assert cleanup_report.call_args_list == [
+            call(manifest.digest),
+            call(registered_digests[0]),
+        ]
+        assert _story17_secscan_queue_items().count() == 2
+
+        QueueItem.update(available_after=datetime.utcnow() - timedelta(seconds=1)).where(
+            QueueItem.id << _story17_secscan_queue_items().select(QueueItem.id)
+        ).execute()
+        cleanup_report.reset_mock()
+        cleanup_report.side_effect = None
+        cleanup_report.return_value = True
+
+        assert model.gc.garbage_collect_secscan_reports() == 2
+        assert cleanup_report.call_args_list == [
+            call(manifest.digest),
+            call(registered_digests[0]),
+        ]
+        assert not _story17_secscan_queue_items().exists()
+        assert model.gc.garbage_collect_secscan_reports() == 0
+
+
+def test_story17_scanner_cleanup_preserves_cross_repository_report_and_legacy_fallback(
+    default_tag_policy, initialized_db
+):
+    first = model.repository.create_repository("devtable", "story17-scanner-first", None)
+    second = model.repository.create_repository("devtable", "story17-scanner-second", None)
+    first_manifest = _story17_create_manifest(first, "story17-scanner-shared")
+    second_manifest = _story17_create_manifest(second, "story17-scanner-shared")
+    shared_digest = "sha512:" + "e" * 128
+    model.oci.manifest.register_repository_manifest_digest(first.id, first_manifest, shared_digest)
+    model.oci.manifest.register_repository_manifest_digest(
+        second.id, second_manifest, shared_digest
+    )
+    model.oci.tag.delete_tags_for_manifest(first_manifest)
+
+    legacy = model.repository.create_repository("devtable", "story17-scanner-legacy", None)
+    legacy_manifest = _story17_create_manifest(legacy, "story17-scanner-legacy")
+    RepositoryManifestDigest.delete().where(
+        RepositoryManifestDigest.repository == legacy,
+        RepositoryManifestDigest.manifest == legacy_manifest,
+    ).execute()
+    model.oci.tag.retarget_tag("story17-scanner-legacy", legacy_manifest)
+    model.oci.tag.delete_tags_for_manifest(legacy_manifest)
+
+    with (
+        mock_patch("data.model.gc.features.SECURITY_SCANNER", True),
+        mock_patch.dict(
+            model.gc.config.app_config,
+            {"SECURITY_SCANNER_V4_MANIFEST_CLEANUP": True},
+        ),
+        mock_patch(
+            "data.model.gc.secscan_model.garbage_collect_manifest_report",
+            return_value=True,
+        ) as cleanup_report,
+    ):
+        assert gc_now(first)
+        assert gc_now(legacy)
+        assert model.gc.garbage_collect_secscan_reports() == 3
+
+        cleanup_report.assert_called_once_with(legacy_manifest.digest)
+        assert RepositoryManifestDigest.get(
+            repository=second,
+            manifest=second_manifest,
+            digest=shared_digest,
+        )
+
+        model.oci.tag.delete_tags_for_manifest(second_manifest)
+        assert gc_now(second)
+        cleanup_report.reset_mock()
+        assert model.gc.garbage_collect_secscan_reports() == 2
+
+    assert cleanup_report.call_args_list == [
+        call(second_manifest.digest),
+        call(shared_digest),
+    ]
+    assert not _story17_secscan_queue_items().exists()
 
 
 def test_story15_purge_repository_removes_digest_registrations(default_tag_policy, initialized_db):

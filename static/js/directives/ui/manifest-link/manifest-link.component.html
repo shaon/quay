@@ -1,15 +1,16 @@
 <span class="manifest-link">
-    <span class="id-label cas" ng-if="::$ctrl.hasSHA256($ctrl.manifestDigest)"
-            data-title="The content-addressable SHA256 hash of this tag."
+    <span class="id-label cas" ng-if="$ctrl.hasDigest($ctrl.manifestDigest)"
+            data-title="Repository-registered manifest digest."
             data-container="body"
             ng-click="$ctrl.showCopyBox()"
-            bs-tooltip>SHA256</span>
+            bs-tooltip>{{ $ctrl.getAlgorithm($ctrl.manifestDigest) }}</span>
 
-    <a ng-href="/repository/{{ ::$ctrl.repository.namespace }}/{{ ::$ctrl.repository.name }}/manifest/{{ ::$ctrl.manifestDigest }}">
+    <a ng-if="$ctrl.hasDigest($ctrl.manifestDigest)"
+       ng-href="/repository/{{ ::$ctrl.repository.namespace }}/{{ ::$ctrl.repository.name }}/manifest/{{ $ctrl.manifestDigest }}">
       {{ $ctrl.getShortDigest($ctrl.manifestDigest) }}
     </a>
 
-    <span ng-if="::!$ctrl.hasSHA256($ctrl.manifestDigest)">{{ ::$ctrl.imageId.substr(0, 12) }}</span>
+    <span ng-if="!$ctrl.hasDigest($ctrl.manifestDigest)">{{ ::$ctrl.imageId.substr(0, 12) }}</span>
 
     <div class="modal fade co-dialog" ng-if="$ctrl.showingCopyBox">
         <div class="modal-dialog">
@@ -17,7 +18,7 @@
             <div class="modal-header">
             <button type="button" class="close" ng-click="$ctrl.hideCopyBox()"
                     aria-hidden="true">&times;</button>
-            <h4 class="modal-title"><span ng-if="$ctrl.hasSHA256($ctrl.manifestDigest)">Manifest SHA256</span><span ng-if="!$ctrl.hasSHA256($ctrl.manifestDigest)">V1 ID</span></h4>
+            <h4 class="modal-title"><span ng-if="$ctrl.hasDigest($ctrl.manifestDigest)">Manifest {{ $ctrl.getAlgorithm($ctrl.manifestDigest) }}</span><span ng-if="!$ctrl.hasDigest($ctrl.manifestDigest)">V1 ID</span></h4>
             </div>
             <div class="modal-body">
             <div class="copy-box" value="$ctrl.manifestDigest"></div>

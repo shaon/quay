@@ -94,12 +94,12 @@ def test_move_tag(manifest_exists, test_tag, expected_status, app):
 @pytest.mark.parametrize(
     "repo_namespace, repo_name, query_count",
     [
-        ("devtable", "simple", 5),  # +2 for converting object to and from json
-        ("devtable", "history", 5),  # +2 for converting object to and from json
-        ("devtable", "complex", 5),  # +2 for converting object to and from json
-        ("devtable", "gargantuan", 5),  # +2 for converting object to and from json
-        ("buynlarge", "orgrepo", 5),  # +2 for permissions checks (uses UNION).
-        ("buynlarge", "anotherorgrepo", 5),  # +2 for permissions checks (uses UNION).
+        ("devtable", "simple", 6),  # +2 for JSON and +1 batched digest inventory
+        ("devtable", "history", 6),  # +2 for JSON and +1 batched digest inventory
+        ("devtable", "complex", 6),  # +2 for JSON and +1 batched digest inventory
+        ("devtable", "gargantuan", 6),  # +2 for JSON and +1 batched digest inventory
+        ("buynlarge", "orgrepo", 6),  # +2 permissions and +1 digest inventory
+        ("buynlarge", "anotherorgrepo", 6),  # +2 permissions and +1 digest inventory
     ],
 )
 def test_list_repo_tags(repo_namespace, repo_name, query_count, app):
@@ -114,12 +114,13 @@ def test_list_repo_tags(repo_namespace, repo_name, query_count, app):
         repo_ref = registry_model.lookup_repository(repo_namespace, repo_name)
         history, _ = registry_model.list_repository_tag_history(repo_ref)
         assert len(tags) == len(history)
+        assert all("manifest_digests" in tag for tag in tags)
 
 
 @pytest.mark.parametrize(
     "repo_namespace, repo_name, query_count",
     [
-        ("devtable", "gargantuan", 5),  # +2 for converting object to and from json
+        ("devtable", "gargantuan", 6),  # +2 for JSON and +1 batched digest inventory
     ],
 )
 def test_list_repo_tags_filter(repo_namespace, repo_name, query_count, app):

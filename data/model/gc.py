@@ -38,12 +38,22 @@ from data.database import (
 )
 from data.model import _basequery, blob, config, db_transaction, storage
 from data.model.notification import delete_tag_notifications_for_tag
+from data.model.oci import manifest as oci_manifest
 from data.model.oci import tag as oci_tag
 from data.model.quota import QuotaOperation, update_quota
+from data.queue import WorkQueue
 from data.secscan_model import secscan_model
 from util.metrics.prometheus import gc_repos_purged, gc_table_rows_deleted
 
 logger = logging.getLogger(__name__)
+
+SECURITY_SCANNER_GC_QUEUE_NAME = "securityscannergc"
+SECURITY_SCANNER_GC_RETRY_SECONDS = 30
+SECURITY_SCANNER_GC_BATCH_SIZE = 10
+security_scanner_gc_queue = WorkQueue(
+    SECURITY_SCANNER_GC_QUEUE_NAME,
+    lambda database: database.atomic(),
+)
 
 
 class _GarbageCollectorContext(object):
@@ -314,7 +324,125 @@ def garbage_collect_repo(repo):
         _run_garbage_collection(context)
         had_changes = True
 
+    # Retry registration cleanup independently of the tag/upload rows that first made content a
+    # candidate. This lets a later pass converge if an earlier transaction failed after its expired
+    # reachability row was removed.
+    if _garbage_collect_unreferenced_manifest_registrations(repo):
+        had_changes = True
+    if _garbage_collect_unreferenced_blob_registrations(repo):
+        had_changes = True
+
     return had_changes
+
+
+def _garbage_collect_unreferenced_manifest_registrations(repo, chunk_size=10):
+    """Collect registered manifests left unreachable by an interrupted earlier pass."""
+    maximum_id = (
+        RepositoryManifestDigest.select(fn.Max(RepositoryManifestDigest.id))
+        .where(RepositoryManifestDigest.repository == repo)
+        .scalar()
+    )
+    if maximum_id is None:
+        return False
+
+    tag_link = Tag.alias()
+    parent_link = ManifestChild.alias()
+    registered_manifest = Manifest.alias()
+    referrer = Manifest.alias()
+    cursor = 0
+    found = False
+
+    while True:
+        registrations = list(
+            RepositoryManifestDigest.select(
+                RepositoryManifestDigest.id, RepositoryManifestDigest.manifest
+            )
+            .join(
+                registered_manifest,
+                on=(RepositoryManifestDigest.manifest == registered_manifest.id),
+            )
+            .where(
+                RepositoryManifestDigest.repository == repo,
+                RepositoryManifestDigest.id > cursor,
+                RepositoryManifestDigest.id <= maximum_id,
+                ~fn.EXISTS(
+                    tag_link.select(1).where(tag_link.manifest == RepositoryManifestDigest.manifest)
+                ),
+                ~fn.EXISTS(
+                    parent_link.select(1).where(
+                        parent_link.child_manifest == RepositoryManifestDigest.manifest
+                    )
+                ),
+                ~fn.EXISTS(
+                    referrer.select(1).where(
+                        referrer.repository == repo,
+                        referrer.subject == registered_manifest.digest,
+                    )
+                ),
+            )
+            .order_by(RepositoryManifestDigest.id)
+            .limit(chunk_size)
+        )
+        if not registrations:
+            return found
+
+        cursor = registrations[-1].id
+        context = _GarbageCollectorContext(repo)
+        for registration in registrations:
+            context.add_manifest_id(registration.manifest_id)
+        _run_garbage_collection(context)
+        found = True
+
+
+def _garbage_collect_unreferenced_blob_registrations(repo, chunk_size=10):
+    """Collect repository blob registrations with no live repository reachability."""
+    maximum_id = (
+        RepositoryBlobDigest.select(fn.Max(RepositoryBlobDigest.id))
+        .where(RepositoryBlobDigest.repository == repo)
+        .scalar()
+    )
+    if maximum_id is None:
+        return False
+
+    manifest_link = ManifestBlob.alias()
+    upload_link = UploadedBlob.alias()
+    cutoff = datetime.utcnow()
+    cursor = 0
+    found = False
+
+    while True:
+        registrations = list(
+            RepositoryBlobDigest.select(RepositoryBlobDigest.id, RepositoryBlobDigest.image_storage)
+            .where(
+                RepositoryBlobDigest.repository == repo,
+                RepositoryBlobDigest.id > cursor,
+                RepositoryBlobDigest.id <= maximum_id,
+                ~fn.EXISTS(
+                    manifest_link.select(1).where(
+                        manifest_link.repository == repo,
+                        manifest_link.blob == RepositoryBlobDigest.image_storage,
+                    )
+                ),
+                ~fn.EXISTS(
+                    upload_link.select(1).where(
+                        upload_link.repository == repo,
+                        upload_link.blob == RepositoryBlobDigest.image_storage,
+                        upload_link.expires_at > cutoff,
+                    )
+                ),
+            )
+            .order_by(RepositoryBlobDigest.id)
+            .limit(chunk_size)
+        )
+        if not registrations:
+            return found
+
+        cursor = registrations[-1].id
+        context = _GarbageCollectorContext(repo)
+        for registration in registrations:
+            context.add_blob_id(registration.image_storage_id)
+        _run_garbage_collection(context)
+        found = True
 
 
 def _run_garbage_collection(context):
@@ -363,6 +491,7 @@ def _run_garbage_collection(context):
             storage_ids_removed = set(
                 storage.garbage_collect_storage(
                     context.blob_ids,
+                    repository=context.repository,
                     namespace=context.repository.namespace_user.username,
                     repo_name=context.repository.name,
                 )
@@ -484,6 +613,58 @@ def _check_manifest_used(manifest_id):
     return False
 
 
+def _scanner_digest_is_referenced(manifest_digest):
+    """Return whether a manifest still owns a canonical or legacy scanner report."""
+    canonical_exists = Manifest.select().where(Manifest.digest == manifest_digest).exists()
+    if canonical_exists:
+        return True
+    return oci_manifest.legacy_repository_manifest_scanner_digest_exists(manifest_digest)
+
+
+def garbage_collect_secscan_reports(batch_size=SECURITY_SCANNER_GC_BATCH_SIZE):
+    """Process a bounded durable batch of scanner-report cleanup work."""
+    if not features.SECURITY_SCANNER or not config.app_config.get(
+        "SECURITY_SCANNER_V4_MANIFEST_CLEANUP"
+    ):
+        return 0
+
+    attempted = 0
+    while attempted < batch_size:
+        item = security_scanner_gc_queue.get(ordering_required=True)
+        if item is None:
+            break
+        attempted += 1
+
+        try:
+            if _scanner_digest_is_referenced(item.body):
+                # This deletion did not remove the report's final global owner. The final owner will
+                # enqueue the same identity when it is eventually collected.
+                security_scanner_gc_queue.complete(item)
+                continue
+
+            if secscan_model.garbage_collect_manifest_report(item.body) is True:
+                security_scanner_gc_queue.complete(item)
+            else:
+                security_scanner_gc_queue.incomplete(
+                    item,
+                    retry_after=SECURITY_SCANNER_GC_RETRY_SECONDS,
+                    restore_retry=True,
+                )
+        except Exception:
+            logger.warning(
+                "Exception attempting to delete manifest %s from secscan service",
+                item.body,
+                exc_info=True,
+            )
+            security_scanner_gc_queue.incomplete(
+                item,
+                retry_after=SECURITY_SCANNER_GC_RETRY_SECONDS,
+                restore_retry=True,
+            )
+
+    return attempted
+
+
 def _garbage_collect_manifest(manifest_id, context):
     assert manifest_id is not None
 
@@ -503,20 +684,15 @@ def _garbage_collect_manifest(manifest_id, context):
         if _check_manifest_used(manifest_id):
             return False
 
-        scanner_digests = {
-            registration.digest
-            for registration in RepositoryManifestDigest.select(
-                RepositoryManifestDigest.digest
-            ).where(
-                RepositoryManifestDigest.manifest == manifest_id,
-                RepositoryManifestDigest.repository == context.repository,
-            )
-        }
-        if not scanner_digests:
-            # A legacy manifest without registrations is visible by canonical SHA-256 fallback.
-            # Once registrations exist, do not disclose an unregistered canonical identity to the
-            # external scanner during cleanup.
-            scanner_digests.add(manifest.digest)
+        # Clair now stores one report under canonical SHA-256. Before Story 22, it used the first
+        # repository registration, so preserve that legacy key for eventual transition cleanup.
+        scanner_digests = [manifest.digest]
+        legacy_scanner_digest = oci_manifest.get_legacy_repository_manifest_scanner_digest(
+            context.repository.id,
+            manifest,
+        )
+        if legacy_scanner_digest != manifest.digest:
+            scanner_digests.append(legacy_scanner_digest)
 
         # Delete any label rows.
         deleted_manifest_label = (
@@ -583,6 +759,18 @@ def _garbage_collect_manifest(manifest_id, context):
             .execute()
         )
 
+        # Persist scanner cleanup work in the same transaction that removes the only rediscovery
+        # records. Queue retries restore their retry count until a later GC worker pass succeeds.
+        if features.SECURITY_SCANNER and config.app_config.get(
+            "SECURITY_SCANNER_V4_MANIFEST_CLEANUP"
+        ):
+            for scanner_digest in scanner_digests:
+                security_scanner_gc_queue.put(
+                    [scanner_digest],
+                    scanner_digest,
+                    retries_remaining=1,
+                )
+
         # Repository-scoped identities are lifecycle metadata for this manifest. Delete them
         # explicitly because development/test schemas may not have the migration's ON DELETE
         # cascade even though production schemas do.
@@ -599,16 +787,6 @@ def _garbage_collect_manifest(manifest_id, context):
         manifest.delete_instance()
 
     context.mark_manifest_removed(manifest)
-
-    if features.SECURITY_SCANNER and config.app_config.get("SECURITY_SCANNER_V4_MANIFEST_CLEANUP"):
-        for scanner_digest in scanner_digests:
-            try:
-                secscan_model.garbage_collect_manifest_report(scanner_digest)
-            except Exception:
-                logger.warning(
-                    "Exception attempting to delete manifest %s from secscan service",
-                    scanner_digest,
-                )
 
     gc_table_rows_deleted.labels(table="ManifestLabel").inc(deleted_manifest_label)
     gc_table_rows_deleted.labels(table="ManifestChild").inc(deleted_manifest_child)

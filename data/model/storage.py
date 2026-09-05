@@ -1,5 +1,6 @@
 import logging
 from collections import namedtuple
+from datetime import datetime
 from enum import Enum
 
 from cachetools.func import lru_cache
@@ -15,7 +16,9 @@ from data.database import (
     ManifestBlob,
     Namespace,
     Repository,
+    RepositoryBlobDigest,
     UploadedBlob,
+    db_for_update,
     ensure_under_transaction,
 )
 from data.model import (
@@ -87,6 +90,14 @@ def _is_storage_orphaned(candidate_id):
         except UploadedBlob.DoesNotExist:
             pass
 
+        # A registration in any repository is a global reference until that repository's GC has
+        # independently established that neither a manifest nor an unexpired upload reaches it.
+        try:
+            RepositoryBlobDigest.get(image_storage=candidate_id)
+            return False
+        except RepositoryBlobDigest.DoesNotExist:
+            pass
+
         # We need to check if a blob is a placeholder blob. If it is, we must **NOT** delete this blob.
         has_placement = (
             ImageStoragePlacement.select()
@@ -102,7 +113,37 @@ def _is_storage_orphaned(candidate_id):
     return True
 
 
-def garbage_collect_storage(storage_id_whitelist, namespace=None, repo_name=None):
+def _delete_unreferenced_repository_blob_digests(candidate_id, repository):
+    """Delete target-repository registrations only after rechecking live reachability."""
+    if (
+        ManifestBlob.select()
+        .where(ManifestBlob.repository == repository, ManifestBlob.blob == candidate_id)
+        .exists()
+    ):
+        return 0
+
+    if (
+        UploadedBlob.select()
+        .where(
+            UploadedBlob.repository == repository,
+            UploadedBlob.blob == candidate_id,
+            UploadedBlob.expires_at > datetime.utcnow(),
+        )
+        .exists()
+    ):
+        return 0
+
+    return (
+        RepositoryBlobDigest.delete()
+        .where(
+            RepositoryBlobDigest.repository == repository,
+            RepositoryBlobDigest.image_storage == candidate_id,
+        )
+        .execute()
+    )
+
+
+def garbage_collect_storage(storage_id_whitelist, namespace=None, repo_name=None, repository=None):
     """
     Performs GC on a possible subset of the storage's with the IDs found in the whitelist.
 
@@ -170,50 +211,69 @@ def garbage_collect_storage(storage_id_whitelist, namespace=None, repo_name=None
     orphaned_storage_ids = set()
     for storage_id_to_check in storage_id_whitelist:
         logger.debug("Garbage collecting storage %s", storage_id_to_check)
+        deleted_repository_blob_digest = 0
+        deleted_image_storage_placement = 0
+        deleted_image_storage_signature = 0
+        deleted_image_storage = 0
+        is_orphaned = False
 
         with db_transaction():
-            if not _is_storage_orphaned(storage_id_to_check):
+            try:
+                db_for_update(
+                    ImageStorage.select(ImageStorage.id).where(
+                        ImageStorage.id == storage_id_to_check
+                    )
+                ).get()
+            except ImageStorage.DoesNotExist:
                 continue
 
-            orphaned_storage_ids.add(storage_id_to_check)
+            if repository is not None:
+                deleted_repository_blob_digest = _delete_unreferenced_repository_blob_digests(
+                    storage_id_to_check, repository
+                )
 
-            placements_to_remove = list(
-                ImageStoragePlacement.select(ImageStoragePlacement, ImageStorage)
-                .join(ImageStorage)
-                .where(ImageStorage.id == storage_id_to_check)
-            )
+            is_orphaned = _is_storage_orphaned(storage_id_to_check)
+            if is_orphaned:
+                orphaned_storage_ids.add(storage_id_to_check)
 
-            # Remove the placements for orphaned storages
-            deleted_image_storage_placement = 0
-            if placements_to_remove:
-                deleted_image_storage_placement = (
-                    ImageStoragePlacement.delete()
-                    .where(ImageStoragePlacement.storage == storage_id_to_check)
+                placements_to_remove = list(
+                    ImageStoragePlacement.select(ImageStoragePlacement, ImageStorage)
+                    .join(ImageStorage)
+                    .where(ImageStorage.id == storage_id_to_check)
+                )
+
+                if placements_to_remove:
+                    deleted_image_storage_placement = (
+                        ImageStoragePlacement.delete()
+                        .where(ImageStoragePlacement.storage == storage_id_to_check)
+                        .execute()
+                    )
+
+                deleted_image_storage_signature = (
+                    ImageStorageSignature.delete()
+                    .where(ImageStorageSignature.storage == storage_id_to_check)
                     .execute()
                 )
 
-            deleted_image_storage_signature = (
-                ImageStorageSignature.delete()
-                .where(ImageStorageSignature.storage == storage_id_to_check)
-                .execute()
-            )
+                deleted_image_storage = (
+                    ImageStorage.delete().where(ImageStorage.id == storage_id_to_check).execute()
+                )
 
-            deleted_image_storage = (
-                ImageStorage.delete().where(ImageStorage.id == storage_id_to_check).execute()
-            )
+                # CAS paths can be shared by multiple storage rows. Filter physical paths only after
+                # the candidate row is gone, while still inside this database transaction.
+                paths_to_remove.extend(placements_to_filtered_paths_set(placements_to_remove))
 
-            # Determine the paths to remove. We cannot simply remove all paths matching storages, as CAS
-            # can share the same path. We further filter these paths by checking for any storages still in
-            # the database with the same content checksum.
-            paths_to_remove.extend(placements_to_filtered_paths_set(placements_to_remove))
-
-        gc_table_rows_deleted.labels(table="ImageStorageSignature").inc(
-            deleted_image_storage_signature
+        gc_table_rows_deleted.labels(table="RepositoryBlobDigest").inc(
+            deleted_repository_blob_digest
         )
-        gc_table_rows_deleted.labels(table="ImageStorage").inc(deleted_image_storage)
-        gc_table_rows_deleted.labels(table="ImageStoragePlacement").inc(
-            deleted_image_storage_placement
-        )
+        if is_orphaned:
+            gc_table_rows_deleted.labels(table="ImageStorageSignature").inc(
+                deleted_image_storage_signature
+            )
+            gc_table_rows_deleted.labels(table="ImageStorage").inc(deleted_image_storage)
+            gc_table_rows_deleted.labels(table="ImageStoragePlacement").inc(
+                deleted_image_storage_placement
+            )
 
     # We are going to make the conscious decision to not delete image storage blobs inside
     # transactions.

@@ -25,6 +25,18 @@ export function Layers(props: LayersProps) {
     return manifestData.layers.slice().reverse();
   }, [manifestData]);
 
+  if (!props.digest) {
+    return (
+      <PageSection hasBodyWrapper={false}>
+        <Alert
+          variant="warning"
+          title="No enabled registered digest identity"
+          isInline
+        />
+      </PageSection>
+    );
+  }
+
   // Show error state if manifest fetch failed
   if (isError) {
     return (

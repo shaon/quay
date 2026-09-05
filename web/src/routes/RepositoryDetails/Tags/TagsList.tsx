@@ -27,6 +27,7 @@ import {TagsToolbar} from './TagsToolbar';
 import {usePaginatedSortableTable} from '../../../hooks/usePaginatedSortableTable';
 import {enrichTagsWithCosignData, isCosignSignatureTag} from 'src/libs/cosign';
 import {toEpochOrZero} from 'src/libs/utils';
+import {preferredManifestDigest} from 'src/libs/manifestDigests';
 import {
   extractLastModified,
   extractExpires,
@@ -60,7 +61,9 @@ export default function TagsList(props: TagsProps) {
       4: (item: Tag) => item.size || 0, // Size
       5: extractLastModified, // Last Modified
       6: extractExpires, // Expires
-      7: (item: Tag) => item.manifest_digest, // Manifest
+      7: (item: Tag) =>
+        preferredManifestDigest(item.manifest_digests, item.manifest_digest) ??
+        '', // Manifest
       8: extractLastPulled, // Last Pulled
       9: (item: Tag) => item.pull_count || 0, // Pull Count
     },

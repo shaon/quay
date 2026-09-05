@@ -33,11 +33,13 @@ from data.model import spam_ingress
 from data.model.org_mirror import is_namespace_org_mirrored
 from data.registry_model import registry_model
 from endpoints.api import (
+    MANIFEST_DIGESTS_SCHEMA,
     ApiResource,
     RepositoryParamResource,
     allow_if_global_readonly_superuser,
     allow_if_superuser,
     allow_if_superuser_with_full_access,
+    define_json_response,
     format_date,
     log_action,
     nickname,
@@ -409,7 +411,22 @@ class Repository(RepositoryParamResource):
                     "description": "Markdown encoded description for the repository",
                 },
             },
-        }
+        },
+        "RepositoryResponse": {
+            "type": "object",
+            "properties": {
+                "tags": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "object",
+                        "required": ["manifest_digests"],
+                        "properties": {
+                            "manifest_digests": MANIFEST_DIGESTS_SCHEMA,
+                        },
+                    },
+                }
+            },
+        },
     }
 
     @parse_args()
@@ -421,6 +438,7 @@ class Repository(RepositoryParamResource):
     )
     @require_repo_read(allow_for_superuser=True, allow_for_global_readonly_superuser=True)
     @nickname("getRepo")
+    @define_json_response("RepositoryResponse")
     def get(self, namespace, repository, parsed_args):
         """
         Fetch the specified repository.

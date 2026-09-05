@@ -37,16 +37,43 @@
             <td ng-if="!entry.date_break" class="history-col">
               <div class="history-description">
                 <span class="tag-span" data-title="{{ entry.tag_name }}" bs-tooltip><span>{{ entry.tag_name }}</span></span>
+                <select ng-if="entry.manifest_digests.length > 1"
+                        ng-model="entry.manifest_digest"
+                        aria-label="History manifest digest identity">
+                  <option ng-repeat="identity in entry.manifest_digests"
+                          ng-disabled="!identity.is_enabled"
+                          value="{{ identity.digest }}">
+                    {{ identity.algorithm }}:{{ identity.digest.split(':')[1] }}{{ identity.is_enabled ? '' : ' (disabled)' }}
+                  </option>
+                </select>
+                <select ng-if="(entry.action == 'move' || entry.action == 'revert') && entry.old_manifest_digests.length > 1"
+                        ng-model="entry.old_manifest_digest"
+                        aria-label="Previous history manifest digest identity">
+                  <option ng-repeat="identity in entry.old_manifest_digests"
+                          ng-disabled="!identity.is_enabled"
+                          value="{{ identity.digest }}">
+                    {{ identity.algorithm }}:{{ identity.digest.split(':')[1] }}{{ identity.is_enabled ? '' : ' (disabled)' }}
+                  </option>
+                </select>
+                <span ng-if="!entry.manifest_digest" ng-repeat="identity in entry.manifest_digests">
+                  {{ identity.digest }} (disabled){{$last ? '' : ', '}}
+                </span>
+                <span ng-if="(entry.action == 'move' || entry.action == 'revert') && !entry.old_manifest_digest"
+                      ng-repeat="identity in entry.old_manifest_digests">
+                  {{ identity.digest }} (disabled){{$last ? '' : ', '}}
+                </span>
                 <span ng-switch on="entry.action">
                   <span ng-switch-when="recreate">
                     was recreated pointing to
-                    <manifest-link repository="repository"
+                    <manifest-link ng-if="entry.manifest_digest" repository="repository"
                           manifest-digest="entry.manifest_digest"></manifest-link>
+                    <span ng-if="!entry.manifest_digest">no enabled registered digest identity</span>
                   </span>
                   <span ng-switch-when="create">
                     was created pointing to
-                    <manifest-link repository="repository"
+                    <manifest-link ng-if="entry.manifest_digest" repository="repository"
                           manifest-digest="entry.manifest_digest"></manifest-link>
+                    <span ng-if="!entry.manifest_digest">no enabled registered digest identity</span>
                   </span>
                   <span ng-switch-when="delete">
                     <span ng-if="::isFuture(entry)">will expire</span>
@@ -54,19 +81,23 @@
                   </span>
                   <span ng-switch-when="move">
                     was moved to
-                    <manifest-link repository="repository"
+                    <manifest-link ng-if="entry.manifest_digest" repository="repository"
                           manifest-digest="entry.manifest_digest"></manifest-link>
+                    <span ng-if="!entry.manifest_digest">no enabled registered digest identity</span>
                     from
-                    <manifest-link repository="repository"
+                    <manifest-link ng-if="entry.old_manifest_digest" repository="repository"
                           manifest-digest="entry.old_manifest_digest"></manifest-link>
+                    <span ng-if="!entry.old_manifest_digest">no enabled registered digest identity</span>
                   </span>
                   <span ng-switch-when="revert">
                     was reverted to
-                    <manifest-link repository="repository"
+                    <manifest-link ng-if="entry.manifest_digest" repository="repository"
                           manifest-digest="entry.manifest_digest"></manifest-link>
+                    <span ng-if="!entry.manifest_digest">no enabled registered digest identity</span>
                     from
-                    <manifest-link repository="repository"
+                    <manifest-link ng-if="entry.old_manifest_digest" repository="repository"
                           manifest-digest="entry.old_manifest_digest"></manifest-link>
+                    <span ng-if="!entry.old_manifest_digest">no enabled registered digest identity</span>
                   </span>
                 </span>
               </div>
@@ -82,17 +113,17 @@
             <td class="revert-col hidden-xs hidden-sm">
               <div ng-if="!entry.date_break && repository.can_write && !inReadOnlyMode && !isFuture(entry)" class="history-revert">
                 <span ng-switch on="entry.action">
-                  <a ng-switch-when="delete" ng-click="askRestoreTag(entry, true)">
+                  <a ng-switch-when="delete" ng-if="entry.can_restore_manifest_digest" ng-click="askRestoreTag(entry, true)">
                     Restore to
                     <manifest-link repository="repository"
                           manifest-digest="entry.manifest_digest"></manifest-link>
                   </a>
-                  <a ng-switch-when="move" ng-click="askRestoreTag(entry, false)">
+                  <a ng-switch-when="move" ng-if="entry.can_restore_old_manifest_digest" ng-click="askRestoreTag(entry, false)">
                     Revert to
                     <manifest-link repository="repository"
                           manifest-digest="entry.old_manifest_digest"></manifest-link>
                   </a>
-                  <a ng-switch-when="revert" ng-click="askRestoreTag(entry, false)">
+                  <a ng-switch-when="revert" ng-if="entry.can_restore_old_manifest_digest" ng-click="askRestoreTag(entry, false)">
                     Restore to
                     <manifest-link repository="repository"
                           manifest-digest="entry.old_manifest_digest"></manifest-link>
@@ -101,13 +132,25 @@
               </div>
             </td>
             <td class="delete-col hidden-xs hidden-sm">
-              <div ng-if="Config.PERMANENTLY_DELETE_TAGS && !entry.date_break && repository.can_write && !inReadOnlyMode && !isFuture(entry) && (entry.action=='delete' || entry.action == 'revert') && repository.tag_expiration_s > 0" class="history-delete">
+              <div ng-if="Config.PERMANENTLY_DELETE_TAGS && !entry.date_break && repository.can_write && !inReadOnlyMode && !isFuture(entry) && (entry.action=='delete' || entry.action == 'revert') && repository.tag_expiration_s > 0 && ((entry.action == 'delete' && entry.cleanup_manifest_digest) || (entry.action == 'revert' && entry.cleanup_old_manifest_digest))" class="history-delete">
+                <select ng-if="entry.action == 'delete' && entry.manifest_digests.length > 1"
+                        ng-model="entry.cleanup_manifest_digest"
+                        aria-label="Cleanup manifest digest identity">
+                  <option ng-repeat="identity in entry.manifest_digests" value="{{ identity.digest }}">
+                    {{ identity.algorithm }}:{{ identity.digest.split(':')[1] }}{{ identity.is_enabled ? '' : ' (disabled)' }}
+                  </option>
+                </select>
+                <select ng-if="entry.action == 'revert' && entry.old_manifest_digests.length > 1"
+                        ng-model="entry.cleanup_old_manifest_digest"
+                        aria-label="Cleanup previous manifest digest identity">
+                  <option ng-repeat="identity in entry.old_manifest_digests" value="{{ identity.digest }}">
+                    {{ identity.algorithm }}:{{ identity.digest.split(':')[1] }}{{ identity.is_enabled ? '' : ' (disabled)' }}
+                  </option>
+                </select>
                 <a ng-click="askPermanentlyDeleteTag(entry)">
                   Delete <b>{{entry.tag_name}}</b>
-                  <manifest-link ng-if="entry.action=='delete'" repository="repository"
-                        manifest-digest="entry.manifest_digest"></manifest-link>
-                  <manifest-link ng-if="entry.action=='revert'"  repository="repository"
-                        manifest-digest="entry.old_manifest_digest"></manifest-link>
+                  <span ng-if="entry.action=='delete'">{{ entry.cleanup_manifest_digest }}</span>
+                  <span ng-if="entry.action=='revert'">{{ entry.cleanup_old_manifest_digest }}</span>
                 </a>
                 <i class="fa fa-info-circle dropdown-toggle" data-toggle="dropdown" data-title="The tag deleted cannot be restored within the time machine window and
                 references to the tag will be removed from tag history. Any active tags matching the name and manifest will not be effected." bs-tooltip></i>

@@ -13,11 +13,19 @@ export interface TagsResponse {
   tags: Tag[];
 }
 
+export interface ManifestDigestIdentity {
+  digest: string;
+  algorithm: string;
+  is_enabled: boolean;
+  is_preferred: boolean;
+}
+
 export interface Tag {
   name: string;
   is_manifest_list: boolean;
   last_modified: string;
   manifest_digest: string;
+  manifest_digests?: ManifestDigestIdentity[];
   reversion: boolean;
   size: number;
   start_ts: number;
@@ -88,6 +96,7 @@ export interface Label {
 }
 export interface ManifestByDigestResponse {
   digest: string;
+  manifest_digests?: ManifestDigestIdentity[];
   is_manifest_list: boolean;
   manifest_data: string;
   config_media_type?: string;

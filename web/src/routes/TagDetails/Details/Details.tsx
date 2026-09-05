@@ -11,14 +11,16 @@ import {
 import {ImageSize} from 'src/components/Table/ImageSize';
 import Labels from 'src/components/labels/Labels';
 import {formatDate} from 'src/libs/utils';
-import {Tag} from 'src/resources/TagResource';
+import {ManifestByDigestResponse, Tag} from 'src/resources/TagResource';
 import SecurityDetails from 'src/routes/RepositoryDetails/Tags/SecurityDetails';
 import CopyTags from './DetailsCopyTags';
 import Conditional from 'src/components/empty/Conditional';
 import {useQuayConfig} from 'src/hooks/UseQuayConfig';
+import ManifestDigestSelector from 'src/components/ManifestDigestSelector';
 
 export default function Details(props: DetailsProps) {
   const config = useQuayConfig();
+  const identities = props.manifestData?.manifest_digests;
 
   return (
     <>
@@ -68,16 +70,26 @@ export default function Details(props: DetailsProps) {
           <DescriptionListGroup>
             <DescriptionListTerm>Digest</DescriptionListTerm>
             <DescriptionListDescription>
-              {props.digest ? (
-                <ClipboardCopy
-                  data-testid="digest-clipboardcopy"
-                  isReadOnly
-                  hoverTip="Copy"
-                  clickTip="Copied"
-                  variant="inline-compact"
-                >
-                  {props.digest}
-                </ClipboardCopy>
+              {props.manifestData ? (
+                <>
+                  <ManifestDigestSelector
+                    identities={identities}
+                    legacyDigest={props.manifestData.digest}
+                    selectedDigest={props.digest || undefined}
+                    onSelect={props.setDigest}
+                  />{' '}
+                  {props.digest && (
+                    <ClipboardCopy
+                      data-testid="digest-clipboardcopy"
+                      isReadOnly
+                      hoverTip="Copy"
+                      clickTip="Copied"
+                      variant="inline-compact"
+                    >
+                      {props.digest}
+                    </ClipboardCopy>
+                  )}
+                </>
               ) : (
                 <Skeleton width="100%"></Skeleton>
               )}
@@ -104,7 +116,7 @@ export default function Details(props: DetailsProps) {
                 <SecurityDetails
                   org={props.org}
                   repo={props.repo}
-                  digest={props.digest}
+                  digest={props.manifestReference}
                   tag={props.tag.name}
                 />
               </DescriptionListDescription>
@@ -113,11 +125,11 @@ export default function Details(props: DetailsProps) {
           <DescriptionListGroup data-testid="labels">
             <DescriptionListTerm>Labels</DescriptionListTerm>
             <DescriptionListDescription>
-              {props.tag.manifest_digest !== '' ? (
+              {props.digest ? (
                 <Labels
                   org={props.org}
                   repo={props.repo}
-                  digest={props.tag.manifest_digest}
+                  digest={props.digest}
                 />
               ) : (
                 <Skeleton width="100%"></Skeleton>
@@ -144,4 +156,7 @@ type DetailsProps = {
   org: string;
   repo: string;
   digest: string;
+  manifestReference: string;
+  manifestData: ManifestByDigestResponse | null;
+  setDigest: (digest: string) => void;
 };

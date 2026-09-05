@@ -545,6 +545,7 @@ def test_get_repo(has_tag_manifest, initialized_db, app):
             "READ_ONLY",
             "MARKED_FOR_DELETION",
         ]
+        assert all("manifest_digests" in tag for tag in response["tags"].values())
 
 
 @pytest.mark.parametrize(

@@ -13,6 +13,7 @@ import {
   getTags,
 } from 'src/resources/TagResource';
 import {useQuayConfig} from 'src/hooks/UseQuayConfig';
+import {preferredManifestDigest} from 'src/libs/manifestDigests';
 import {
   parseOrgNameFromUrl,
   parseRepoNameFromUrl,
@@ -33,6 +34,7 @@ function getMissingArchitectures(tag: Tag): string[] {
 export default function TagDetails() {
   const [searchParams] = useSearchParams();
   const [digest, setDigest] = useState<string>('');
+  const [manifestReference, setManifestReference] = useState<string>('');
   const [manifestData, setManifestData] =
     useState<ManifestByDigestResponse>(null);
   const [err, setErr] = useState<string>();
@@ -64,7 +66,6 @@ export default function TagDetails() {
       try {
         const resp: TagsResponse = await getTags(org, repo, 1, 100, tag);
 
-        // These should never happen but checking for errors just in case
         if (resp.tags.length === 0) {
           throw new Error('Could not find tag');
         }
@@ -75,69 +76,82 @@ export default function TagDetails() {
         }
 
         const tagResp: Tag = resp.tags[0];
-
-        // Always fetch manifest data for layers and other features, but
-        // only include modelcard if UI_MODELCARD feature is enabled
         const includeModelcard = quayConfig?.features.UI_MODELCARD || false;
-        const manifestResp: ManifestByDigestResponse =
-          await getManifestByDigest(
-            org,
-            repo,
-            tagResp.manifest_digest,
-            includeModelcard,
-          );
+        const rootDigest = preferredManifestDigest(
+          tagResp.manifest_digests,
+          tagResp.manifest_digest,
+        );
+        if (!rootDigest) {
+          throw new Error('No registered digest identities');
+        }
+        const rootManifestData = await getManifestByDigest(
+          org,
+          repo,
+          rootDigest,
+          includeModelcard,
+        );
 
         if (tagResp.is_manifest_list) {
-          const manifestList = JSON.parse(manifestResp.manifest_data);
-          // Merge presence info from tag API into manifest list
+          const manifestList = JSON.parse(rootManifestData.manifest_data);
           if (tagResp.child_manifests_presence && manifestList.manifests) {
             manifestList.manifests = manifestList.manifests.map(
-              (m: {digest: string}) => ({
-                ...m,
+              (manifest: {digest: string}) => ({
+                ...manifest,
                 is_present:
-                  tagResp.child_manifests_presence?.[m.digest] ?? true,
+                  tagResp.child_manifests_presence?.[manifest.digest] ?? true,
               }),
             );
           }
           tagResp.manifest_list = manifestList;
         }
-        if (manifestResp.modelcard) {
-          tagResp.modelcard = manifestResp.modelcard;
+        if (rootManifestData.modelcard) {
+          tagResp.modelcard = rootManifestData.modelcard;
         }
 
-        setManifestData(manifestResp);
-
-        // Confirm requested digest exists for this tag
         const requestedDigest = searchParams.get('digest');
-        if (
-          requestedDigest &&
-          requestedDigest !== tagResp.manifest_digest &&
-          !tagResp.manifest_list?.manifests?.some(
-            (m) => m.digest === requestedDigest,
-          )
-        ) {
+        const isEnabledRootDigest =
+          tagResp.manifest_digests === undefined
+            ? requestedDigest === tagResp.manifest_digest
+            : tagResp.manifest_digests.some(
+                (identity) =>
+                  identity.is_enabled && identity.digest === requestedDigest,
+              );
+        const requestedChild = tagResp.manifest_list?.manifests?.find(
+          (manifest) => manifest.digest === requestedDigest,
+        );
+        if (requestedDigest && !isEnabledRootDigest && !requestedChild) {
           throw new Error(`Requested digest not found: ${requestedDigest}`);
         }
 
-        // For manifest lists, prefer the first present architecture
-        let currentDigest = tagResp.manifest_digest;
-        if (
-          tagResp.is_manifest_list &&
-          tagResp.manifest_list?.manifests?.length > 0
-        ) {
-          // Find the first present manifest, or fall back to first if none present
-          const firstPresent = tagResp.manifest_list.manifests.find(
-            (m) => m.is_present !== false,
+        let selectedReference = tagResp.manifest_digest || rootDigest;
+        let selectedIdentity = requestedDigest || rootDigest;
+        let selectedManifestData = rootManifestData;
+
+        if (tagResp.is_manifest_list && !isEnabledRootDigest) {
+          const firstPresent = tagResp.manifest_list?.manifests?.find(
+            (manifest) => manifest.is_present !== false,
           );
-          currentDigest = firstPresent
-            ? firstPresent.digest
-            : tagResp.manifest_list.manifests[0].digest;
+          selectedReference =
+            requestedChild?.digest ?? firstPresent?.digest ?? rootDigest;
+          if (selectedReference !== rootDigest) {
+            selectedManifestData = await getManifestByDigest(
+              org,
+              repo,
+              selectedReference,
+            );
+            selectedIdentity =
+              preferredManifestDigest(
+                selectedManifestData.manifest_digests,
+                selectedManifestData.digest,
+              ) ?? '';
+          }
         }
-        currentDigest = searchParams.get('digest')
-          ? searchParams.get('digest')
-          : currentDigest;
-        setDigest(currentDigest);
+
+        setManifestReference(selectedReference);
+        setDigest(selectedIdentity);
+        setManifestData(selectedManifestData);
         setTagDetails(tagResp);
+        setErr(undefined);
       } catch (error: unknown) {
         console.error(error);
         const errorObj =
@@ -147,6 +161,29 @@ export default function TagDetails() {
     })();
   }, [org, repo, tag, searchParams, quayConfig?.features?.UI_MODELCARD]);
 
+  const selectManifestReference = async (reference: string) => {
+    try {
+      const selectedManifestData = await getManifestByDigest(
+        org,
+        repo,
+        reference,
+      );
+      setManifestReference(reference);
+      setManifestData(selectedManifestData);
+      setDigest(
+        preferredManifestDigest(
+          selectedManifestData.manifest_digests,
+          selectedManifestData.digest,
+        ) ?? '',
+      );
+      setErr(undefined);
+    } catch (error: unknown) {
+      const errorObj =
+        error instanceof Error ? error : new Error(String(error));
+      setErr(addDisplayError('Unable to get details for manifest', errorObj));
+    }
+  };
+
   return (
     <>
       <QuayBreadcrumb />
@@ -155,9 +192,9 @@ export default function TagDetails() {
           {repo}:{tag}
         </Title>
         <TagArchSelect
-          digest={digest}
+          digest={manifestReference}
           options={tagDetails.manifest_list?.manifests}
-          setDigest={setDigest}
+          setDigest={selectManifestReference}
           render={tagDetails.is_manifest_list}
           style={{marginTop: 'var(--pf-t--global--spacer--md)'}}
         />
@@ -192,7 +229,9 @@ export default function TagDetails() {
             repo={repo}
             tag={tagDetails}
             digest={digest}
+            manifestReference={manifestReference}
             manifestData={manifestData}
+            setDigest={setDigest}
             err={err}
           />
         </ErrorBoundary>

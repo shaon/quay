@@ -20,12 +20,14 @@ from data.model.pull_statistics import (
     get_tag_pull_statistics,
 )
 from data.registry_model import registry_model
-from endpoints.api import RepositoryParamResource
+from endpoints.api import MANIFEST_DIGESTS_SCHEMA, RepositoryParamResource
 from endpoints.api import abort as custom_abort
 from endpoints.api import (
     disallow_for_non_normal_repositories,
+    define_json_response,
     disallow_for_user_namespace,
     format_date,
+    format_manifest_digest_infos,
     log_action,
     nickname,
     parse_args,
@@ -108,7 +110,7 @@ def _get_sparse_manifest_info(manifest_id, repository_id):
     return is_sparse, child_manifest_count, present_child_count, child_presence_map
 
 
-def _tag_dict(tag):
+def _tag_dict(tag, manifest_digest_infos=()):
     tag_info = {
         "name": tag.name,
         "reversion": tag.reversion,
@@ -124,6 +126,7 @@ def _tag_dict(tag):
         tag_info["end_ts"] = tag.lifetime_end_ts
 
     tag_info["manifest_digest"] = tag.manifest_digest
+    tag_info["manifest_digests"] = format_manifest_digest_infos(manifest_digest_infos)
     tag_info["is_manifest_list"] = tag.manifest.is_manifest_list
     tag_info["size"] = tag.manifest_layers_size
 
@@ -155,6 +158,28 @@ class ListRepositoryTags(RepositoryParamResource):
     Resource for listing full repository tag history, alive *and dead*.
     """
 
+    schemas = {
+        "RepositoryTagsResponse": {
+            "type": "object",
+            "required": ["tags", "page", "has_additional"],
+            "properties": {
+                "tags": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["manifest_digest", "manifest_digests"],
+                        "properties": {
+                            "manifest_digest": {"type": "string"},
+                            "manifest_digests": MANIFEST_DIGESTS_SCHEMA,
+                        },
+                    },
+                },
+                "page": {"type": "integer"},
+                "has_additional": {"type": "boolean"},
+            },
+        }
+    }
+
     @require_repo_read(allow_for_superuser=True, allow_for_global_readonly_superuser=True)
     @parse_args()
     @query_param("specificTag", "Filters the tags to the specific tag.", type=str, default="")
@@ -171,6 +196,7 @@ class ListRepositoryTags(RepositoryParamResource):
     @query_param("page", "Page index for the results. Default 1.", type=int, default=1)
     @query_param("onlyActiveTags", "Filter to only active tags.", type=truthy_bool, default=False)
     @nickname("listRepoTags")
+    @define_json_response("RepositoryTagsResponse")
     def get(self, namespace, repository, parsed_args):
         specific_tag = parsed_args.get("specificTag") or None
         filter_tag_name = parsed_args.get("filter_tag_name") or None
@@ -194,8 +220,18 @@ class ListRepositoryTags(RepositoryParamResource):
             print("error", error)
             custom_abort(400, message=str(error))
 
+        manifests_by_id = {}
+        for tag in history:
+            manifest = tag.manifest
+            manifests_by_id[manifest.id] = manifest
+        digest_infos = registry_model.get_repository_manifest_digest_infos(
+            repo_ref,
+            manifests_by_id.values(),
+            allowed_algorithms=app.config.get("ALLOWED_HASH_ALGORITHMS", ["sha256"]),
+        )
+
         return {
-            "tags": [_tag_dict(tag) for tag in history],
+            "tags": [_tag_dict(tag, digest_infos[tag.manifest.id]) for tag in history],
             "page": page,
             "has_additional": has_more,
         }

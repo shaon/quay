@@ -29,9 +29,11 @@ export default function RestoreTag(props: RestoreTagProps) {
 
   let digest: string = null;
   let message: ReactElement = null;
+  let canRestore = false;
   switch (tagEntry.action) {
     case TagAction.Delete:
       digest = tagEntry.digest;
+      canRestore = tagEntry.canRestoreDigest !== false;
       message = (
         <>
           Restore to <ManifestDigest digest={tagEntry.digest} />
@@ -40,6 +42,7 @@ export default function RestoreTag(props: RestoreTagProps) {
       break;
     case TagAction.Move:
       digest = tagEntry.oldDigest;
+      canRestore = tagEntry.canRestoreOldDigest !== false;
       message = (
         <>
           Revert to <ManifestDigest digest={tagEntry.oldDigest} />
@@ -48,6 +51,7 @@ export default function RestoreTag(props: RestoreTagProps) {
       break;
     case TagAction.Revert:
       digest = tagEntry.oldDigest;
+      canRestore = tagEntry.canRestoreOldDigest !== false;
       message = (
         <>
           Restore to <ManifestDigest digest={tagEntry.oldDigest} />
@@ -80,6 +84,10 @@ export default function RestoreTag(props: RestoreTagProps) {
       setIsModalOpen(false);
     }
   }, [error]);
+
+  if (!canRestore) {
+    return null;
+  }
 
   return (
     <>

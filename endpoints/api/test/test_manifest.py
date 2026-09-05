@@ -3,7 +3,8 @@ from datetime import datetime
 from mock import patch
 
 from app import app as realapp
-from data.database import ManifestPullStatistics, TagPullStatistics
+from data.database import Manifest as ManifestTable
+from data.database import ManifestPullStatistics, RepositoryManifestDigest, TagPullStatistics
 from data.model.repository import create_repository
 from data.model.user import get_user
 from data.registry_model import registry_model
@@ -11,9 +12,51 @@ from endpoints.api.manifest import RepositoryManifest, _get_modelcard_layer_dige
 from endpoints.api.test.shared import conduct_api_call
 from endpoints.test.shared import client_with_identity
 from features import FeatureNameValue
+from image.docker.schema1 import DOCKER_SCHEMA1_CONTENT_TYPES
 from image.oci.manifest import OCIManifest
 from test.fixtures import *
 from util.bytes import Bytes
+
+
+def test_repository_manifest_exposes_only_registered_schema1_sha256(app):
+    repo_ref = registry_model.lookup_repository("devtable", "simple")
+    manifest = registry_model.list_all_active_repository_tags(repo_ref)[0].manifest
+    manifest_row = ManifestTable.get_by_id(manifest.id)
+    assert manifest_row.media_type.name in DOCKER_SCHEMA1_CONTENT_TYPES
+    RepositoryManifestDigest.delete().where(
+        RepositoryManifestDigest.repository == repo_ref.id,
+        RepositoryManifestDigest.manifest == manifest.id,
+    ).execute()
+    RepositoryManifestDigest.create(
+        repository=repo_ref.id,
+        manifest=manifest.id,
+        digest="sha512:" + "a" * 128,
+    )
+    RepositoryManifestDigest.create(
+        repository=repo_ref.id,
+        manifest=manifest.id,
+        digest=manifest_row.digest,
+    )
+
+    params = {"repository": "devtable/simple", "manifestref": manifest_row.digest}
+    with (
+        patch.dict(
+            realapp.config,
+            {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384", "sha512"]},
+        ),
+        client_with_identity("devtable", app) as cl,
+    ):
+        result = conduct_api_call(cl, RepositoryManifest, "GET", params, None, 200).json
+
+    assert result["digest"] == manifest_row.digest
+    assert result["manifest_digests"] == [
+        {
+            "digest": manifest_row.digest,
+            "algorithm": "sha256",
+            "is_enabled": True,
+            "is_preferred": True,
+        }
+    ]
 
 
 def test_repository_manifest(app):

@@ -2,6 +2,7 @@ import {atom, atomFamily, selector} from 'recoil';
 import {SearchState} from 'src/components/toolbar/SearchTypes';
 import {Tag} from 'src/resources/TagResource';
 import ColumnNames from 'src/routes/RepositoryDetails/Tags/ColumnNames';
+import {manifestDigestIdentities} from 'src/libs/manifestDigests';
 
 export const searchTagsState = atom<SearchState>({
   key: 'searchsearchTagsStateState',
@@ -29,12 +30,16 @@ export const searchTagsFilterState = selector({
         return false;
       }
     };
+    const digestSearchValue = (tag: Tag) =>
+      manifestDigestIdentities(tag.manifest_digests, tag.manifest_digest)
+        .map((identity) => identity.digest)
+        .join(' ');
     const filterByDigest = (tag: Tag) =>
-      tag.manifest_digest.includes(search.query);
+      digestSearchValue(tag).includes(search.query);
     const filterByDigestRegex = (tag: Tag) => {
       try {
         const regex = new RegExp(search.query, 'i');
-        return regex.test(tag.manifest_digest);
+        return regex.test(digestSearchValue(tag));
       } catch (e) {
         return false;
       }

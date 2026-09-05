@@ -1,5 +1,6 @@
 import datetime
 import logging
+import random
 import re
 import uuid
 from calendar import timegm
@@ -9,13 +10,17 @@ from peewee import fn
 import features
 from data.database import (
     Manifest,
+    ManifestBlob,
     ManifestChild,
     MediaType,
     Namespace,
     Repository,
+    RepositoryBlobDigest,
+    RepositoryManifestDigest,
     RepositoryState,
     Tag,
     TagPullStatistics,
+    UploadedBlob,
     User,
     compute_advisory_lock_id,
     db_advisory_xact_lock,
@@ -963,49 +968,208 @@ def set_tag_end_ms(tag, end_ms):
         return (tag.lifetime_end_ms, True)
 
 
-def find_repository_with_garbage(limit_to_gc_policy_s):
-    """Returns a repository that has garbage (defined as an expired Tag that is past
-    the repo's namespace's expiration window) or None if none.
-    """
+def _source_window(model, start_id, columns, alias):
+    """Return a bounded primary-key window from a garbage source table."""
+    return (
+        model.select(*columns, can_use_read_replica=True)
+        .where(
+            model.id >= start_id,
+            model.id < start_id + GC_CANDIDATE_COUNT,
+        )
+        .order_by(model.id)
+        .limit(GC_CANDIDATE_COUNT)
+        .alias(alias)
+    )
+
+
+def _find_repository_garbage_candidates(limit_to_gc_policy_s, source_start_ids):
+    """Build a bounded union of repository IDs driven by the four garbage sources."""
     expiration_timestamp = get_epoch_timestamp_ms() - (limit_to_gc_policy_s * 1000)
+    now = datetime.datetime.utcnow()
+    tag_start, upload_start, blob_registration_start, manifest_registration_start = source_start_ids
+
+    tag_source = _source_window(
+        Tag,
+        tag_start,
+        (Tag.id, Tag.repository, Tag.lifetime_end_ms, Tag.immutable),
+        "garbage_tag_source",
+    )
+    expired_tags = (
+        Repository.select(
+            tag_source.c.repository_id.alias("repository_id"), can_use_read_replica=True
+        )
+        .from_(tag_source)
+        .join(Repository, on=(tag_source.c.repository_id == Repository.id))
+        .join(Namespace, on=(Repository.namespace_user == Namespace.id))
+        .where(
+            ~(tag_source.c.lifetime_end_ms >> None),
+            tag_source.c.lifetime_end_ms <= expiration_timestamp,
+            Namespace.removed_tag_expiration_s == limit_to_gc_policy_s,
+            Namespace.enabled == True,
+            Repository.state != RepositoryState.MARKED_FOR_DELETION,
+        )
+        .group_by(tag_source.c.repository_id)
+    )
+    if features.IMMUTABLE_TAGS and not config.app_config.get(
+        "FEATURE_IMMUTABLE_TAGS_CAN_EXPIRE", False
+    ):
+        expired_tags = expired_tags.where(tag_source.c.immutable == False)  # noqa: E712
+
+    upload_source = _source_window(
+        UploadedBlob,
+        upload_start,
+        (UploadedBlob.id, UploadedBlob.repository, UploadedBlob.expires_at),
+        "garbage_upload_source",
+    )
+    expired_uploads = (
+        Repository.select(
+            upload_source.c.repository_id.alias("repository_id"), can_use_read_replica=True
+        )
+        .from_(upload_source)
+        .join(Repository, on=(upload_source.c.repository_id == Repository.id))
+        .join(Namespace, on=(Repository.namespace_user == Namespace.id))
+        .where(
+            upload_source.c.expires_at <= now,
+            Namespace.enabled == True,
+            Repository.state != RepositoryState.MARKED_FOR_DELETION,
+        )
+        .group_by(upload_source.c.repository_id)
+    )
+
+    blob_source = _source_window(
+        RepositoryBlobDigest,
+        blob_registration_start,
+        (
+            RepositoryBlobDigest.id,
+            RepositoryBlobDigest.repository,
+            RepositoryBlobDigest.image_storage,
+        ),
+        "garbage_blob_registration_source",
+    )
+    registration_manifest_link = ManifestBlob.alias()
+    registration_upload_link = UploadedBlob.alias()
+    unreachable_blob_registrations = (
+        Repository.select(
+            blob_source.c.repository_id.alias("repository_id"), can_use_read_replica=True
+        )
+        .from_(blob_source)
+        .join(Repository, on=(blob_source.c.repository_id == Repository.id))
+        .join(Namespace, on=(Repository.namespace_user == Namespace.id))
+        .where(
+            Namespace.enabled == True,
+            Repository.state != RepositoryState.MARKED_FOR_DELETION,
+            ~fn.EXISTS(
+                registration_manifest_link.select(1).where(
+                    registration_manifest_link.repository == blob_source.c.repository_id,
+                    registration_manifest_link.blob == blob_source.c.image_storage_id,
+                )
+            ),
+            ~fn.EXISTS(
+                registration_upload_link.select(1).where(
+                    registration_upload_link.repository == blob_source.c.repository_id,
+                    registration_upload_link.blob == blob_source.c.image_storage_id,
+                    registration_upload_link.expires_at > now,
+                )
+            ),
+        )
+        .group_by(blob_source.c.repository_id)
+    )
+
+    manifest_source = _source_window(
+        RepositoryManifestDigest,
+        manifest_registration_start,
+        (
+            RepositoryManifestDigest.id,
+            RepositoryManifestDigest.repository,
+            RepositoryManifestDigest.manifest,
+        ),
+        "garbage_manifest_registration_source",
+    )
+    registered_manifest = Manifest.alias()
+    registration_tag_link = Tag.alias()
+    registration_parent_link = ManifestChild.alias()
+    registration_referrer = Manifest.alias()
+    unreachable_manifest_registrations = (
+        Repository.select(
+            manifest_source.c.repository_id.alias("repository_id"), can_use_read_replica=True
+        )
+        .from_(manifest_source)
+        .join(Repository, on=(manifest_source.c.repository_id == Repository.id))
+        .join(Namespace, on=(Repository.namespace_user == Namespace.id))
+        .join(
+            registered_manifest,
+            on=(manifest_source.c.manifest_id == registered_manifest.id),
+        )
+        .where(
+            Namespace.enabled == True,
+            Repository.state != RepositoryState.MARKED_FOR_DELETION,
+            ~fn.EXISTS(
+                registration_tag_link.select(1).where(
+                    registration_tag_link.manifest == manifest_source.c.manifest_id
+                )
+            ),
+            ~fn.EXISTS(
+                registration_parent_link.select(1).where(
+                    registration_parent_link.child_manifest == manifest_source.c.manifest_id
+                )
+            ),
+            ~fn.EXISTS(
+                registration_referrer.select(1).where(
+                    registration_referrer.repository == manifest_source.c.repository_id,
+                    registration_referrer.subject == registered_manifest.digest,
+                )
+            ),
+        )
+        .group_by(manifest_source.c.repository_id)
+    )
+
+    source_candidates = (
+        expired_tags.union_all(expired_uploads)
+        .union_all(unreachable_blob_registrations)
+        .union_all(unreachable_manifest_registrations)
+        .alias("garbage_source_candidates")
+    )
+    return (
+        Repository.select(
+            source_candidates.c.repository_id.alias("repository_id"),
+            can_use_read_replica=True,
+        )
+        .from_(source_candidates)
+        .distinct()
+        .limit(GC_CANDIDATE_COUNT)
+    )
+
+
+def _random_source_start_id(model):
+    maximum_id = model.select(fn.Max(model.id), can_use_read_replica=True).scalar() or 0
+    if maximum_id <= GC_CANDIDATE_COUNT:
+        return 1
+
+    # Negative starts give rows at the low end of a larger primary-key range the same-size sampling
+    # interval as later rows. Gaps can reduce a window, but no window examines more IDs than the
+    # fixed candidate count.
+    return random.randint(1 - GC_CANDIDATE_COUNT, maximum_id)
+
+
+def find_repository_with_garbage(limit_to_gc_policy_s):
+    """Return a random repository found in bounded windows of indexed garbage sources."""
+    source_start_ids = tuple(
+        _random_source_start_id(model)
+        for model in (Tag, UploadedBlob, RepositoryBlobDigest, RepositoryManifestDigest)
+    )
+    candidates = _find_repository_garbage_candidates(
+        limit_to_gc_policy_s,
+        source_start_ids=source_start_ids,
+    ).alias("candidates")
 
     try:
-        candidates = (
-            Tag.select(Tag.repository, can_use_read_replica=True)
-            .join(Repository)
-            .join(Namespace, on=(Repository.namespace_user == Namespace.id))
-            .where(
-                ~(Tag.lifetime_end_ms >> None),
-                (Tag.lifetime_end_ms <= expiration_timestamp),
-                (Namespace.removed_tag_expiration_s == limit_to_gc_policy_s),
-                (Namespace.enabled == True),
-                (Repository.state != RepositoryState.MARKED_FOR_DELETION),
-            )
-            .limit(GC_CANDIDATE_COUNT)
-            .distinct()
-        )
-
-        # Skip repos where the only expired tags are immutable and should not expire
-        if features.IMMUTABLE_TAGS and not config.app_config.get(
-            "FEATURE_IMMUTABLE_TAGS_CAN_EXPIRE", False
-        ):
-            candidates = candidates.where(Tag.immutable == False)  # noqa: E712
-
-        candidates = candidates.alias("candidates")
-
         found = (
-            Tag.select(candidates.c.repository_id, can_use_read_replica=True)
+            Repository.select(candidates.c.repository_id, can_use_read_replica=True)
             .from_(candidates)
             .order_by(db_random_func())
             .get()
         )
-
-        if found is None:
-            return
-
         return Repository.get(Repository.id == found.repository_id)
-    except Tag.DoesNotExist:
-        return None
     except Repository.DoesNotExist:
         return None
 

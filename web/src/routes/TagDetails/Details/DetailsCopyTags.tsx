@@ -45,32 +45,36 @@ export default function CopyTags(props: CopyTagsProps) {
             </ClipboardCopy>
           </DescriptionListDescription>
         </DescriptionListGroup>
-        <DescriptionListGroup>
-          <DescriptionListTerm>Podman Pull (by digest)</DescriptionListTerm>
-          <DescriptionListDescription>
-            <ClipboardCopy
-              data-testid="podman-digest-clipboardcopy"
-              isReadOnly
-              hoverTip="Copy"
-              clickTip="Copied"
-            >
-              {`podman pull ${domain}/${props.org}/${props.repo}@${props.digest}`}
-            </ClipboardCopy>
-          </DescriptionListDescription>
-        </DescriptionListGroup>
-        <DescriptionListGroup>
-          <DescriptionListTerm>Docker Pull (by digest)</DescriptionListTerm>
-          <DescriptionListDescription>
-            <ClipboardCopy
-              data-testid="docker-digest-clipboardcopy"
-              isReadOnly
-              hoverTip="Copy"
-              clickTip="Copied"
-            >
-              {`docker pull ${domain}/${props.org}/${props.repo}@${props.digest}`}
-            </ClipboardCopy>
-          </DescriptionListDescription>
-        </DescriptionListGroup>
+        {props.digest && (
+          <>
+            <DescriptionListGroup>
+              <DescriptionListTerm>Podman Pull (by digest)</DescriptionListTerm>
+              <DescriptionListDescription>
+                <ClipboardCopy
+                  data-testid="podman-digest-clipboardcopy"
+                  isReadOnly
+                  hoverTip="Copy"
+                  clickTip="Copied"
+                >
+                  {`podman pull ${domain}/${props.org}/${props.repo}@${props.digest}`}
+                </ClipboardCopy>
+              </DescriptionListDescription>
+            </DescriptionListGroup>
+            <DescriptionListGroup>
+              <DescriptionListTerm>Docker Pull (by digest)</DescriptionListTerm>
+              <DescriptionListDescription>
+                <ClipboardCopy
+                  data-testid="docker-digest-clipboardcopy"
+                  isReadOnly
+                  hoverTip="Copy"
+                  clickTip="Copied"
+                >
+                  {`docker pull ${domain}/${props.org}/${props.repo}@${props.digest}`}
+                </ClipboardCopy>
+              </DescriptionListDescription>
+            </DescriptionListGroup>
+          </>
+        )}
       </DescriptionList>
     </>
   );

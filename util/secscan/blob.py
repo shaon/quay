@@ -25,9 +25,12 @@ class BlobURLRetriever(object):
         self._instance_keys = instance_keys
         self._app = app
 
-    def url_for_download(self, repository_ref, blob):
+    def url_for_download(self, repository_ref, blob, repository_digest=None):
         """
         Returns the URL for downloading the given blob under the given repository.
+
+        ``repository_digest`` is the registered descriptor identity used for registry routing.
+        The blob itself retains its canonical SHA-256 storage identity.
         """
         # Try via direct download from storage.
         uri = self._storage.get_direct_download_url(self._storage.locations, blob.storage_path)
@@ -39,7 +42,7 @@ class BlobURLRetriever(object):
             relative_layer_url = url_for(
                 "v2.download_blob",
                 repository=_repository_and_namespace(repository_ref),
-                digest=blob.digest,
+                digest=repository_digest or blob.digest,
             )
 
         url_scheme_and_hostname = "%s://%s" % (

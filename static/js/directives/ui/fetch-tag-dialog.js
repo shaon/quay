@@ -37,7 +37,7 @@ angular.module('quay').directive('fetchTagDialog', function () {
           'command': 'docker pull {hostname}/{namespace}/{name}:{tag}'
         });
 
-        if ($scope.currentTag && $scope.currentTag.manifest_digest) {          
+        if ($scope.currentTag && $scope.currentTag.selected_manifest_digest) {
           $scope.formats.push({
             'title': 'Podman Pull (by digest)',
             'icon': 'podman-icon',
@@ -99,7 +99,7 @@ angular.module('quay').directive('fetchTagDialog', function () {
           'namespace': $scope.repository.namespace,
           'name': $scope.repository.name,
           'tag': $scope.currentTag.name,
-          'manifest_digest': $scope.currentTag.manifest_digest
+          'manifest_digest': $scope.currentTag.selected_manifest_digest
         };
 
         var value = format.command;

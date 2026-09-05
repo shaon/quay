@@ -137,6 +137,7 @@ class Tag(
             "image_aggregate_size",
             "lifetime_start_ts",
             "tag_manifest_digest",
+            "manifest_digests",
             "lifetime_end_ts",
         ],
     )
@@ -167,6 +168,7 @@ class Tag(
         if self.tag_manifest_digest is not None:
             tag_info["manifest_digest"] = self.tag_manifest_digest
 
+        tag_info["manifest_digests"] = self.manifest_digests
         return tag_info
 
 

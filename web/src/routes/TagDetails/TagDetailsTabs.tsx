@@ -48,6 +48,9 @@ export default function TagTabs(props: TagTabsProps) {
           repo={props.repo}
           tag={props.tag}
           digest={props.digest}
+          manifestReference={props.manifestReference}
+          manifestData={props.manifestData}
+          setDigest={props.setDigest}
         />
       </Tab>
       <Tab
@@ -64,7 +67,7 @@ export default function TagTabs(props: TagTabsProps) {
         <SecurityReport
           org={props.org}
           repo={props.repo}
-          digest={props.digest}
+          digest={props.manifestReference}
         />
       </Tab>
       <Tab
@@ -75,7 +78,7 @@ export default function TagTabs(props: TagTabsProps) {
         <Packages
           org={props.org}
           repo={props.repo}
-          digest={props.digest}
+          digest={props.manifestReference}
           layers={props.manifestData?.layers}
         />
       </Tab>
@@ -95,6 +98,8 @@ type TagTabsProps = {
   org: string;
   repo: string;
   digest: string;
+  manifestReference: string;
   manifestData: ManifestByDigestResponse | null;
+  setDigest: (digest: string) => void;
   err: string;
 };

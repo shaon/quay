@@ -16,12 +16,15 @@ from data.model.pull_statistics import get_manifest_pull_statistics
 from data.registry_model import registry_model
 from digest import digest_tools
 from endpoints.api import (
+    MANIFEST_DIGESTS_SCHEMA,
     RepositoryParamResource,
     abort,
     api,
     disallow_for_non_normal_repositories,
+    define_json_response,
     disallow_for_user_namespace,
     format_date,
+    format_manifest_digest_infos,
     log_action,
     nickname,
     parse_args,
@@ -78,7 +81,7 @@ def _layer_dict(manifest_layer, index):
     }
 
 
-def _manifest_dict(manifest):
+def _manifest_dict(manifest, manifest_digest_infos=()):
     layers = None
     if not manifest.is_manifest_list:
         layers = registry_model.list_manifest_layers(manifest, storage)
@@ -88,6 +91,7 @@ def _manifest_dict(manifest):
 
     return {
         "digest": manifest.digest,
+        "manifest_digests": format_manifest_digest_infos(manifest_digest_infos),
         "is_manifest_list": manifest.is_manifest_list,
         "manifest_data": manifest.internal_manifest_bytes.as_unicode(),
         "config_media_type": manifest.config_media_type,
@@ -140,8 +144,20 @@ class RepositoryManifest(RepositoryParamResource):
     Resource for retrieving a specific repository manifest.
     """
 
+    schemas = {
+        "RepositoryManifestResponse": {
+            "type": "object",
+            "required": ["digest", "manifest_digests"],
+            "properties": {
+                "digest": {"type": "string"},
+                "manifest_digests": MANIFEST_DIGESTS_SCHEMA,
+            },
+        }
+    }
+
     @require_repo_read(allow_for_superuser=True, allow_for_global_readonly_superuser=True)
     @nickname("getRepoManifest")
+    @define_json_response("RepositoryManifestResponse")
     @parse_args()
     @query_param(
         "include_modelcard",
@@ -162,7 +178,12 @@ class RepositoryManifest(RepositoryParamResource):
         if manifest is None or manifest.internal_manifest_bytes.as_unicode() == "":
             raise NotFound()
 
-        manifest_dict = _manifest_dict(manifest)
+        digest_infos = registry_model.get_repository_manifest_digest_infos(
+            repo_ref,
+            [manifest],
+            allowed_algorithms=app.config.get("ALLOWED_HASH_ALGORITHMS", ["sha256"]),
+        )
+        manifest_dict = _manifest_dict(manifest, digest_infos[manifest.id])
 
         if features.UI_MODELCARD and parsed_args["include_modelcard"]:
             parsed = manifest.get_parsed_manifest()

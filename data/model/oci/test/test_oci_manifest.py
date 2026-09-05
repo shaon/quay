@@ -30,9 +30,11 @@ from data.model.oci.manifest import (
     CreateManifestException,
     connect_manifests,
     get_or_create_manifest,
+    get_repository_manifest_digest_infos,
     lookup_manifest,
     lookup_manifest_referrers,
     register_repository_manifest_digest,
+    resolve_repository_manifest_descriptor,
 )
 from data.model.oci.retriever import RepositoryContentRetriever
 from data.model.oci.tag import filter_to_alive_tags, get_tag
@@ -42,6 +44,7 @@ from digest.digest_tools import digest_bytes, sha256_digest
 from image.docker.schema1 import DockerSchema1Manifest, DockerSchema1ManifestBuilder
 from image.docker.schema2.list import DockerSchema2ManifestListBuilder
 from image.docker.schema2.manifest import (
+    DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE,
     DockerSchema2Manifest,
     DockerSchema2ManifestBuilder,
 )
@@ -52,6 +55,78 @@ from image.shared.interfaces import ContentRetriever
 from image.shared.schemas import parse_manifest_from_bytes
 from test.fixtures import *
 from util.bytes import Bytes
+
+
+def test_repository_manifest_digest_infos_are_explicit_scoped_and_batched(initialized_db):
+    repository = create_repository("devtable", "newrepo", None)
+    manifest, parsed = create_manifest_for_testing(repository, differentiation_field="api-digests")
+    RepositoryManifestDigest.delete().where(
+        RepositoryManifestDigest.repository == repository,
+        RepositoryManifestDigest.manifest == manifest,
+    ).execute()
+    sha384 = digest_bytes("sha384", parsed.bytes.as_encoded_str())
+    sha512 = digest_bytes("sha512", parsed.bytes.as_encoded_str())
+    for digest in (sha512, manifest.digest, sha384):
+        RepositoryManifestDigest.create(
+            repository=repository,
+            manifest=manifest,
+            digest=digest,
+        )
+
+    other_tag = (
+        filter_to_alive_tags(Tag.select())
+        .where(Tag.hidden == False, Tag.repository != repository)  # noqa: E712
+        .get()
+    )
+    other_manifest = other_tag.manifest
+
+    with assert_query_count(1):
+        infos = get_repository_manifest_digest_infos(
+            repository.id,
+            [manifest.id, other_manifest.id],
+            allowed_algorithms=["sha256", "sha384"],
+        )
+
+    assert [info.digest for info in infos[manifest.id]] == [sha512, manifest.digest, sha384]
+    assert [info.is_enabled for info in infos[manifest.id]] == [False, True, True]
+    assert [info.is_preferred for info in infos[manifest.id]] == [False, True, False]
+    assert infos[other_manifest.id] == []
+
+    RepositoryManifestDigest.delete().where(
+        RepositoryManifestDigest.repository == repository,
+        RepositoryManifestDigest.manifest == manifest,
+    ).execute()
+    assert get_repository_manifest_digest_infos(repository.id, [manifest.id])[manifest.id] == []
+
+
+def test_repository_manifest_digest_infos_filter_schema1_alternatives(initialized_db):
+    tag = filter_to_alive_tags(Tag.select()).where(Tag.hidden == False).get()  # noqa: E712
+    manifest = tag.manifest
+    RepositoryManifestDigest.delete().where(
+        RepositoryManifestDigest.repository == manifest.repository,
+        RepositoryManifestDigest.manifest == manifest,
+    ).execute()
+    alternative_digest = digest_bytes("sha512", manifest.manifest_bytes.encode("utf-8"))
+    RepositoryManifestDigest.create(
+        repository=manifest.repository,
+        manifest=manifest,
+        digest=alternative_digest,
+    )
+    RepositoryManifestDigest.create(
+        repository=manifest.repository,
+        manifest=manifest,
+        digest=manifest.digest,
+    )
+
+    infos = get_repository_manifest_digest_infos(
+        manifest.repository_id,
+        [manifest.id],
+        allowed_algorithms=["sha256", "sha512"],
+    )
+
+    assert [info.digest for info in infos[manifest.id]] == [manifest.digest]
+    assert infos[manifest.id][0].is_enabled
+    assert infos[manifest.id][0].is_preferred
 
 
 def test_lookup_manifest(initialized_db):
@@ -80,11 +155,9 @@ def test_lookup_manifest(initialized_db):
 def test_alternative_manifest_registration_preserves_visible_legacy_sha256(
     algorithm, initialized_db
 ):
-    tag = filter_to_alive_tags(Tag.select()).where(Tag.hidden == False).get()  # noqa: E712
-    manifest = tag.manifest
-    parsed = parse_manifest_from_bytes(
-        Bytes.for_string_or_unicode(manifest.manifest_bytes),
-        manifest.media_type.name,
+    repository = create_repository("devtable", "newrepo", None)
+    manifest, parsed = create_manifest_for_testing(
+        repository, differentiation_field=f"alternative-{algorithm}"
     )
     alternative_digest = digest_bytes(algorithm, parsed.bytes.as_encoded_str())
 
@@ -107,6 +180,58 @@ def test_alternative_manifest_registration_preserves_visible_legacy_sha256(
             RepositoryManifestDigest.manifest == manifest,
         )
     } == {manifest.digest, alternative_digest}
+
+
+@pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
+def test_story19_schema1_alternative_descriptor_is_rejected_by_model(algorithm, initialized_db):
+    tag = filter_to_alive_tags(Tag.select()).where(Tag.hidden == False).get()  # noqa: E712
+    manifest = tag.manifest
+    parsed = parse_manifest_from_bytes(
+        Bytes.for_string_or_unicode(manifest.manifest_bytes),
+        manifest.media_type.name,
+    )
+    assert parsed.schema_version == 1
+    alternative_digest = digest_bytes(algorithm, parsed.bytes.as_encoded_str())
+    with pytest.raises(ManifestDigestConflictException):
+        register_repository_manifest_digest(
+            manifest.repository_id,
+            manifest,
+            alternative_digest,
+        )
+    RepositoryManifestDigest.create(
+        repository=manifest.repository,
+        manifest=manifest,
+        digest=alternative_digest,
+    )
+
+    with pytest.raises(ManifestDigestConflictException):
+        resolve_repository_manifest_descriptor(
+            manifest.repository_id,
+            alternative_digest,
+            media_type=manifest.media_type.name,
+        )
+    assert (
+        resolve_repository_manifest_descriptor(
+            manifest.repository_id,
+            manifest.digest,
+            media_type=manifest.media_type.name,
+        )
+        == manifest
+    )
+
+
+def test_story19_schema1_registration_rejects_noncanonical_sha256(initialized_db):
+    tag = filter_to_alive_tags(Tag.select()).where(Tag.hidden == False).get()  # noqa: E712
+    manifest = tag.manifest
+    wrong_sha256 = "sha256:" + "0" * 64
+    assert wrong_sha256 != manifest.digest
+
+    with pytest.raises(ManifestDigestConflictException):
+        register_repository_manifest_digest(
+            manifest.repository_id,
+            manifest,
+            wrong_sha256,
+        )
 
 
 def test_story13_legacy_manifest_registration_is_atomic_and_idempotent(initialized_db):
@@ -160,38 +285,38 @@ def test_story13_legacy_manifest_registration_is_atomic_and_idempotent(initializ
 
 @pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
 def test_manifest_registration_is_repository_scoped_and_cannot_remap(algorithm, initialized_db):
-    first_tag = filter_to_alive_tags(Tag.select()).where(Tag.hidden == False).get()  # noqa: E712
-    first_manifest = first_tag.manifest
-    second_manifest = (
-        Manifest.select()
-        .where(
-            Manifest.repository == first_manifest.repository,
-            Manifest.id != first_manifest.id,
-        )
-        .get()
+    first_repository = create_repository("devtable", "newrepo", None)
+    first_manifest, _ = create_manifest_for_testing(
+        first_repository, differentiation_field=f"first-{algorithm}"
+    )
+    second_manifest, _ = create_manifest_for_testing(
+        first_repository, differentiation_field=f"second-{algorithm}"
     )
     other_tag = (
         filter_to_alive_tags(Tag.select())
         .where(
             Tag.hidden == False,  # noqa: E712
-            Tag.repository != first_manifest.repository,
+            Tag.repository != first_repository,
         )
         .get()
     )
+    other_manifest = other_tag.manifest
+    other_manifest.media_type = Manifest.media_type.get_id(DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE)
+    other_manifest.save()
     digest = f"{algorithm}:" + "1" * (hashlib.new(algorithm).digest_size * 2)
 
     with pytest.raises(ManifestDigestConflictException):
         register_repository_manifest_digest(
             first_manifest.repository,
-            other_tag.manifest,
+            other_manifest,
             digest,
         )
 
     register_repository_manifest_digest(first_manifest.repository, first_manifest, digest)
-    register_repository_manifest_digest(other_tag.repository, other_tag.manifest, digest)
+    register_repository_manifest_digest(other_manifest.repository, other_manifest, digest)
 
     assert lookup_manifest(first_manifest.repository, digest, allow_hidden=True) == first_manifest
-    assert lookup_manifest(other_tag.repository, digest, allow_hidden=True) == other_tag.manifest
+    assert lookup_manifest(other_manifest.repository, digest, allow_hidden=True) == other_manifest
     assert (
         lookup_manifest(first_manifest.repository, first_manifest.digest, allow_hidden=True) is None
     )

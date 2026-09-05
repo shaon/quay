@@ -198,7 +198,12 @@ def fetch_manifest_by_tagname(namespace_name, repo_name, manifest_ref, registry_
 @inject_registry_model()
 def fetch_manifest_by_digest(namespace_name, repo_name, manifest_ref, registry_model):
     parsed_reference = _parse_manifest_reference(manifest_ref)
-    _validate_manifest_digest_algorithm(parsed_reference.hash_alg)
+    algorithm_disabled = parsed_reference.hash_alg not in app.config.get(
+        "ALLOWED_HASH_ALGORITHMS", ["sha256"]
+    )
+    defer_disabled_validation = algorithm_disabled and parsed_reference.hash_alg != "sha256"
+    if not defer_disabled_validation:
+        _validate_manifest_digest_algorithm(parsed_reference.hash_alg)
     manifest_ref = str(parsed_reference)
 
     try:
@@ -210,6 +215,8 @@ def fetch_manifest_by_digest(namespace_name, repo_name, manifest_ref, registry_m
             model_cache=model_cache,
         )
     except RepositoryDoesNotExist as e:
+        if defer_disabled_validation:
+            raise DigestDisabled(parsed_reference.hash_alg)
         image_pulls.labels("v2", "manifest", 404).inc()
         raise NameUnknown("repository not found")
 
@@ -222,8 +229,14 @@ def fetch_manifest_by_digest(namespace_name, repo_name, manifest_ref, registry_m
             allow_hidden=True,
         )
     except ManifestDoesNotExist as e:
+        if defer_disabled_validation:
+            raise DigestDisabled(parsed_reference.hash_alg)
         image_pulls.labels("v2", "manifest", 404).inc()
         raise ManifestUnknown(str(e))
+
+    _reject_alternative_schema1_identity(manifest, parsed_reference.hash_alg)
+    _validate_manifest_digest_algorithm(parsed_reference.hash_alg)
+    _validate_schema1_response(manifest)
 
     track_and_log(
         "pull_repo", repository_ref, manifest_digest=manifest_ref, mediaType=manifest.media_type
@@ -262,12 +275,14 @@ def _rewrite_schema_if_necessary(
     # See: https://docs.docker.com/registry/spec/manifest-v2-2
     mimetypes = [mimetype for mimetype, _ in request.accept_mimetypes]
     if manifest.media_type in mimetypes:
+        _validate_schema1_response(manifest)
         return manifest.internal_manifest_bytes, manifest.digest, manifest.media_type
 
     # Short-circuit check: If the mimetypes is empty or just `application/json`, verify we have
     # a schema 1 manifest and return it.
     if not mimetypes or mimetypes == ["application/json"]:
         if manifest.media_type in DOCKER_SCHEMA1_CONTENT_TYPES:
+            _validate_schema1_response(manifest)
             return manifest.internal_manifest_bytes, manifest.digest, manifest.media_type
 
     logger.debug(
@@ -279,12 +294,15 @@ def _rewrite_schema_if_necessary(
         manifest, namespace_name, repo_name, tag_name, mimetypes, storage
     )
     if converted is not None:
+        if converted.media_type in DOCKER_SCHEMA1_CONTENT_TYPES:
+            _validate_manifest_descriptor_digests(converted)
         return converted.bytes, converted.digest, converted.media_type
 
     # For back-compat, we always default to schema 1 if the manifest could not be converted.
     schema1 = registry_model.get_schema1_parsed_manifest(
         manifest, namespace_name, repo_name, tag_name, storage, raise_on_error=True
     )
+    _validate_manifest_descriptor_digests(schema1)
     return schema1.bytes, schema1.digest, schema1.media_type
 
 
@@ -388,6 +406,8 @@ def _enqueue_blobs_for_replication(manifest, storage, namespace_name):
 @check_pushes_disabled
 def write_manifest_by_digest(namespace_name, repo_name, manifest_ref):
     requested_digest = _parse_manifest_reference(manifest_ref)
+    if requested_digest.hash_alg != "sha256" and _request_declares_schema1_manifest():
+        raise DigestUnsupported(requested_digest.hash_alg)
     _validate_manifest_digest_algorithm(requested_digest.hash_alg)
 
     parsed = _parse_manifest(request.content_type, request.data)
@@ -556,6 +576,10 @@ def _validate_manifest_digest_algorithm(algorithm):
         raise DigestDisabled(algorithm)
 
 
+def _request_declares_schema1_manifest():
+    return request.mimetype in {None, "application/json", *DOCKER_SCHEMA1_CONTENT_TYPES}
+
+
 def _manifest_descriptor_digests(manifest_impl):
     try:
         descriptor_digests = list(manifest_impl.blob_digests or [])
@@ -577,6 +601,8 @@ def _manifest_descriptor_digests(manifest_impl):
 def _validate_manifest_descriptor_digests(manifest_impl):
     for descriptor_digest in _manifest_descriptor_digests(manifest_impl):
         parsed = _parse_manifest_reference(descriptor_digest)
+        if manifest_impl.schema_version == 1 and parsed.hash_alg != "sha256":
+            raise DigestUnsupported(parsed.hash_alg)
         _validate_manifest_digest_algorithm(parsed.hash_alg)
 
 
@@ -635,6 +661,8 @@ def delete_manifest_by_digest(namespace_name, repo_name, manifest_ref):
         )
         if manifest is None:
             raise ManifestUnknown()
+
+        _reject_alternative_schema1_identity(manifest, parsed_reference.hash_alg)
 
         try:
             tags = registry_model.delete_tags_for_manifest(model_cache, manifest)
@@ -756,6 +784,7 @@ def _write_manifest(
         manifest_impl,
         requested_digest=requested_digest,
     )
+    _validate_no_schema1_alias_descriptors(repository_ref, manifest_impl)
 
     # Create the manifest(s) and retarget the tag to point to it.
     try:
@@ -803,6 +832,38 @@ def _write_manifest(
         raise ManifestInvalid()
 
     return repository_ref, manifest, tag
+
+
+def _reject_alternative_schema1_identity(manifest, algorithm):
+    if manifest.media_type in DOCKER_SCHEMA1_CONTENT_TYPES and algorithm != "sha256":
+        raise DigestUnsupported(algorithm)
+
+
+def _validate_schema1_response(manifest):
+    if manifest.media_type in DOCKER_SCHEMA1_CONTENT_TYPES:
+        _validate_manifest_descriptor_digests(manifest.get_parsed_manifest())
+
+
+def _validate_no_schema1_alias_descriptors(repository_ref, parsed_manifest):
+    descriptors = list(parsed_manifest.manifest_dict.get("manifests", []))
+    if parsed_manifest.subject is not None:
+        descriptors.append(parsed_manifest.subject)
+
+    for descriptor in descriptors:
+        descriptor_digest = (
+            descriptor.get("digest") if isinstance(descriptor, dict) else str(descriptor.digest)
+        )
+        algorithm = _parse_manifest_reference(descriptor_digest).hash_alg
+        if algorithm == "sha256":
+            continue
+        child = registry_model.lookup_manifest_by_digest(
+            repository_ref,
+            descriptor_digest,
+            allow_hidden=True,
+            raise_on_error=False,
+        )
+        if child is not None and child.media_type in DOCKER_SCHEMA1_CONTENT_TYPES:
+            raise DigestUnsupported(algorithm)
 
 
 def _validate_schema1_manifest(namespace: str, repo: str, manifest: DockerSchema1Manifest):

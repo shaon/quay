@@ -6,11 +6,12 @@ import logging
 from enum import Enum, unique
 
 import features
-from app import model_cache, storage
+from app import app, model_cache, storage
 from auth.decorators import process_basic_auth_no_pass
 from data.registry_model import registry_model
 from data.secscan_model import secscan_model
 from data.secscan_model.datatypes import ScanLookupStatus
+from digest import digest_tools
 from endpoints.api import (
     RepositoryParamResource,
     deprecated,
@@ -25,6 +26,7 @@ from endpoints.api import (
 from endpoints.api.manifest import MANIFEST_DIGEST_ROUTE
 from endpoints.decorators import anon_allowed
 from endpoints.exception import DownstreamIssue, NotFound
+from image.docker.schema1 import DOCKER_SCHEMA1_CONTENT_TYPES
 from util.parsing import truthy_bool
 
 
@@ -52,6 +54,25 @@ MAPPED_STATUSES[ScanLookupStatus.MANIFEST_LAYER_TOO_LARGE] = (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _require_enabled_manifest_digest(manifestref):
+    try:
+        parsed = digest_tools.Digest.parse_digest(manifestref, strict=True)
+    except digest_tools.InvalidDigestException:
+        raise NotFound()
+
+    if parsed.hash_alg not in app.config.get("ALLOWED_HASH_ALGORITHMS", ["sha256"]):
+        raise NotFound()
+
+
+def _require_canonical_schema1_digest(manifestref, manifest):
+    if manifest.media_type not in DOCKER_SCHEMA1_CONTENT_TYPES:
+        return
+
+    parsed_manifest = manifest.get_parsed_manifest()
+    if manifestref != str(parsed_manifest.digest):
+        raise NotFound()
 
 
 def _security_info(manifest_or_legacy_image, include_vulnerabilities=True):
@@ -103,8 +124,10 @@ class RepositoryManifestSecurity(RepositoryParamResource):
         if repo_ref is None:
             raise NotFound()
 
+        _require_enabled_manifest_digest(manifestref)
         manifest = registry_model.lookup_manifest_by_digest(repo_ref, manifestref, allow_dead=True)
         if manifest is None:
             raise NotFound()
+        _require_canonical_schema1_digest(manifestref, manifest)
 
         return _security_info(manifest, parsed_args.vulnerabilities)

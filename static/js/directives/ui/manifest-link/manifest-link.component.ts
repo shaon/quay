@@ -20,13 +20,18 @@ export class ManifestLinkComponent {
   constructor(@Inject('$timeout') private $timeout, @Inject('$element') private $element) {
   }
 
-  private hasSHA256(digest: string) {
-    return digest && digest.indexOf('sha256:') == 0;
+  private hasDigest(digest: string) {
+    return digest && digest.indexOf(':') > 0;
+  }
+
+  private getAlgorithm(digest: string) {
+    if (!this.hasDigest(digest)) { return ''; }
+    return digest.substring(0, digest.indexOf(':'));
   }
 
   private getShortDigest(digest: string) {
-    if (!digest) { return ''; }
-    return digest.substr('sha256:'.length).substr(0, 12);
+    if (!this.hasDigest(digest)) { return ''; }
+    return digest.substring(digest.indexOf(':') + 1).substring(0, 12);
   }
 
   private showCopyBox() {

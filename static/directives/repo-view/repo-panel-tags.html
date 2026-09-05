@@ -130,9 +130,9 @@
         style="width: 20px; position: relative;">
     </td>
     <td class="hidden-xs hidden-sm"
-        ng-class="tablePredicateClass('manifest_digest', options.predicate, options.reverse)"
+        ng-class="tablePredicateClass('manifest_digest_search', options.predicate, options.reverse)"
         style="width: 140px;">
-      <a ng-click="orderBy('manifest_digest')">Manifest</a>
+      <a ng-click="orderBy('manifest_digest_search')">Manifest</a>
     </td>
     <td class="hidden-xs hidden-sm hidden-md image-track" ng-repeat="mt in manifestTracks"
         ng-if="manifestTracks.length <= maxTrackCount"></td>
@@ -218,7 +218,22 @@
               bs-popover></span>
       </td>
       <td class="hidden-xs hidden-sm image-id-col">
-        <manifest-link repository="repository" image-id="tag.image_id" manifest-digest="tag.manifest_digest"></manifest-link>
+        <select ng-if="digestIdentities(tag).length > 1"
+                ng-model="tag.selected_manifest_digest"
+                aria-label="Manifest digest identity">
+          <option ng-repeat="identity in digestIdentities(tag)"
+                  ng-disabled="!identity.is_enabled"
+                  value="{{ identity.digest }}">
+            {{ identity.algorithm }}:{{ identity.digest.split(':')[1] }}{{ identity.is_enabled ? '' : ' (disabled)' }}
+          </option>
+        </select>
+        <manifest-link ng-if="tag.selected_manifest_digest"
+                       repository="repository" image-id="tag.image_id"
+                       manifest-digest="tag.selected_manifest_digest"></manifest-link>
+        <span ng-if="tag.manifest_digests.length && !tag.selected_manifest_digest">
+          <span ng-repeat="identity in tag.manifest_digests">{{ identity.digest }} (disabled){{$last ? '' : ', '}}</span>
+        </span>
+        <span ng-if="tag.manifest_digests !== undefined && !tag.manifest_digests.length">No registered digest identities</span>
       </td>
       <td class="hidden-xs hidden-sm hidden-md image-track" ng-repeat="mt in manifestTracks"
           ng-if="manifestTracks.length <= maxTrackCount">
@@ -239,6 +254,7 @@
       </td>
       <td class="options-col">
         <i class="fa fa-download" data-title="Fetch Tag" bs-tooltip
+           ng-if="tag.selected_manifest_digest"
            ng-click="fetchTagActionHandler.askFetchTag(tag)">
         </i>
       </td>
@@ -250,7 +266,7 @@
               <i class="fa fa-plus"></i> Add New Tag
             </span>
             <span class="cor-option" option-click="showLabelEditor(tag)"
-                  ng-if="tag.manifest_digest">
+                  ng-if="tag.selected_manifest_digest">
               <i class="fa fa-tags"></i> Edit Labels
             </span>
             <span class="cor-option" option-click="askDeleteTag(tag.name)"
@@ -318,12 +334,12 @@
       <td class="labels-col" colspan="{{5 + (repository.trust_enabled ? 1 : 0) + (Features.SECURITY_SCANNER ? 1 : 0) }}">
         <!-- Image ID -->
         <div class="image-id-row">
-          <manifest-link repository="repository" image-id="tag.image_id" manifest-digest="tag.manifest_digest"></manifest-link>
+          <manifest-link repository="repository" image-id="tag.image_id" manifest-digest="tag.selected_manifest_digest"></manifest-link>
         </div>
 
         <!-- Labels -->
         <div class="manifest-label-list" repository="repository"
-             manifest-digest="tag.manifest_digest" cache="labelCache"></div>
+             manifest-digest="tag.selected_manifest_digest" cache="labelCache"></div>
 
         <!-- Cosign Signatures -->
         <div class="cosign-signature-row" ng-if="tag.cosign_signature_tag">

@@ -20,6 +20,7 @@ from data.database import (
     ManifestBlob,
     ManifestSecurityStatus,
     MediaType,
+    RepositoryManifestDigest,
     db_transaction,
 )
 from data.registry_model import registry_model
@@ -45,6 +46,7 @@ from data.secscan_model.secscan_v4_model import (
     V4SecurityScanner,
     _has_container_layers,
     features_for,
+    manifest_for_security_scanner,
 )
 from image.docker.schema2 import (
     DOCKER_SCHEMA2_LAYER_CONTENT_TYPE,
@@ -193,17 +195,27 @@ def test_load_security_information_success(initialized_db, set_secscan_config):
     assert result.security_information == SecurityInformation(Layer(manifest.digest, "", "", 4, []))
 
 
-def test_load_security_information_uses_repository_visible_digest(
-    initialized_db, set_secscan_config
+@pytest.mark.parametrize(("algorithm", "encoded_length"), [("sha384", 96), ("sha512", 128)])
+def test_load_security_information_resolves_registered_identity_to_canonical_report(
+    algorithm, encoded_length, initialized_db, set_secscan_config
 ):
-    repository_ref = registry_model.lookup_repository("devtable", "simple")
-    tag = registry_model.get_repo_tag(repository_ref, "latest")
-    manifest = registry_model.get_manifest_for_tag(tag)
+    repository = model.repository.create_repository("devtable", "story22-report", None)
+    tags = {}
+    create_schema2_or_oci_manifest_for_testing(
+        repository,
+        (1, [], ["story22-report"]),
+        tags,
+    )
+    repository_ref = registry_model.lookup_repository("devtable", "story22-report")
+    manifest = tags["story22-report"]
     manifest_row = Manifest.get_by_id(manifest._db_id)
-    external_digest = "sha512:" + "a" * 128
+    external_digest = algorithm + ":" + "a" * encoded_length
     model.oci.manifest.register_repository_manifest_digest(
         repository_ref.id, manifest_row, external_digest
     )
+    alias_manifest = registry_model.lookup_manifest_by_digest(repository_ref, external_digest)
+    assert alias_manifest.digest == external_digest
+    assert manifest_for_security_scanner(manifest_row).digest == manifest_row.digest
 
     ManifestSecurityStatus.update(
         error_json={},
@@ -216,7 +228,7 @@ def test_load_security_information_uses_repository_visible_digest(
     secscan = V4SecurityScanner(application, instance_keys, storage)
     secscan._secscan_api = mock.Mock()
     secscan._secscan_api.vulnerability_report.return_value = {
-        "manifest_hash": external_digest,
+        "manifest_hash": manifest_row.digest,
         "state": "IndexFinished",
         "packages": {},
         "distributions": {},
@@ -227,11 +239,269 @@ def test_load_security_information_uses_repository_visible_digest(
         "err": "",
     }
 
-    result = secscan.load_security_information(manifest)
+    result = secscan.load_security_information(alias_manifest)
 
     assert result.status == ScanLookupStatus.SUCCESS
-    secscan._secscan_api.vulnerability_report.assert_called_once_with(external_digest)
-    assert result.security_information == SecurityInformation(Layer(external_digest, "", "", 4, []))
+    secscan._secscan_api.vulnerability_report.assert_called_once_with(manifest_row.digest)
+    assert result.security_information == SecurityInformation(
+        Layer(manifest_row.digest, "", "", 4, [])
+    )
+
+
+def test_registered_digest_aliases_share_canonical_security_report_cache(
+    initialized_db, set_secscan_config
+):
+    model_cache = InMemoryDataModelCache(TEST_CACHE_CONFIG)
+    model_cache.empty_for_testing()
+    repository = model.repository.create_repository("devtable", "story22-cache", None)
+    tags = {}
+    create_schema2_or_oci_manifest_for_testing(
+        repository,
+        (1, [], ["story22-cache"]),
+        tags,
+    )
+    repository_ref = registry_model.lookup_repository("devtable", "story22-cache")
+    manifest = tags["story22-cache"]
+    manifest_row = Manifest.get_by_id(manifest.id)
+    aliases = ["sha384:" + "d" * 96, "sha512:" + "e" * 128]
+    for alias in aliases:
+        model.oci.manifest.register_repository_manifest_digest(
+            repository_ref.id,
+            manifest_row,
+            alias,
+        )
+
+    ManifestSecurityStatus.update(
+        error_json={},
+        index_status=IndexStatus.COMPLETED,
+        indexer_hash="abc",
+        indexer_version=IndexerVersion.V4,
+        metadata_json={},
+    ).where(ManifestSecurityStatus.manifest == manifest.id).execute()
+
+    secscan = V4SecurityScanner(application, instance_keys, storage)
+    secscan._secscan_api = mock.Mock()
+    secscan._secscan_api.vulnerability_report.return_value = {
+        "manifest_hash": manifest_row.digest,
+        "state": "IndexFinished",
+        "packages": {},
+        "distributions": {},
+        "repository": {},
+        "environments": {},
+        "package_vulnerabilities": {},
+        "success": True,
+        "err": "",
+    }
+
+    for alias in aliases:
+        alias_manifest = registry_model.lookup_manifest_by_digest(repository_ref, alias)
+        assert (
+            secscan.load_security_information(alias_manifest, model_cache=model_cache).status
+            == ScanLookupStatus.SUCCESS
+        )
+
+    secscan._secscan_api.vulnerability_report.assert_called_once_with(manifest_row.digest)
+    assert model_cache.cache.get(cache_key.for_security_report(manifest_row.digest, {}).key)
+    for alias in aliases:
+        assert model_cache.cache.get(cache_key.for_security_report(alias, {}).key) is None
+
+
+def test_missing_canonical_report_falls_back_and_schedules_reindex(
+    initialized_db, set_secscan_config
+):
+    model_cache = InMemoryDataModelCache(TEST_CACHE_CONFIG)
+    model_cache.empty_for_testing()
+    repository = model.repository.create_repository("devtable", "story22-transition", None)
+    tags = {}
+    create_schema2_or_oci_manifest_for_testing(
+        repository,
+        (1, [], ["story22-transition"]),
+        tags,
+    )
+    repository_ref = registry_model.lookup_repository("devtable", "story22-transition")
+    manifest = tags["story22-transition"]
+    manifest_row = Manifest.get_by_id(manifest.id)
+    legacy_digest = "sha512:" + "f" * 128
+    RepositoryManifestDigest.delete().where(
+        RepositoryManifestDigest.repository == repository,
+        RepositoryManifestDigest.manifest == manifest_row,
+    ).execute()
+    model.oci.manifest.register_repository_manifest_digest(
+        repository_ref.id,
+        manifest_row,
+        legacy_digest,
+    )
+
+    ManifestSecurityStatus.update(
+        error_json={},
+        index_status=IndexStatus.COMPLETED,
+        indexer_hash="abc",
+        indexer_version=IndexerVersion.V4,
+        metadata_json={},
+    ).where(ManifestSecurityStatus.manifest == manifest.id).execute()
+
+    legacy_report = {
+        "manifest_hash": legacy_digest,
+        "state": "IndexFinished",
+        "packages": {},
+        "distributions": {},
+        "repository": {},
+        "environments": {},
+        "package_vulnerabilities": {},
+        "success": True,
+        "err": "",
+    }
+    secscan = V4SecurityScanner(application, instance_keys, storage)
+    secscan._secscan_api = mock.Mock()
+    secscan._secscan_api.vulnerability_report.side_effect = lambda digest: (
+        legacy_report if digest == legacy_digest else None
+    )
+
+    alias_manifest = registry_model.lookup_manifest_by_digest(repository_ref, legacy_digest)
+    result = secscan.load_security_information(alias_manifest, model_cache=model_cache)
+
+    assert result.status == ScanLookupStatus.SUCCESS
+    assert result.security_information == SecurityInformation(
+        Layer(manifest_row.digest, "", "", 4, [])
+    )
+    assert secscan._secscan_api.vulnerability_report.call_args_list == [
+        mock.call(manifest_row.digest),
+        mock.call(legacy_digest),
+    ]
+    status = ManifestSecurityStatus.get(ManifestSecurityStatus.manifest == manifest.id)
+    assert status.index_status == IndexStatus.PENDING
+    assert status.metadata_json["legacy_scanner_digest"] == legacy_digest
+    assert model_cache.cache.get(cache_key.for_security_report(manifest_row.digest, {}).key) is None
+    assert model_cache.cache.get(cache_key.for_security_report(legacy_digest, {}).key)
+
+    result = secscan.load_security_information(alias_manifest, model_cache=model_cache)
+
+    assert result.status == ScanLookupStatus.SUCCESS
+    assert result.security_information == SecurityInformation(
+        Layer(manifest_row.digest, "", "", 4, [])
+    )
+    assert secscan._secscan_api.vulnerability_report.call_args_list == [
+        mock.call(manifest_row.digest),
+        mock.call(legacy_digest),
+    ]
+
+
+def test_v1_worker_completes_legacy_report_transition_with_canonical_identity(
+    initialized_db, set_secscan_config
+):
+    repository = model.repository.create_repository("devtable", "story22-v1-transition", None)
+    tags = {}
+    create_schema2_or_oci_manifest_for_testing(
+        repository,
+        (1, [], ["story22-v1-transition"]),
+        tags,
+    )
+    repository_ref = registry_model.lookup_repository("devtable", "story22-v1-transition")
+    manifest = tags["story22-v1-transition"]
+    manifest_row = Manifest.get_by_id(manifest.id)
+    legacy_digest = "sha512:" + "a" * 128
+    RepositoryManifestDigest.delete().where(
+        RepositoryManifestDigest.repository == repository,
+        RepositoryManifestDigest.manifest == manifest_row,
+    ).execute()
+    model.oci.manifest.register_repository_manifest_digest(
+        repository.id,
+        manifest_row,
+        legacy_digest,
+    )
+    alias_manifest = registry_model.lookup_manifest_by_digest(repository_ref, legacy_digest)
+
+    _backfill_pending_mss()
+    ManifestSecurityStatus.update(
+        error_json={},
+        index_status=IndexStatus.COMPLETED,
+        indexer_hash="canonical-state",
+        indexer_version=IndexerVersion.V4,
+        last_indexed=datetime.utcnow(),
+        metadata_json={},
+    ).execute()
+
+    legacy_report = {
+        "manifest_hash": legacy_digest,
+        "state": "IndexFinished",
+        "packages": {},
+        "distributions": {},
+        "repository": {},
+        "environments": {},
+        "package_vulnerabilities": {},
+        "success": True,
+        "err": "",
+    }
+    secscan = V4SecurityScanner(application, instance_keys, storage)
+    secscan._secscan_api = mock.Mock()
+    secscan._secscan_api.vulnerability_report.side_effect = lambda digest: (
+        legacy_report if digest == legacy_digest else None
+    )
+
+    assert secscan.load_security_information(alias_manifest).status == ScanLookupStatus.SUCCESS
+    transition = ManifestSecurityStatus.get(ManifestSecurityStatus.manifest == manifest_row)
+    assert transition.index_status == IndexStatus.PENDING
+    assert transition.metadata_json == {"legacy_scanner_digest": legacy_digest}
+
+    secscan._secscan_api.state.return_value = {"state": "canonical-state"}
+    secscan._secscan_api.index.return_value = (
+        {"err": None, "state": IndexReportState.Index_Finished},
+        "canonical-state",
+    )
+    secscan._secscan_api.index.reset_mock()
+    secscan.perform_indexing(batch_size=100)
+
+    secscan._secscan_api.index.assert_called_once()
+    indexed_manifest, indexed_layers = secscan._secscan_api.index.call_args.args
+    assert indexed_manifest.digest == manifest_row.digest
+    local_layers = [layer for layer in indexed_layers if not layer.layer_info.is_remote]
+    assert local_layers
+    assert all(str(layer.blob.digest).startswith("sha256:") for layer in local_layers)
+
+    completed = ManifestSecurityStatus.get(ManifestSecurityStatus.manifest == manifest_row)
+    assert completed.index_status == IndexStatus.COMPLETED
+    assert completed.metadata_json == {}
+
+    canonical_report = dict(legacy_report, manifest_hash=manifest_row.digest)
+    secscan._secscan_api.vulnerability_report.reset_mock()
+    secscan._secscan_api.vulnerability_report.side_effect = lambda digest: (
+        canonical_report if digest == manifest_row.digest else None
+    )
+    assert secscan.load_security_information(alias_manifest).status == ScanLookupStatus.SUCCESS
+    secscan._secscan_api.vulnerability_report.assert_called_once_with(manifest_row.digest)
+
+
+def test_gc_preserves_legacy_report_key_while_it_is_still_owned(initialized_db, set_secscan_config):
+    repository = model.repository.create_repository("devtable", "story22-legacy-cleanup", None)
+    tags = {}
+    create_schema2_or_oci_manifest_for_testing(
+        repository,
+        (1, [], ["story22-legacy-cleanup"]),
+        tags,
+    )
+    manifest = tags["story22-legacy-cleanup"]
+    manifest_row = Manifest.get_by_id(manifest.id)
+    legacy_digest = "sha512:" + "9" * 128
+    RepositoryManifestDigest.delete().where(
+        RepositoryManifestDigest.repository == repository,
+        RepositoryManifestDigest.manifest == manifest_row,
+    ).execute()
+    registration = model.oci.manifest.register_repository_manifest_digest(
+        repository.id,
+        manifest_row,
+        legacy_digest,
+    )
+
+    secscan = V4SecurityScanner(application, instance_keys, storage)
+    secscan._secscan_api = mock.Mock()
+
+    assert secscan.garbage_collect_manifest_report(legacy_digest) is None
+    secscan._secscan_api.delete.assert_not_called()
+
+    registration.delete_instance()
+
+    assert secscan.garbage_collect_manifest_report(legacy_digest) is True
+    secscan._secscan_api.delete.assert_called_once_with(legacy_digest)
 
 
 def test_load_security_information_success_with_cache(initialized_db, set_secscan_config):

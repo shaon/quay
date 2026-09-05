@@ -10,7 +10,7 @@ import {
   Td,
 } from '@patternfly/react-table';
 import prettyBytes from 'pretty-bytes';
-import {useState} from 'react';
+import {useEffect, useState} from 'react';
 import {Tag, Manifest, Label as ManifestLabel} from 'src/resources/TagResource';
 import {useRecoilValue} from 'recoil';
 import {Link, useLocation} from 'react-router-dom';
@@ -41,6 +41,12 @@ import {useTagPullStatistics} from 'src/hooks/UseTags';
 import TagExpiration from './TagsTableExpiration';
 import {useManifestTracks, TrackEntry} from './useManifestTracks';
 import ManifestTrackCell from './ManifestTrackCell';
+import ManifestDigest from 'src/components/ManifestDigest';
+import ManifestDigestSelector from 'src/components/ManifestDigestSelector';
+import {
+  preferredManifestDigest,
+  tagNavigationDigest,
+} from 'src/libs/manifestDigests';
 import './Tags.css';
 
 function SubRow(props: SubRowProps) {
@@ -175,6 +181,16 @@ function TagsTableRow(props: RowProps) {
   const location = useLocation();
   const [isTagHovered, setIsTagHovered] = useState(false);
   const [isDigestHovered, setIsDigestHovered] = useState(false);
+  const preferredDigest = preferredManifestDigest(
+    tag.manifest_digests,
+    tag.manifest_digest,
+  );
+  const [selectedDigest, setSelectedDigest] = useState(preferredDigest);
+  useEffect(() => setSelectedDigest(preferredDigest), [preferredDigest]);
+  const navigationDigest = tagNavigationDigest(
+    tag.is_manifest_list,
+    selectedDigest,
+  );
 
   const isTagCopied = props.copiedKey === `tag-${tag.name}`;
   const isDigestCopied = props.copiedKey === `digest-${tag.name}`;
@@ -238,6 +254,9 @@ function TagsTableRow(props: RowProps) {
               props.org,
               props.repo,
               tag.name,
+              navigationDigest
+                ? new Map([['digest', navigationDigest]])
+                : undefined,
             )}
           >
             {tag.name}
@@ -344,7 +363,12 @@ function TagsTableRow(props: RowProps) {
           onMouseEnter={() => setIsDigestHovered(true)}
           onMouseLeave={() => setIsDigestHovered(false)}
         >
-          {tag.manifest_digest.substring(0, 19)}
+          <ManifestDigestSelector
+            identities={tag.manifest_digests}
+            legacyDigest={tag.manifest_digest}
+            selectedDigest={selectedDigest}
+            onSelect={setSelectedDigest}
+          />
           <span
             className="copy-icon"
             style={{visibility: isDigestHovered ? 'visible' : 'hidden'}}
@@ -361,11 +385,11 @@ function TagsTableRow(props: RowProps) {
                 icon={<CopyIcon />}
                 variant="plain"
                 aria-label="Copy manifest digest to clipboard"
+                isDisabled={!selectedDigest}
                 onClick={() => {
-                  props.copyToClipboard(
-                    tag.manifest_digest,
-                    `digest-${tag.name}`,
-                  );
+                  if (selectedDigest) {
+                    props.copyToClipboard(selectedDigest, `digest-${tag.name}`);
+                  }
                 }}
               />
             </Tooltip>
@@ -401,7 +425,7 @@ function TagsTableRow(props: RowProps) {
             ) : isErrorPullStats ? (
               '-'
             ) : (
-              pullStatistics?.tag_pull_count ?? 0
+              (pullStatistics?.tag_pull_count ?? 0)
             )}
           </Td>
         </Conditional>
@@ -417,7 +441,7 @@ function TagsTableRow(props: RowProps) {
             org={props.org}
             repo={props.repo}
             tag={tag.name}
-            digest={tag.manifest_digest}
+            digest={selectedDigest}
           >
             <DownloadIcon />
           </TablePopover>
@@ -427,7 +451,7 @@ function TagsTableRow(props: RowProps) {
             <TagActions
               org={props.org}
               repo={props.repo}
-              manifest={tag.manifest_digest}
+              manifest={selectedDigest ?? ''}
               tags={[tag.name]}
               expiration={tag.expiration}
               loadTags={props.loadTags}
@@ -464,23 +488,31 @@ function TagsTableRow(props: RowProps) {
                 <Tooltip content="Manifest">
                   <CubeIcon style={{marginRight: '8px'}} />
                 </Tooltip>
-                <Tooltip content="The content-addressable SHA256 hash of this tag">
+                <Tooltip content="Repository-registered digest identities for this tag">
                   <span className="manifest-link">
-                    <span className="id-label">SHA256</span>{' '}
-                    <Link
-                      to={getTagDetailPath(
-                        location.pathname,
-                        props.org,
-                        props.repo,
-                        tag.name,
-                        new Map([['tab', 'layers']]),
-                      )}
-                    >
-                      {tag.manifest_digest.substring(
-                        'sha256:'.length,
-                        'sha256:'.length + 12,
-                      )}
-                    </Link>
+                    {selectedDigest ? (
+                      <Link
+                        to={getTagDetailPath(
+                          location.pathname,
+                          props.org,
+                          props.repo,
+                          tag.name,
+                          new Map(
+                            [
+                              ['tab', 'layers'],
+                              ['digest', navigationDigest],
+                            ].filter(([, value]) => value) as [
+                              string,
+                              string,
+                            ][],
+                          ),
+                        )}
+                      >
+                        <ManifestDigest digest={selectedDigest} />
+                      </Link>
+                    ) : (
+                      'No enabled digest identity'
+                    )}
                   </span>
                 </Tooltip>
               </div>
@@ -488,13 +520,17 @@ function TagsTableRow(props: RowProps) {
                 <Tooltip content="Labels">
                   <TagIcon style={{marginRight: '8px'}} />
                 </Tooltip>
-                <Labels
-                  org={props.org}
-                  repo={props.repo}
-                  digest={tag.manifest_digest}
-                  cache={props.labelCache}
-                  setCache={props.setLabelCache}
-                />
+                {selectedDigest ? (
+                  <Labels
+                    org={props.org}
+                    repo={props.repo}
+                    digest={selectedDigest}
+                    cache={props.labelCache}
+                    setCache={props.setLabelCache}
+                  />
+                ) : (
+                  'N/A'
+                )}
               </div>
               {tag.cosign_signature_tag && (
                 <div className="expanded-row-section">

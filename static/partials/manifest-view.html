@@ -11,7 +11,20 @@
       </span>
       <span class="cor-title-content">
         <i class="fa fa-lg" ng-class="{'fa-file': !manifest.is_manifest_list, 'fa-file-text-o': manifest.is_manifest_list}" style="margin-right: 10px"></i>
-        {{ manifest.digest.substr(7, 12) }}
+        <select ng-if="manifest.manifest_digests.length > 1"
+                ng-model="manifest.selected_manifest_digest"
+                aria-label="Manifest digest identity">
+          <option ng-repeat="identity in manifest.manifest_digests"
+                  ng-disabled="!identity.is_enabled"
+                  value="{{ identity.digest }}">
+            {{ identity.algorithm }}:{{ identity.digest.split(':')[1] }}{{ identity.is_enabled ? '' : ' (disabled)' }}
+          </option>
+        </select>
+        <span ng-if="manifest.selected_manifest_digest">{{ shortDigest(manifest.selected_manifest_digest) }}</span>
+        <span ng-if="manifest.manifest_digests.length && !manifest.selected_manifest_digest">
+          <span ng-repeat="identity in manifest.manifest_digests">{{ identity.digest }} (disabled){{$last ? '' : ', '}}</span>
+        </span>
+        <span ng-if="manifest.manifest_digests !== undefined && !manifest.manifest_digests.length">No registered digest identities</span>
       </span>
     </div>
 

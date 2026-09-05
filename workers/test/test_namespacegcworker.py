@@ -17,8 +17,10 @@ def test_story15_gc_namespace(initialized_db):
     repository = model.repository.get_repository("buynlarge", "orgrepo")
     manifest = Manifest.select().where(Manifest.repository == repository).first()
     assert manifest is not None
-    model.oci.manifest.register_repository_manifest_digest(
-        repository.id, manifest, f"sha512:{manifest.id:0128x}"
+    RepositoryManifestDigest.create(
+        repository=repository,
+        manifest=manifest,
+        digest=f"sha512:{manifest.id:0128x}",
     )
     for link in ManifestBlob.select().where(ManifestBlob.repository == repository):
         model.oci.blob.register_repository_blob_digest(

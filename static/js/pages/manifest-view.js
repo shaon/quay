@@ -30,6 +30,16 @@
 
       $scope.manifestResource = ApiService.getRepoManifestAsResource(params).get(function(manifest) {
         $scope.manifest = manifest;
+        var identities = manifest.manifest_digests === undefined ? [{
+          'digest': manifest.digest,
+          'algorithm': manifest.digest.split(':')[0],
+          'is_enabled': true,
+          'is_preferred': true,
+        }] : manifest.manifest_digests;
+        var enabled = identities.filter(function(identity) { return identity.is_enabled; });
+        var preferred = enabled.filter(function(identity) { return identity.is_preferred; })[0];
+        $scope.manifest.selected_manifest_digest = preferred ? preferred.digest :
+          (enabled.length ? enabled[0].digest : null);
         $scope.reversedLayers = manifest.layers ? manifest.layers.reverse() : null;
       });
     };
@@ -56,6 +66,11 @@
     $scope.loadManifestPackages = function() {
       if (!Features.SECURITY_SCANNER) { return; }
       $scope.manifestPackageCounter++;
+    };
+
+    $scope.shortDigest = function(digest) {
+      if (!digest || digest.indexOf(':') < 0) { return ''; }
+      return digest.substring(digest.indexOf(':') + 1, digest.indexOf(':') + 13);
     };
 
     $scope.manifestsOf = function(manifest) {

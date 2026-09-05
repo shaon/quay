@@ -50,6 +50,33 @@ angular.module('quay').directive('repoPanelTags', function () {
       $scope.repoDelegationsInfo = null;
       $scope.cosignedManifests = {};
 
+      var digestIdentities = function(entity) {
+        if (entity.manifest_digests !== undefined) {
+          return entity.manifest_digests;
+        }
+        if (!entity.manifest_digest) {
+          return [];
+        }
+        return [{
+          'digest': entity.manifest_digest,
+          'algorithm': entity.manifest_digest.split(':')[0],
+          'is_enabled': true,
+          'is_preferred': true,
+        }];
+      };
+
+      var preferredDigest = function(entity) {
+        var enabled = digestIdentities(entity).filter(function(identity) {
+          return identity.is_enabled;
+        });
+        var preferred = enabled.filter(function(identity) {
+          return identity.is_preferred;
+        })[0];
+        return preferred ? preferred.digest : (enabled.length ? enabled[0].digest : null);
+      };
+
+      $scope.digestIdentities = digestIdentities;
+
       var loadRepoSignatures = function() {
         if (!$scope.repository || !$scope.repository.trust_enabled) {
           return;
@@ -111,6 +138,10 @@ angular.module('quay').directive('repoPanelTags', function () {
           var tagData = $scope.repositoryTags[tag];
           var tagInfo = $.extend(tagData, {
             'name': tag,
+            'selected_manifest_digest': preferredDigest(tagData),
+            'manifest_digest_search': digestIdentities(tagData).map(function(identity) {
+              return identity.digest;
+            }).join(' '),
             'last_modified_datetime': TableService.getReversedTimestamp(tagData.last_modified),
             'expiration_date': tagData.expiration ? TableService.getReversedTimestamp(tagData.expiration) : null,
             'cosign_signature_tag': $scope.cosignedManifests.hasOwnProperty(tagData.manifest_digest) ? $scope.cosignedManifests[tagData.manifest_digest].signatureTagName : null,
@@ -122,7 +153,7 @@ angular.module('quay').directive('repoPanelTags', function () {
 
         // Sort the tags by the predicate and the reverse, and map the information.
         var ordered = TableService.buildOrderedItems(allTags, $scope.options,
-            ['name', 'manifest_digest'], ['last_modified_datetime', 'size']).entries;
+            ['name', 'manifest_digest', 'manifest_digest_search'], ['last_modified_datetime', 'size']).entries;
 
         var checked = [];
         var manifestMap = {};
@@ -426,15 +457,17 @@ angular.module('quay').directive('repoPanelTags', function () {
         if ($scope.inReadOnlyMode) {
           return;
         }
-        $scope.tagActionHandler.askAddTag(tag.manifest_digest);
+        if (tag.selected_manifest_digest) {
+          $scope.tagActionHandler.askAddTag(tag.selected_manifest_digest);
+        }
       };
 
       $scope.showLabelEditor = function(tag) {
         if ($scope.inReadOnlyMode) {
           return;
         }
-        if (!tag.manifest_digest) { return; }
-        $scope.tagActionHandler.showLabelEditor(tag.manifest_digest);
+        if (!tag.selected_manifest_digest) { return; }
+        $scope.tagActionHandler.showLabelEditor(tag.selected_manifest_digest);
       };
 
       $scope.orderBy = function(predicate) {
@@ -529,7 +562,7 @@ angular.module('quay').directive('repoPanelTags', function () {
 
         var params = {
           'repository': $scope.repository.namespace + '/' + $scope.repository.name,
-          'manifestref': tag.manifest_digest
+          'manifestref': tag.selected_manifest_digest || tag.manifest_digest
         };
 
         ApiService.getRepoManifest(null, params).then(function(resp) {

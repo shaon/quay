@@ -14,7 +14,6 @@ from data.database import (
     IndexStatus,
     Manifest,
     ManifestSecurityStatus,
-    RepositoryManifestDigest,
     db_transaction,
     get_epoch_timestamp_ms,
 )
@@ -65,6 +64,7 @@ DEFAULT_SECURITY_SCANNER_V4_REINDEX_THRESHOLD = 86400  # 1 day
 DEFAULT_MAX_SCAN_RETRIES = 5
 STALE_IN_PROGRESS_HOURS = 6  # Hours before an IN_PROGRESS manifest is considered stale
 TAG_LIMIT = 100
+LEGACY_SCANNER_DIGEST_METADATA_KEY = "legacy_scanner_digest"
 
 IndexReportState = namedtuple("IndexReportState", ["Index_Finished", "Index_Error"])(  # type: ignore[call-arg]
     "IndexFinished", "IndexError"
@@ -72,15 +72,8 @@ IndexReportState = namedtuple("IndexReportState", ["Index_Finished", "Index_Erro
 
 
 def manifest_for_security_scanner(manifest_row):
-    """Wraps a manifest with a stable repository-visible scanner identity."""
-    return ManifestDataType.for_manifest(
-        manifest_row,
-        None,
-        digest=oci.manifest.get_repository_manifest_scanner_digest(
-            manifest_row.repository_id,
-            manifest_row,
-        ),
-    )
+    """Wrap a manifest with the canonical SHA-256 identity used as Clair's report key."""
+    return ManifestDataType.for_manifest(manifest_row, None, digest=manifest_row.digest)
 
 
 class ScanToken(namedtuple("NextScanToken", ["min_id"])):
@@ -252,27 +245,60 @@ class V4SecurityScanner(SecurityScannerInterface):
                 ScanLookupStatus.MANIFEST_LAYER_TOO_LARGE
             )
 
-        if status.index_status in (IndexStatus.PENDING, IndexStatus.IN_PROGRESS):
+        metadata = status.metadata_json or {}
+        legacy_scanner_digest = metadata.get(LEGACY_SCANNER_DIGEST_METADATA_KEY)
+        if (
+            status.index_status in (IndexStatus.PENDING, IndexStatus.IN_PROGRESS)
+            and legacy_scanner_digest is None
+        ):
             return SecurityInformationLookupResult.with_status(ScanLookupStatus.NOT_YET_INDEXED)
 
-        assert status.index_status == IndexStatus.COMPLETED
-
-        scanner_digest = oci.manifest.get_repository_manifest_scanner_digest(
-            manifest_or_legacy_image.repository._db_id,
-            manifest_or_legacy_image._db_id,
+        assert status.index_status in (
+            IndexStatus.PENDING,
+            IndexStatus.IN_PROGRESS,
+            IndexStatus.COMPLETED,
         )
 
-        def security_report_loader():
-            return self._secscan_api.vulnerability_report(scanner_digest)
+        manifest_row = status.manifest
+        scanner_digest = manifest_row.digest
 
-        try:
+        def load_report(digest):
+            def security_report_loader():
+                return self._secscan_api.vulnerability_report(digest)
+
             if model_cache:
                 security_report_key = cache_key.for_security_report(
-                    scanner_digest, model_cache.cache_config
+                    digest, model_cache.cache_config
                 )
-                report = model_cache.retrieve(security_report_key, security_report_loader)
-            else:
-                report = security_report_loader()
+                return model_cache.retrieve(security_report_key, security_report_loader)
+            return security_report_loader()
+
+        try:
+            report = (
+                load_report(scanner_digest)
+                if status.index_status == IndexStatus.COMPLETED
+                else None
+            )
+            if report is None and status.index_status == IndexStatus.COMPLETED:
+                legacy_scanner_digest = oci.manifest.get_legacy_repository_manifest_scanner_digest(
+                    status.repository_id,
+                    manifest_row,
+                )
+                if legacy_scanner_digest == scanner_digest:
+                    legacy_scanner_digest = None
+                else:
+                    transition_metadata = dict(metadata)
+                    transition_metadata[LEGACY_SCANNER_DIGEST_METADATA_KEY] = legacy_scanner_digest
+                    ManifestSecurityStatus.update(
+                        index_status=IndexStatus.PENDING,
+                        metadata_json=transition_metadata,
+                    ).where(
+                        ManifestSecurityStatus.id == status.id,
+                        ManifestSecurityStatus.index_status == IndexStatus.COMPLETED,
+                    ).execute()
+
+            if report is None and legacy_scanner_digest is not None:
+                report = load_report(legacy_scanner_digest)
         except APIRequestFailure as arf:
             return SecurityInformationLookupResult.for_request_error(str(arf))
 
@@ -282,7 +308,7 @@ class V4SecurityScanner(SecurityScannerInterface):
         # TODO(alecmerdler): Provide a way to indicate the current scan is outdated (`report.state != status.indexer_hash`)
 
         return SecurityInformationLookupResult.for_data(
-            SecurityInformation(Layer(report["manifest_hash"], "", "", 4, features_for(report)))
+            SecurityInformation(Layer(scanner_digest, "", "", 4, features_for(report)))
         )
 
     def _get_manifest_iterator(
@@ -929,11 +955,7 @@ class V4SecurityScanner(SecurityScannerInterface):
             )
             if canonical_exists:
                 return True
-            return (
-                RepositoryManifestDigest.select(can_use_read_replica=True)
-                .where(RepositoryManifestDigest.digest == manifest_digest)
-                .exists()
-            )
+            return oci.manifest.legacy_repository_manifest_scanner_digest_exists(manifest_digest)
 
         with db_transaction():
             if not manifest_digest_exists():

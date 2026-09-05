@@ -1,4 +1,4 @@
-import {Tag} from 'src/resources/TagResource';
+import {ManifestDigestIdentity, Tag} from 'src/resources/TagResource';
 
 export enum TagAction {
   Create = 'create',
@@ -13,5 +13,11 @@ export interface TagEntry {
   time: number; // unix timestamp, milliseconds
   action: TagAction;
   digest: string;
+  digestIdentities?: ManifestDigestIdentity[];
+  canRestoreDigest?: boolean;
+  cleanupDigest?: string;
   oldDigest: string;
+  oldDigestIdentities?: ManifestDigestIdentity[];
+  canRestoreOldDigest?: boolean;
+  cleanupOldDigest?: string;
 }

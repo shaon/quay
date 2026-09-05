@@ -20,6 +20,8 @@ from data.database import (
     Manifest,
     ManifestBlob,
     ManifestChild,
+    QuotaNamespaceSize,
+    QuotaRepositorySize,
     RepositoryBlobDigest,
     RepositoryManifestDigest,
     Tag,
@@ -300,7 +302,7 @@ def _repository_publication_state(repository_name):
             .order_by(Manifest.id)
             .tuples()
         ),
-        "registrations": list(
+        "manifest_registrations": list(
             RepositoryManifestDigest.select(
                 RepositoryManifestDigest.id,
                 RepositoryManifestDigest.manifest,
@@ -310,10 +312,40 @@ def _repository_publication_state(repository_name):
             .order_by(RepositoryManifestDigest.id)
             .tuples()
         ),
+        "blob_registrations": list(
+            RepositoryBlobDigest.select(
+                RepositoryBlobDigest.id,
+                RepositoryBlobDigest.image_storage,
+                RepositoryBlobDigest.digest,
+            )
+            .where(RepositoryBlobDigest.repository == repository)
+            .order_by(RepositoryBlobDigest.id)
+            .tuples()
+        ),
         "tags": list(
             Tag.select(Tag.id, Tag.name, Tag.manifest, Tag.lifetime_end_ms)
             .where(Tag.repository == repository)
             .order_by(Tag.id)
+            .tuples()
+        ),
+        "manifest_blobs": list(
+            ManifestBlob.select(
+                ManifestBlob.id,
+                ManifestBlob.manifest,
+                ManifestBlob.blob,
+            )
+            .where(ManifestBlob.repository == repository)
+            .order_by(ManifestBlob.id)
+            .tuples()
+        ),
+        "manifest_children": list(
+            ManifestChild.select(
+                ManifestChild.id,
+                ManifestChild.manifest,
+                ManifestChild.child_manifest,
+            )
+            .where(ManifestChild.repository == repository)
+            .order_by(ManifestChild.id)
             .tuples()
         ),
         "canonical_blobs": list(
@@ -325,6 +357,14 @@ def _repository_publication_state(repository_name):
             )
             .order_by(ImageStorage.id)
             .tuples()
+        ),
+        "repository_quota": list(
+            QuotaRepositorySize.select().where(QuotaRepositorySize.repository == repository).dicts()
+        ),
+        "namespace_quota": list(
+            QuotaNamespaceSize.select()
+            .where(QuotaNamespaceSize.namespace_user == repository.namespace_user)
+            .dicts()
         ),
     }
 
@@ -389,7 +429,7 @@ def test_e2e_query_count_manifest_norewrite(client, app):
                 raw_body=manifest.internal_manifest_bytes.as_encoded_str(),
             )
 
-        assert counter.count <= 27
+        assert counter.count <= 28
 
 
 INVALID_DOCKER_V2_MANIFEST = json.dumps(
@@ -1014,6 +1054,657 @@ def test_schema1_digest_push_remains_sha256_only(algorithm, client, app):
             RepositoryManifestDigest.digest == alternative_digest,
         )
         .exists()
+    )
+
+
+@pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
+@pytest.mark.parametrize("signed", [False, True])
+@pytest.mark.parametrize("algorithm_enabled", [False, True])
+def test_story19_schema1_alternative_route_is_always_unsupported_without_mutation(
+    algorithm, signed, algorithm_enabled, client, app
+):
+    repository = "devtable/simple"
+    relationship = (
+        ManifestBlob.select()
+        .where(ManifestBlob.repository == model.repository.get_repository("devtable", "simple"))
+        .get()
+    )
+    schema1 = (
+        DockerSchema1ManifestBuilder("devtable", "simple", "story19-route")
+        .add_layer(relationship.blob.content_checksum, json.dumps({"id": "b" * 64}))
+        .build(docker_v2_signing_key if signed else None)
+    )
+    body = schema1.bytes.as_encoded_str()
+    alternative_digest = f"{algorithm}:" + hashlib.new(algorithm, body).hexdigest()
+    allowed_algorithms = ["sha256", algorithm] if algorithm_enabled else ["sha256"]
+    before = _repository_publication_state(repository)
+    test_cache = InMemoryDataModelCache(TEST_CACHE_CONFIG)
+
+    with (
+        patch.dict(realapp.config, {"ALLOWED_HASH_ALGORITHMS": allowed_algorithms}),
+        patch("endpoints.v2.manifest.model_cache", test_cache),
+        patch("endpoints.v2.manifest.spawn_notification") as spawn_notification,
+    ):
+        response = conduct_call(
+            client,
+            "v2.write_manifest_by_digest",
+            url_for,
+            "PUT",
+            {"repository": repository, "manifest_ref": alternative_digest},
+            expected_code=400,
+            headers={
+                **_manifest_auth_headers(repository),
+                "Content-Type": schema1.media_type,
+            },
+            raw_body=body,
+        )
+
+    error = response.get_json()["errors"][0]
+    assert error["code"] == "UNSUPPORTED"
+    assert error["detail"] == {"algorithm": algorithm, "reason": "unsupported"}
+    assert _repository_publication_state(repository) == before
+    assert not test_cache.cache
+    spawn_notification.assert_not_called()
+
+
+@pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
+@pytest.mark.parametrize("signed", [False, True])
+def test_story19_schema1_alternative_blob_sum_is_unsupported_before_mutation(
+    algorithm, signed, client, app
+):
+    repository = "devtable/simple"
+    repository_row = model.repository.get_repository("devtable", "simple")
+    relationship = ManifestBlob.select().where(ManifestBlob.repository == repository_row).get()
+    alternative_blob_digest = f"{algorithm}:" + "c" * hashlib.new(algorithm).digest_size * 2
+    model.oci.blob.register_repository_blob_digest(
+        repository_row,
+        relationship.blob,
+        alternative_blob_digest,
+    )
+    schema1 = (
+        DockerSchema1ManifestBuilder("devtable", "simple", "story19-blob-sum")
+        .add_layer(alternative_blob_digest, json.dumps({"id": "d" * 64}))
+        .build(docker_v2_signing_key if signed else None)
+    )
+    before = _repository_publication_state(repository)
+    test_cache = InMemoryDataModelCache(TEST_CACHE_CONFIG)
+
+    with (
+        patch.dict(
+            realapp.config,
+            {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384", "sha512"]},
+        ),
+        patch("endpoints.v2.manifest.model_cache", test_cache),
+        patch("endpoints.v2.manifest.spawn_notification") as spawn_notification,
+    ):
+        response = conduct_call(
+            client,
+            "v2.write_manifest_by_digest",
+            url_for,
+            "PUT",
+            {"repository": repository, "manifest_ref": schema1.digest},
+            expected_code=400,
+            headers={
+                **_manifest_auth_headers(repository),
+                "Content-Type": schema1.media_type,
+            },
+            raw_body=schema1.bytes.as_encoded_str(),
+        )
+
+    error = response.get_json()["errors"][0]
+    assert error["code"] == "UNSUPPORTED"
+    assert error["detail"] == {"algorithm": algorithm, "reason": "unsupported"}
+    assert _repository_publication_state(repository) == before
+    assert not test_cache.cache
+    spawn_notification.assert_not_called()
+
+
+def _publish_story19_schema1(client, tag_name):
+    repository = "devtable/simple"
+    repository_row = model.repository.get_repository("devtable", "simple")
+    relationship = ManifestBlob.select().where(ManifestBlob.repository == repository_row).get()
+    schema1 = (
+        DockerSchema1ManifestBuilder("devtable", "simple", tag_name)
+        .add_layer(relationship.blob.content_checksum, json.dumps({"id": "e" * 64}))
+        .build(docker_v2_signing_key)
+    )
+    conduct_call(
+        client,
+        "v2.write_manifest_by_digest",
+        url_for,
+        "PUT",
+        {"repository": repository, "manifest_ref": schema1.digest},
+        expected_code=201,
+        headers={
+            **_manifest_auth_headers(repository),
+            "Content-Type": schema1.media_type,
+        },
+        raw_body=schema1.bytes.as_encoded_str(),
+    )
+    manifest = Manifest.get(repository=repository_row, digest=schema1.digest)
+    return repository, repository_row, manifest, schema1
+
+
+@pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
+def test_story19_schema1_stale_alias_cannot_bypass_reads_tags_or_hard_disable(
+    algorithm, client, app
+):
+    repository, repository_row, manifest, schema1 = _publish_story19_schema1(
+        client, f"story19-read-{algorithm}"
+    )
+    RepositoryManifestDigest.delete().where(
+        RepositoryManifestDigest.repository == repository_row,
+        RepositoryManifestDigest.manifest == manifest,
+    ).execute()
+    alternative_digest = (
+        f"{algorithm}:" + hashlib.new(algorithm, schema1.bytes.as_encoded_str()).hexdigest()
+    )
+    RepositoryManifestDigest.create(
+        repository=repository_row,
+        manifest=manifest,
+        digest=alternative_digest,
+    )
+    cache = InMemoryDataModelCache(TEST_CACHE_CONFIG)
+    pull_headers = _manifest_auth_headers(repository, actions=("pull",))
+
+    with (
+        patch.dict(realapp.config, {"ALLOWED_HASH_ALGORITHMS": ["sha256", algorithm]}),
+        patch("endpoints.v2.manifest.model_cache", cache),
+    ):
+        repository_ref = registry_model.lookup_repository("devtable", "simple")
+        registry_model.lookup_cached_manifest_by_digest(
+            cache,
+            repository_ref,
+            alternative_digest,
+            allow_hidden=True,
+            raise_on_error=True,
+        )
+        for _ in range(2):
+            for method in ("GET", "HEAD"):
+                alias_response = conduct_call(
+                    client,
+                    "v2.fetch_manifest_by_digest",
+                    url_for,
+                    method,
+                    {"repository": repository, "manifest_ref": alternative_digest},
+                    expected_code=400,
+                    headers=pull_headers.copy(),
+                )
+                if method == "GET":
+                    assert alias_response.get_json()["errors"][0]["detail"] == {
+                        "algorithm": algorithm,
+                        "reason": "unsupported",
+                    }
+                else:
+                    assert alias_response.data == b""
+                canonical_response = conduct_call(
+                    client,
+                    "v2.fetch_manifest_by_digest",
+                    url_for,
+                    method,
+                    {"repository": repository, "manifest_ref": schema1.digest},
+                    expected_code=200,
+                    headers=pull_headers.copy(),
+                )
+                assert canonical_response.headers["Docker-Content-Digest"] == schema1.digest
+                assert canonical_response.data == (
+                    schema1.bytes.as_encoded_str() if method == "GET" else b""
+                )
+
+        tag_response = conduct_call(
+            client,
+            "v2.fetch_manifest_by_tagname",
+            url_for,
+            "GET",
+            {"repository": repository, "manifest_ref": schema1.tag},
+            expected_code=200,
+            headers=pull_headers.copy(),
+        )
+        assert tag_response.headers["Docker-Content-Digest"] == schema1.digest
+
+        conduct_call(
+            client,
+            "v2.fetch_manifest_by_digest",
+            url_for,
+            "GET",
+            {"repository": "devtable/complex", "manifest_ref": alternative_digest},
+            expected_code=404,
+            headers=_manifest_auth_headers("devtable/complex", actions=("pull",)),
+        )
+        conduct_call(
+            client,
+            "v2.fetch_manifest_by_digest",
+            url_for,
+            "GET",
+            {"repository": repository, "manifest_ref": alternative_digest},
+            expected_code=401,
+        )
+
+        with patch.dict(realapp.config, {"ALLOWED_HASH_ALGORITHMS": ["sha256"]}):
+            disabled_alias = conduct_call(
+                client,
+                "v2.fetch_manifest_by_digest",
+                url_for,
+                "GET",
+                {"repository": repository, "manifest_ref": alternative_digest},
+                expected_code=400,
+                headers=pull_headers.copy(),
+            )
+            assert disabled_alias.get_json()["errors"][0]["detail"] == {
+                "algorithm": algorithm,
+                "reason": "unsupported",
+            }
+        with patch.dict(realapp.config, {"ALLOWED_HASH_ALGORITHMS": [algorithm]}):
+            for manifest_ref in (schema1.digest, alternative_digest):
+                response = conduct_call(
+                    client,
+                    "v2.fetch_manifest_by_digest",
+                    url_for,
+                    "GET",
+                    {"repository": repository, "manifest_ref": manifest_ref},
+                    expected_code=400,
+                    headers=pull_headers.copy(),
+                )
+                expected_algorithm = "sha256" if manifest_ref == schema1.digest else algorithm
+                expected_reason = "disabled" if manifest_ref == schema1.digest else "unsupported"
+                assert response.get_json()["errors"][0]["detail"] == {
+                    "algorithm": expected_algorithm,
+                    "reason": expected_reason,
+                }
+            tag_disabled = conduct_call(
+                client,
+                "v2.fetch_manifest_by_tagname",
+                url_for,
+                "GET",
+                {"repository": repository, "manifest_ref": schema1.tag},
+                expected_code=400,
+                headers=pull_headers.copy(),
+            )
+            assert tag_disabled.get_json()["errors"][0]["detail"] == {
+                "algorithm": "sha256",
+                "reason": "disabled",
+            }
+
+        recovered = conduct_call(
+            client,
+            "v2.fetch_manifest_by_tagname",
+            url_for,
+            "GET",
+            {"repository": repository, "manifest_ref": schema1.tag},
+            expected_code=200,
+            headers=pull_headers.copy(),
+        )
+        assert recovered.headers["Docker-Content-Digest"] == schema1.digest
+
+    assert RepositoryManifestDigest.get(
+        repository=repository_row,
+        manifest=manifest,
+        digest=schema1.digest,
+    )
+    assert RepositoryManifestDigest.get(
+        repository=repository_row,
+        manifest=manifest,
+        digest=alternative_digest,
+    )
+
+
+@pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
+def test_story19_schema1_alias_delete_is_unsupported_but_canonical_delete_ignores_allowlist(
+    algorithm, client, app
+):
+    repository, repository_row, manifest, schema1 = _publish_story19_schema1(
+        client, f"story19-delete-{algorithm}"
+    )
+    alternative_digest = f"{algorithm}:" + "f" * hashlib.new(algorithm).digest_size * 2
+    RepositoryManifestDigest.create(
+        repository=repository_row,
+        manifest=manifest,
+        digest=alternative_digest,
+    )
+    before = _repository_publication_state(repository)
+
+    with patch.dict(realapp.config, {"ALLOWED_HASH_ALGORITHMS": [algorithm]}):
+        rejected = conduct_call(
+            client,
+            "v2.delete_manifest_by_digest",
+            url_for,
+            "DELETE",
+            {"repository": repository, "manifest_ref": alternative_digest},
+            expected_code=400,
+            headers=_manifest_auth_headers(repository),
+        )
+        assert rejected.get_json()["errors"][0]["detail"] == {
+            "algorithm": algorithm,
+            "reason": "unsupported",
+        }
+        assert _repository_publication_state(repository) == before
+
+        conduct_call(
+            client,
+            "v2.delete_manifest_by_digest",
+            url_for,
+            "DELETE",
+            {"repository": repository, "manifest_ref": schema1.digest},
+            expected_code=202,
+            headers=_manifest_auth_headers(repository),
+        )
+
+    assert not filter_to_alive_tags(
+        Tag.select().where(Tag.repository == repository_row, Tag.manifest == manifest),
+        allow_hidden=True,
+    ).exists()
+    assert RepositoryManifestDigest.get(
+        repository=repository_row,
+        manifest=manifest,
+        digest=alternative_digest,
+    )
+
+
+def _as_oci_manifest(manifest_info, algorithm="sha256"):
+    manifest_dict = json.loads(manifest_info["bytes"])
+    manifest_dict["mediaType"] = OCI_IMAGE_MANIFEST_CONTENT_TYPE
+    manifest_dict["config"]["mediaType"] = OCI_IMAGE_CONFIG_CONTENT_TYPE
+    manifest_dict["layers"][0]["mediaType"] = "application/vnd.oci.image.layer.v1.tar+gzip"
+    manifest_bytes = json.dumps(manifest_dict, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    manifest_info.update(
+        bytes=manifest_bytes,
+        canonical_digest="sha256:" + hashlib.sha256(manifest_bytes).hexdigest(),
+        external_digest=f"{algorithm}:" + hashlib.new(algorithm, manifest_bytes).hexdigest(),
+        media_type=OCI_IMAGE_MANIFEST_CONTENT_TYPE,
+    )
+    return manifest_info
+
+
+@pytest.mark.parametrize(
+    "media_type",
+    [DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE, OCI_IMAGE_MANIFEST_CONTENT_TYPE],
+)
+@pytest.mark.parametrize("layer_algorithm", ["sha384", "sha512"])
+def test_story19_single_manifest_conversion_rejects_alternative_blob_sum_without_mutation(
+    media_type, layer_algorithm, client, app
+):
+    repository = "devtable/simple"
+    tag_name = f"story19-convert-{media_type.split('.')[-2]}-{layer_algorithm}"
+    manifest_info = _sha512_single_manifest(
+        repository,
+        f"story19 {media_type} {layer_algorithm}".encode(),
+        algorithm="sha256",
+        config_algorithm="sha256",
+        layer_algorithm=layer_algorithm,
+    )
+    if media_type == OCI_IMAGE_MANIFEST_CONTENT_TYPE:
+        _as_oci_manifest(manifest_info)
+
+    with patch.dict(
+        realapp.config,
+        {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384", "sha512"]},
+    ):
+        _put_manifest(
+            client,
+            repository,
+            manifest_info["external_digest"],
+            manifest_info,
+            tag=tag_name,
+        )
+        before = _repository_publication_state(repository)
+        response = conduct_call(
+            client,
+            "v2.fetch_manifest_by_tagname",
+            url_for,
+            "GET",
+            {"repository": repository, "manifest_ref": tag_name},
+            expected_code=400,
+            headers={
+                **_manifest_auth_headers(repository, actions=("pull",)),
+                "Accept": DOCKER_SCHEMA1_MANIFEST_CONTENT_TYPE,
+            },
+        )
+
+    assert response.get_json()["errors"][0]["detail"] == {
+        "algorithm": layer_algorithm,
+        "reason": "unsupported",
+    }
+    assert _repository_publication_state(repository) == before
+
+
+@pytest.mark.parametrize(
+    "parent_media_type",
+    [
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+        OCI_IMAGE_INDEX_CONTENT_TYPE,
+    ],
+)
+def test_story19_index_conversion_rejects_alternative_child_layer(parent_media_type, client, app):
+    repository = "devtable/simple"
+    child = _sha512_single_manifest(
+        repository,
+        b"story19 alternative index child",
+        algorithm="sha256",
+        config_algorithm="sha256",
+        layer_algorithm="sha512",
+    )
+    child.update(
+        media_type=DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE,
+        descriptor_digest=child["external_digest"],
+        architecture="amd64",
+    )
+    parent = _manifest_index(children=[child], media_type=parent_media_type, algorithm="sha256")
+    tag_name = f"story19-index-{parent_media_type.split('.')[-2]}"
+
+    with patch.dict(
+        realapp.config,
+        {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384", "sha512"]},
+    ):
+        _put_manifest(client, repository, child["external_digest"], child)
+        _put_manifest(client, repository, parent["external_digest"], parent, tag=tag_name)
+        before = _repository_publication_state(repository)
+        response = conduct_call(
+            client,
+            "v2.fetch_manifest_by_tagname",
+            url_for,
+            "GET",
+            {"repository": repository, "manifest_ref": tag_name},
+            expected_code=400,
+            headers={
+                **_manifest_auth_headers(repository, actions=("pull",)),
+                "Accept": DOCKER_SCHEMA1_MANIFEST_CONTENT_TYPE,
+            },
+        )
+
+    assert response.get_json()["errors"][0]["detail"] == {
+        "algorithm": "sha512",
+        "reason": "unsupported",
+    }
+    assert _repository_publication_state(repository) == before
+
+
+@pytest.mark.parametrize(
+    "source_media_type",
+    [DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE, OCI_IMAGE_MANIFEST_CONTENT_TYPE],
+)
+def test_story19_all_sha256_conversion_preserves_existing_representation(
+    source_media_type, client, app
+):
+    repository = "devtable/simple"
+    tag_name = f"story19-sha256-convert-{source_media_type.split('.')[-2]}"
+    manifest_info = _sha512_single_manifest(
+        repository,
+        f"story19 all sha256 {source_media_type}".encode(),
+        algorithm="sha256",
+    )
+    if source_media_type == OCI_IMAGE_MANIFEST_CONTENT_TYPE:
+        _as_oci_manifest(manifest_info)
+
+    with patch.dict(realapp.config, {"ALLOWED_HASH_ALGORITHMS": ["sha256"]}):
+        _put_manifest(
+            client,
+            repository,
+            manifest_info["external_digest"],
+            manifest_info,
+            tag=tag_name,
+        )
+        repository_ref = registry_model.lookup_repository("devtable", "simple")
+        tag = registry_model.get_repo_tag(repository_ref, tag_name)
+        source = registry_model.get_manifest_for_tag(tag)
+        expected = registry_model.convert_manifest(
+            source,
+            "devtable",
+            "simple",
+            tag_name,
+            {DOCKER_SCHEMA1_MANIFEST_CONTENT_TYPE},
+            storage,
+        )
+        response = conduct_call(
+            client,
+            "v2.fetch_manifest_by_tagname",
+            url_for,
+            "GET",
+            {"repository": repository, "manifest_ref": tag_name},
+            expected_code=200,
+            headers={
+                **_manifest_auth_headers(repository, actions=("pull",)),
+                "Accept": DOCKER_SCHEMA1_MANIFEST_CONTENT_TYPE,
+            },
+        )
+
+    assert response.data == expected.bytes.as_encoded_str()
+    assert response.headers["Content-Type"] == expected.media_type
+    assert response.headers["Docker-Content-Digest"] == expected.digest
+    assert all(str(layer.digest).startswith("sha256:") for layer in expected.layers)
+
+
+@pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
+def test_story19_manifest_list_rejects_alternative_schema1_child_descriptor(algorithm, client, app):
+    repository, repository_row, child, schema1 = _publish_story19_schema1(
+        client, f"story19-list-child-{algorithm}"
+    )
+    alternative_digest = (
+        f"{algorithm}:" + hashlib.new(algorithm, schema1.bytes.as_encoded_str()).hexdigest()
+    )
+    RepositoryManifestDigest.create(
+        repository=repository_row,
+        manifest=child,
+        digest=alternative_digest,
+    )
+    parent_bytes = json.dumps(
+        {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
+            "manifests": [
+                {
+                    "mediaType": DOCKER_SCHEMA1_MANIFEST_CONTENT_TYPE,
+                    "size": len(schema1.bytes.as_encoded_str()),
+                    "digest": alternative_digest,
+                    "platform": {"architecture": "amd64", "os": "linux"},
+                }
+            ],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    parent = {
+        "bytes": parent_bytes,
+        "canonical_digest": "sha256:" + hashlib.sha256(parent_bytes).hexdigest(),
+        "external_digest": "sha256:" + hashlib.sha256(parent_bytes).hexdigest(),
+        "media_type": "application/vnd.docker.distribution.manifest.list.v2+json",
+    }
+    before = _repository_publication_state(repository)
+
+    with patch.dict(
+        realapp.config,
+        {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384", "sha512"]},
+    ):
+        response = _put_manifest(
+            client,
+            repository,
+            parent["external_digest"],
+            parent,
+            expected_code=400,
+            tag=f"story19-list-{algorithm}",
+        )
+
+    assert response.get_json()["errors"][0]["detail"] == {
+        "algorithm": algorithm,
+        "reason": "unsupported",
+    }
+    assert _repository_publication_state(repository) == before
+
+
+@pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
+def test_story19_schema1_retarget_resigns_without_inheriting_alternative_alias(
+    algorithm, client, app
+):
+    repository, repository_row, source_row, schema1 = _publish_story19_schema1(
+        client, f"story19-retarget-source-{algorithm}"
+    )
+    alternative_digest = (
+        f"{algorithm}:" + hashlib.new(algorithm, schema1.bytes.as_encoded_str()).hexdigest()
+    )
+    with pytest.raises(model.ManifestDigestConflictException):
+        model.oci.manifest.register_repository_manifest_digest(
+            repository_row.id, source_row, alternative_digest
+        )
+    RepositoryManifestDigest.create(
+        repository=repository_row,
+        manifest=source_row,
+        digest=alternative_digest,
+    )
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+    source_tag = registry_model.get_repo_tag(repository_ref, schema1.tag)
+    source = registry_model.get_manifest_for_tag(source_tag)
+    new_tag_name = f"story19-retargeted-{algorithm}"
+
+    rewritten_tag = registry_model.retarget_tag(
+        repository_ref,
+        new_tag_name,
+        source,
+        storage,
+        docker_v2_signing_key,
+    )
+    rewritten = rewritten_tag.manifest
+    parsed = rewritten.get_parsed_manifest()
+
+    assert rewritten._db_id != source._db_id
+    assert parsed.is_signed
+    assert parsed.tag == new_tag_name
+    assert parsed.namespace == "devtable"
+    assert parsed.repo_name == "simple"
+    assert rewritten.digest.startswith("sha256:")
+    assert (
+        not RepositoryManifestDigest.select()
+        .where(
+            RepositoryManifestDigest.repository == repository_row,
+            RepositoryManifestDigest.manifest == rewritten._db_id,
+            RepositoryManifestDigest.digest == alternative_digest,
+        )
+        .exists()
+    )
+
+    with patch.dict(
+        realapp.config,
+        {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha384", "sha512"]},
+    ):
+        response = conduct_call(
+            client,
+            "v2.fetch_manifest_by_tagname",
+            url_for,
+            "GET",
+            {"repository": repository, "manifest_ref": new_tag_name},
+            expected_code=200,
+            headers=_manifest_auth_headers(repository, actions=("pull",)),
+        )
+
+    assert response.data == rewritten.internal_manifest_bytes.as_encoded_str()
+    assert response.headers["Docker-Content-Digest"] == rewritten.digest
+    assert model.oci.manifest.get_repository_manifest_digests(
+        repository_row.id, Manifest.get(id=rewritten._db_id)
+    ) == [rewritten.digest]
+    assert RepositoryManifestDigest.get(
+        repository=repository_row,
+        manifest=source_row,
+        digest=alternative_digest,
     )
 
 

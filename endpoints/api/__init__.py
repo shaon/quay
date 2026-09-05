@@ -795,6 +795,34 @@ def log_action(kind, user_or_orgname, metadata=None, repo=None, repo_name=None, 
     )
 
 
+MANIFEST_DIGESTS_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "required": ["digest", "algorithm", "is_enabled", "is_preferred"],
+        "properties": {
+            "digest": {"type": "string"},
+            "algorithm": {"type": "string"},
+            "is_enabled": {"type": "boolean"},
+            "is_preferred": {"type": "boolean"},
+        },
+    },
+}
+
+
+def format_manifest_digest_infos(infos):
+    """Serializes repository-registered manifest digest identities for API v1."""
+    return [
+        {
+            "digest": info.digest,
+            "algorithm": info.digest.partition(":")[0],
+            "is_enabled": info.is_enabled,
+            "is_preferred": info.is_preferred,
+        }
+        for info in infos
+    ]
+
+
 def define_json_response(schema_name):
     def wrapper(func):
         @add_method_metadata("response_schema", schema_name)

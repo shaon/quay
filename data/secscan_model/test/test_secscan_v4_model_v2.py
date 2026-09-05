@@ -8,10 +8,19 @@ from peewee import fn
 import features
 from app import app as application
 from app import instance_keys, storage
-from data.database import IndexerVersion, IndexStatus, Manifest, ManifestSecurityStatus
+from data import model
+from data.database import (
+    IndexerVersion,
+    IndexStatus,
+    Manifest,
+    ManifestSecurityStatus,
+    RepositoryManifestDigest,
+)
 from data.registry_model import registry_model
-from data.secscan_model.secscan_v4_model import IndexReportState
+from data.secscan_model.datatypes import ScanLookupStatus
+from data.secscan_model.secscan_v4_model import IndexReportState, V4SecurityScanner
 from data.secscan_model.secscan_v4_model_v2 import V4SecurityScannerV2
+from initdb import create_schema2_or_oci_manifest_for_testing
 from test.fixtures import *
 from util.secscan.v4.api import Non200ResponseException
 
@@ -789,3 +798,90 @@ class TestPerformIndexingCycle:
 
         scanner._secscan_api.vulnerability_report.return_value = None
         scanner._send_vulnerability_notifications(manifest, candidate)
+
+
+def test_v2_worker_completes_legacy_report_transition_with_canonical_identity(
+    initialized_db, scanner
+):
+    repository = model.repository.create_repository("devtable", "story22-v2-transition", None)
+    tags = {}
+    create_schema2_or_oci_manifest_for_testing(
+        repository,
+        (1, [], ["story22-v2-transition"]),
+        tags,
+    )
+    repository_ref = registry_model.lookup_repository("devtable", "story22-v2-transition")
+    manifest = tags["story22-v2-transition"]
+    manifest_row = Manifest.get_by_id(manifest.id)
+    legacy_digest = "sha512:" + "b" * 128
+    RepositoryManifestDigest.delete().where(
+        RepositoryManifestDigest.repository == repository,
+        RepositoryManifestDigest.manifest == manifest_row,
+    ).execute()
+    model.oci.manifest.register_repository_manifest_digest(
+        repository.id,
+        manifest_row,
+        legacy_digest,
+    )
+    alias_manifest = registry_model.lookup_manifest_by_digest(repository_ref, legacy_digest)
+
+    ManifestSecurityStatus.delete().execute()
+    for candidate in Manifest.select():
+        ManifestSecurityStatus.create(
+            manifest=candidate,
+            repository=candidate.repository,
+            error_json={},
+            index_status=IndexStatus.COMPLETED,
+            indexer_hash="abc",
+            indexer_version=IndexerVersion.V4,
+            last_indexed=datetime.utcnow(),
+            metadata_json={},
+        )
+
+    legacy_report = {
+        "manifest_hash": legacy_digest,
+        "state": "IndexFinished",
+        "packages": {},
+        "distributions": {},
+        "repository": {},
+        "environments": {},
+        "package_vulnerabilities": {},
+        "success": True,
+        "err": "",
+    }
+    lookup_scanner = V4SecurityScanner(application, instance_keys, storage)
+    lookup_scanner._secscan_api = mock.Mock()
+    lookup_scanner._secscan_api.vulnerability_report.side_effect = lambda digest: (
+        legacy_report if digest == legacy_digest else None
+    )
+
+    assert (
+        lookup_scanner.load_security_information(alias_manifest).status == ScanLookupStatus.SUCCESS
+    )
+    transition = ManifestSecurityStatus.get(ManifestSecurityStatus.manifest == manifest_row)
+    assert transition.index_status == IndexStatus.PENDING
+    assert transition.metadata_json == {"legacy_scanner_digest": legacy_digest}
+
+    scanner._secscan_api.index.reset_mock()
+    scanner.perform_indexing(batch_size=100)
+
+    scanner._secscan_api.index.assert_called_once()
+    indexed_manifest, indexed_layers = scanner._secscan_api.index.call_args.args
+    assert indexed_manifest.digest == manifest_row.digest
+    local_layers = [layer for layer in indexed_layers if not layer.layer_info.is_remote]
+    assert local_layers
+    assert all(str(layer.blob.digest).startswith("sha256:") for layer in local_layers)
+
+    completed = ManifestSecurityStatus.get(ManifestSecurityStatus.manifest == manifest_row)
+    assert completed.index_status == IndexStatus.COMPLETED
+    assert completed.metadata_json == {}
+
+    canonical_report = dict(legacy_report, manifest_hash=manifest_row.digest)
+    lookup_scanner._secscan_api.vulnerability_report.reset_mock()
+    lookup_scanner._secscan_api.vulnerability_report.side_effect = lambda digest: (
+        canonical_report if digest == manifest_row.digest else None
+    )
+    assert (
+        lookup_scanner.load_security_information(alias_manifest).status == ScanLookupStatus.SUCCESS
+    )
+    lookup_scanner._secscan_api.vulnerability_report.assert_called_once_with(manifest_row.digest)
