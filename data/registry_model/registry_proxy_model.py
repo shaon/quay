@@ -8,7 +8,9 @@ from peewee import Select, fn
 
 import features
 from app import app, proxy_cache_blob_queue, storage
-from data.database import ImageStorage
+from data.database import (
+    ImageStorage,
+)
 from data.database import Manifest as ManifestTable
 from data.database import ManifestBlob, ManifestChild
 from data.database import Tag as TagTable
@@ -664,6 +666,7 @@ class ProxyModel(OCIModel):
                             db_manifest,
                             raise_on_error=True,
                             expiration_seconds=expiration,
+                            track_repo_modification=False,
                         )
                     except ImmutableTagException:
                         raise
@@ -681,38 +684,38 @@ class ProxyModel(OCIModel):
                         oci.manifest.register_repository_manifest_digest(
                             repository_ref.id, db_manifest, manifest.digest
                         )
-                        return wrapped_manifest, wrapped_tag
-
-                    child_references = list(manifest.child_manifests(content_retriever=None))
-                    child_descriptors = manifest.manifest_dict.get("manifests", [])
-                    if len(child_references) != len(child_descriptors):
-                        raise ManifestDoesNotExist(
-                            "upstream index descriptors could not be resolved"
-                        )
-
-                    manifests_to_connect = []
-                    for child in child_references:
-                        m = oci.manifest.lookup_manifest(
-                            repository_ref.id, child.digest, allow_dead=True
-                        )
-                        if m is None:
-                            m = oci.manifest.create_manifest(repository_ref.id, child)
-                            oci.tag.create_temporary_tag_if_necessary(
-                                m, self._config.expiration_s or None
+                    else:
+                        child_references = list(manifest.child_manifests(content_retriever=None))
+                        child_descriptors = manifest.manifest_dict.get("manifests", [])
+                        if len(child_references) != len(child_descriptors):
+                            raise ManifestDoesNotExist(
+                                "upstream index descriptors could not be resolved"
                             )
-                        try:
-                            ManifestChild.get(manifest=db_manifest.id, child_manifest=m.id)
-                        except ManifestChild.DoesNotExist:
-                            manifests_to_connect.append(m)
 
-                    oci.manifest.connect_manifests(
-                        manifests_to_connect, db_manifest, repository_ref.id
-                    )
-                    oci.manifest.register_repository_manifest_digest(
-                        repository_ref.id, db_manifest, manifest.digest
-                    )
+                        manifests_to_connect = []
+                        for child in child_references:
+                            m = oci.manifest.lookup_manifest(
+                                repository_ref.id, child.digest, allow_dead=True
+                            )
+                            if m is None:
+                                m = oci.manifest.create_manifest(repository_ref.id, child)
+                                oci.tag.create_temporary_tag_if_necessary(
+                                    m, self._config.expiration_s or None
+                                )
+                            try:
+                                ManifestChild.get(manifest=db_manifest.id, child_manifest=m.id)
+                            except ManifestChild.DoesNotExist:
+                                manifests_to_connect.append(m)
 
-                    return wrapped_manifest, wrapped_tag
+                        oci.manifest.connect_manifests(
+                            manifests_to_connect, db_manifest, repository_ref.id
+                        )
+                        oci.manifest.register_repository_manifest_digest(
+                            repository_ref.id, db_manifest, manifest.digest
+                        )
+
+            oci.tag.mark_repository_modified(repository_ref.namespace_name, repository_ref.name)
+            return wrapped_manifest, wrapped_tag
         except Exception as e:
             logger.warning(
                 "Failed to create blob/tag for manifest %s, cleaning up: %s", db_manifest.id, e

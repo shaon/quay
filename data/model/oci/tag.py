@@ -461,6 +461,18 @@ def create_temporary_tag_outside_timemachine(manifest):
     )
 
 
+def mark_repository_modified(namespace_name, repo_name):
+    """Best-effort repository modification tracking after a database commit."""
+    try:
+        from app import model_cache
+
+        tracker = getattr(model_cache, "repo_modification_tracker", None)
+        if tracker:
+            tracker.mark_repo_modified(namespace_name, repo_name)
+    except Exception as e:
+        logger.warning("Failed to mark repo modified for %s/%s: %s", namespace_name, repo_name, e)
+
+
 def retarget_tag(
     tag_name,
     manifest_id,
@@ -469,6 +481,7 @@ def retarget_tag(
     raise_on_error=False,
     expiration_seconds=None,
     immutable_from_label=False,
+    track_repo_modification=True,
 ):
     """
     Creates or updates a tag with the specified name to point to the given manifest under its
@@ -523,7 +536,7 @@ def retarget_tag(
 
         try:
             repo = (
-                Repository.select(Repository.namespace_user)
+                Repository.select(Repository.namespace_user, Repository.name)
                 .where(Repository.id == manifest.repository_id)
                 .get()
             )
@@ -592,15 +605,8 @@ def retarget_tag(
         namespace_name = repo.namespace_user.username
         repo_name = repo.name
 
-    # Mark repo as modified (best-effort, outside transaction)
-    try:
-        from app import model_cache
-
-        tracker = getattr(model_cache, "repo_modification_tracker", None)
-        if tracker:
-            tracker.mark_repo_modified(namespace_name, repo_name)
-    except Exception as e:
-        logger.warning("Failed to mark repo modified for %s/%s: %s", namespace_name, repo_name, e)
+    if track_repo_modification:
+        mark_repository_modified(namespace_name, repo_name)
 
     # Best-effort audit log outside the transaction so a logging failure
     # does not roll back the tag creation.

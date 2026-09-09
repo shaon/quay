@@ -10,7 +10,7 @@ from mock import MagicMock, patch
 from peewee import fn
 from playhouse.test_utils import assert_query_count
 
-from app import storage
+from app import model_cache, storage
 from data import model
 from data.database import ImageStorageLocation, ManifestChild, Repository, Tag, User, db
 from data.model import ImmutableTagException
@@ -588,9 +588,15 @@ def test_retarget_tag(initialized_db):
     assert results[1].lifetime_end_ms is not None
 
     # Revert back to the original manifest.
-    created = retarget_tag(
-        "latest", results[0].manifest, is_reversion=True, now_ms=results[1].lifetime_end_ms + 10000
-    )
+    with patch.object(
+        model_cache.repo_modification_tracker, "mark_repo_modified"
+    ) as mark_repo_modified:
+        created = retarget_tag(
+            "latest",
+            results[0].manifest,
+            is_reversion=True,
+            now_ms=results[1].lifetime_end_ms + 10000,
+        )
     assert created.lifetime_end_ms is None
     assert created.reversion
     assert created.name == "latest"
@@ -605,6 +611,7 @@ def test_retarget_tag(initialized_db):
     assert results[2].lifetime_end_ms is not None
 
     assert results[0] == created
+    mark_repo_modified.assert_called_once_with("devtable", "history")
 
 
 def test_retarget_tag_wrong_name(initialized_db):

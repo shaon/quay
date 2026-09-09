@@ -883,9 +883,10 @@ class OCIModel(RegistryDataInterface):
             namespacequota.notify_organization_admins(repository_ref, "quota_error")
             raise
 
-        # Invalidate only after commit. Invalidating inside the transaction allows another request
-        # to repopulate stale state before the tag move becomes visible.
+        # Repository tracking and cache invalidation must happen only after the top-level commit.
+        # Lower-level tag writes suppress their own tracking while this method owns the transaction.
         if current_manifest is not None:
+            oci.tag.mark_repository_modified(repository_ref.namespace_name, repository_ref.name)
             self._invalidate_manifest_cache(
                 repository_ref,
                 [*previous_manifests, current_manifest],
@@ -1017,6 +1018,7 @@ class OCIModel(RegistryDataInterface):
                     raise_on_error=raise_on_error,
                     expiration_seconds=expiration_seconds,
                     immutable_from_label=immutable_from_label,
+                    track_repo_modification=False,
                 )
                 if tag is None:
                     return (None, None), previous_manifests, None

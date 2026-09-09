@@ -1,879 +1,1016 @@
-# Quay Configurable-Digest Handoff
+# Story 22 Completion and Story 23 Planning Handoff
 
-## Purpose
+## Story 23 deferral decision
 
-This file is the current operational snapshot for the next implementation session. It is not a cumulative execution log. Detailed history remains in Git.
+Story 23, **Publish Quay build output using configured digest algorithms**, is **Deferred** by explicit product decision. It remains unimplemented and must not be reported as Done or as supporting SHA-384/SHA-512 build output.
 
-The feature supports repository-visible SHA-256, SHA-384, and SHA-512 identities for selected Registry V2 operations while retaining SHA-256 as Quay's canonical internal storage, deduplication, manifest, and graph identity.
+The baseline confirmed the intended cross-repository boundary: Quay queues and manages builds, while the external `quay-builder` performs the image build and Registry V2 publication. This worktree has no worker source or worker rebuild path. Local tooling can only extract a prebuilt worker binary from `quay.io/projectquay/quay-builder`, which cannot provide implementation or live-proof evidence. The existing protocol has neither worker capability advertisement nor an output-digest field.
 
-## Start here
+No production, test, configuration, protobuf, generated, schema, migration, or worker file was changed for Story 23. Only this handoff, the planning `TODO.md`, and this session's `.PITASKS.md` section were updated. Read-only inspection used `git status --short --branch`, local `find`/`env` checks for a designated worker source, `wc -l`, `rg`, and complete reads of the required planning/configuration/build files. No tests, PostgreSQL commands, protobuf generation, compilation, mypy, pre-commit, or live builds were run because implementation did not begin. `git diff --check` was the only required validation for this documentation-only decision.
 
-1. Work only in `/Users/shossain/QuayWorkspace/shaon-feature-PQC`.
-2. Use branch `shaon-feature-PQC`.
-3. Read this file, the planning repository's `TODO.md` and `PQC-Features.md`, `AGENTS.md`, `IMPLEMENTATION_PLAN.md`, and relevant `agent_docs/` files completely.
-4. Recheck branch, HEAD, merge base, status, staging, untracked files, worktrees, recent history, and the complete `master...HEAD` diff before changing files.
-5. Continue the existing implementation. Do not reset, rebase, restore, discard, overwrite, amend, or replace work.
-6. Do not access or modify `/Users/shossain/QuayWorkspace/11537-pqc-schema`.
-7. Do not push, alter remotes, update pull requests, or modify another worktree.
-8. Before modifying files, update only the current session's `.PITASKS.md` section.
+The implementation plan below remains authoritative if the story resumes. Resume only after a local `quay-builder` source and rebuild path are designated. Until then, worker implementation and SHA-256/SHA-384/SHA-512 live completion evidence remain infrastructure-blocked. Recommendation: keep Story 23 **Deferred**, not Done or Blocked.
 
-## Repository state
+Stories 24–33 are also **Deferred** by explicit product decision. No next implementation story is designated. Their status-only deferral changes no production behavior and provides no implementation, validation, interoperability, rollout, or release-readiness evidence.
+
+Story 22 resolves authorized vulnerability-report requests through enabled repository-registered SHA-384 and SHA-512 identities while keeping Clair deduplicated on canonical SHA-256.
+
+- `endpoints/api/secscan.py` validates the requested digest and active allowlist after repository authorization, then uses repository-scoped registration lookup. Disabled, malformed, unregistered, and cross-repository identities return 404.
+- Both scanner workers wrap manifests with canonical SHA-256. Report lookup and caching use the canonical manifest row rather than the requested alias.
+- Existing completed scans keyed by the pre-Story-22 first registration remain readable during transition. A missing canonical report records the legacy key in `ManifestSecurityStatus.metadata_json`, atomically returns the status to `PENDING`, and continues serving the legacy report while that canonical reindex is pending or in progress.
+- Clair index requests use canonical SHA-256 storage identities for local layer hashes. For storage without direct-download URLs, the internal registry URL uses the layer's registered descriptor identity so Clair can retrieve the canonical bytes without exposing an unregistered canonical digest. Remote layers retain their descriptor digest and external URL because Quay does not own their storage.
+- Scanner GC queues the canonical report identity and the one legacy report identity that the pre-Story-22 implementation could have created. Cleanup preserves canonical and legacy reports across repositories until their final corresponding owner is removed; missing legacy reports are idempotent cleanup.
+- Existing SHA-256 behavior, authorization decorators, registrations, and non-Clair integrations remain unchanged. API v1 now reapplies Story 19's exact canonical SHA-256 rule after resolving a Docker schema 1 manifest. No schema or migration was added.
+
+Final corrective validation: the new API suite passed **22 tests on SQLite**; the two worker-transition tests passed on SQLite; the complete affected scanner/Clair API/security endpoint/GC set passed **221 tests on SQLite**; the Story 19 schema 1 regression selection passed **36 tests with 236 deselected**; the complete PostgreSQL endpoint/scanner/GC set passed **195 tests**; and the final PostgreSQL API plus worker-transition slice passed **24 tests**. A broader SQLite authorization/scanner/GC selection passed **1,825 tests with 43 deselected**. Targeted compilation, mypy, pre-commit, and `git diff --check` passed. The running Quay instance returned healthy status for auth, database, disk, registry, service keys, and web. Live Clair validation remains infrastructure-blocked because no Clair container is running.
+
+## Implementation status
+
+The two high-severity static-review findings are fixed in the uncommitted Story 22 work:
+
+- `data/secscan_model/secscan_v4_model.py` falls back to the one legacy report key selected by pre-Story-22 code when a completed scan has no canonical report. It stores that key in `ManifestSecurityStatus.metadata_json`, conditionally returns the status to `PENDING`, serves the legacy report while canonical reindexing is pending or in progress, and keeps the response identity canonical SHA-256.
+- `data/model/oci/manifest.py` identifies the historical first-registration report key and determines whether another manifest still owns that legacy key.
+- `data/model/gc.py` durably queues both the canonical report key and the one possible legacy key. Canonical and legacy ownership checks prevent cross-repository report deletion, and Clair 404 remains idempotent cleanup.
+- `util/secscan/v4/api.py` still sends canonical SHA-256 hashes for local layers, while `util/secscan/blob.py` uses the registered descriptor identity in fallback Registry V2 download URLs. This lets Clair retrieve canonical bytes from storage backends without direct-download URLs without exposing hidden canonical digests.
+- Regression coverage is in `data/secscan_model/test/test_secscan_v4_model.py`, `data/model/test/test_gc.py`, `util/secscan/v4/test/test_v4_api.py`, and `util/secscan/test/test_blob_retriever.py`.
+
+The worktree remains intentionally dirty with unrelated pre-existing Stories 17/19/20/21 changes. Do not reset, restore, rebase, stage, commit, or attribute the complete working-tree diff to Story 22.
+
+## Story 22 completion
+
+- `endpoints/api/secscan.py` now compares a resolved Docker schema 1 manifest request with the digest of its parsed historical payload. Retained SHA-384, SHA-512, and noncanonical SHA-256 registrations return the same API v1 404 as other inaccessible identities. Repository authorization still runs first, and canonical SHA-256 schema 1 access remains unchanged.
+- `endpoints/api/test/test_secscan.py` covers malformed syntax, unknown algorithms, enabled but unregistered identities, disabled canonical SHA-256, cross-repository aliases, all three stale schema 1 identity forms, canonical schema 1 success, and unauthenticated/unauthorized precedence. The three schema 1 cases failed with HTTP 200 before the production correction and pass with HTTP 404 afterward.
+- Both scanner implementations are now covered from legacy-report fallback through `PENDING` claim, canonical SHA-256 manifest/local-layer indexing, successful metadata cleanup, and canonical-only subsequent report lookup. These tests passed without another scanner production change.
+- Existing GC coverage proves durable canonical and legacy key queuing, cross-repository ownership preservation, final-owner deletion, retries, and idempotent missing-report cleanup. The complete GC suite passed without another GC production change.
+- Story 22 is **Done** under the local definition of done. Full mixed-version/region rollout remains Story 30. SHA-384/SHA-512 remote-layer interoperability remains explicitly infrastructure-blocked until an isolated live Clair instance is available; mocked tests are not treated as live support evidence.
+
+Final corrective files:
+
+- `endpoints/api/secscan.py`
+- `endpoints/api/test/test_secscan.py`
+- `data/secscan_model/test/test_secscan_v4_model.py`
+- `data/secscan_model/test/test_secscan_v4_model_v2.py`
+- `HANDOFF.md`
+
+## Deferred Story 23 implementation plan
+
+Story 23, **Publish Quay build output using configured digest algorithms**, is deferred in `TODO.md`. Its dependencies, Stories 2 and 3, are Done. Story 23 must preserve canonical SHA-256 storage while publishing each build through one explicitly selected repository-visible digest algorithm and proving that the expected registrations were created.
+
+### Architectural finding and completion boundary
+
+Quay does not build or push the image in this repository. `buildman/manager/ephemeral.py::start_job` sends repository, registry, token, and tag arguments to an external `quay-builder` process. `buildman/buildmanagerservicer.py::RegisterBuildJob` serializes those arguments into `buildman/buildman_pb/buildman.proto::BuildPack`. The current protobuf has no output-digest field, and the current worker contract reports only phases and logs. The worker source is not present in this worktree; local development extracts a prebuilt binary from `quay.io/projectquay/quay-builder`.
+
+A normal worker push is tag-addressed. Story 2 deliberately keeps tag-addressed manifest PUT canonical SHA-256 because it carries no explicit algorithm. Alternative output therefore cannot be implemented by adding a Quay-side default around the existing push. The worker must use the explicit Registry V2 extension already implemented by Stories 2 and 3: publish content under the selected digest and attach tags through digest-addressed manifest PUT tag parameters.
+
+Story 23 cannot be marked Done from Quay-only protobuf plumbing, mocks, or a stock worker that silently continues to push SHA-256. Completion requires a compatible `quay-builder` implementation and a live build proving the selected registrations. Do not fetch, inspect, or compare upstream code without explicit approval; first obtain the designated local worker source or record the dependency as blocked.
+
+### Proposed contract
+
+1. Add a singular deployment setting, provisionally named `BUILD_OUTPUT_HASH_ALGORITHM`, with a backward-compatible default of `sha256`. Do not infer build output from the order of `ALLOWED_HASH_ALGORITHMS`: that list controls availability, not which one build workers publish.
+2. Accept only `sha256`, `sha384`, or `sha512`, and require the selected value to be enabled by `ALLOWED_HASH_ALGORITHMS` whenever builds are enabled. A missing setting preserves legacy SHA-256 behavior. If SHA-256 is disabled and no explicit alternative is selected, fail configuration/build startup clearly rather than silently choosing an algorithm.
+3. Snapshot the selected algorithm into the repository build's internal `job_config` in `endpoints/building.py`. Existing queued records with no field fall back to SHA-256. Revalidate the snapshot against the active allowlist before handing work to a worker so a hard-disabled algorithm is not published after a configuration change.
+4. Extend the protobuf additively. A new worker advertises its supported output algorithms in `BuildJobArgs`; `BuildPack` returns the selected `output_digest_algorithm`. Permit an old worker only for the legacy SHA-256 path. Reject an alternative build before execution when the worker does not advertise support, preventing an old binary from ignoring an unknown field and silently publishing SHA-256.
+5. Update the external worker to preserve its current SHA-256 path and add explicit SHA-384/SHA-512 publication. For alternative output, calculate the selected digest over exact blob/config bytes, upload or register each local blob under that identity using the existing `digest-algorithm` upload contract, rewrite manifest descriptors to those selected registrations, calculate the selected digest over the final exact manifest bytes, and use digest-addressed manifest PUT with every requested `tag` parameter. Quay continues to deduplicate the bytes and manifest internally by canonical SHA-256; the worker must not expose an unregistered canonical identity.
+6. Before accepting a worker's `COMPLETE` phase, verify repository-locally that every requested tag points to the produced manifest, that the manifest has the exact selected registration, and that its local config/layer descriptors have the corresponding repository blob registrations. Missing or mismatched registrations are build failures, not successful builds. Keep this verification out of notifications and audit payloads; those schema changes belong to Stories 24 and 25.
+
+The exact protobuf capability shape and completion-failure classification should be locked down with failing compatibility tests before production edits. Generated Python protobuf files must be regenerated from `buildman.proto`, not hand-edited. The matching worker protobuf must change in the designated worker source.
+
+### Test-first implementation phases
+
+1. **Baseline and contract tests**
+   - Capture the current default SHA-256 build arguments and protobuf behavior.
+   - Add configuration tests for omission/default, each supported value, unknown values, selected-but-disabled values, and build-support-disabled behavior.
+   - Add queued-job tests proving manual, trigger, and webhook builds all snapshot the same selected algorithm and old records retain SHA-256 compatibility.
+2. **Manager/worker protocol**
+   - Add failing tests around `EphemeralBuilderManager.start_job` and `BuildManagerServicer.RegisterBuildJob` for selected-algorithm propagation, old-worker SHA-256 compatibility, alternative capability acceptance, unsupported-worker rejection, and active-allowlist revalidation.
+   - Add protobuf wire compatibility tests and regenerate `buildman_pb2.py`, `buildman_pb2_grpc.py`, and typing output as required by this repository.
+3. **Worker publication**
+   - In the separately designated `quay-builder` source, add exact-byte digest, descriptor rewrite, blob publication, multi-tag manifest publication, retry, and registry-error tests for SHA-256, SHA-384, and SHA-512.
+   - Prove the alternative path does not first perform a tag-addressed SHA-256 manifest PUT. Preserve authentication, build logs, cancellation, cache lookup, and existing Dockerfile build behavior.
+4. **Completion verification**
+   - Add a repository-scoped model/helper that verifies the selected manifest and local blob registrations without synthesizing registrations or exposing canonical fallback.
+   - Test all tags, missing manifest registration, missing blob registration, wrong repository, changed tag, duplicate tags, disabled-after-queue behavior, and successful SHA-256/SHA-384/SHA-512 completion on SQLite and PostgreSQL.
+   - Integrate verification before success notification and queue completion. Do not add digest fields to notifications, webhooks, action logs, or API responses in Story 23.
+5. **End-to-end validation**
+   - Build a minimal image with a locally rebuilt compatible worker under separate SHA-256, SHA-384, and SHA-512 output configurations.
+   - For each build, verify success, all requested tags, digest-addressed GET/HEAD, exact manifest and blob registrations, and canonical SHA-256 internal deduplication. With alternative-only configuration, prove no repository-visible canonical SHA-256 registration was created.
+   - Verify omitted configuration and an old compatible worker preserve the existing SHA-256 path. Verify invalid/disabled selection and an incapable old worker fail closed with a clear build result.
+
+### Likely Quay files
+
+- `config.py`
+- `util/config/schema.py` and `util/config/test/test_schema.py`
+- `internal/config/*` and their Go tests if the new top-level field must be parsed there
+- `endpoints/building.py` and `endpoints/test/test_building.py`
+- `buildman/manager/ephemeral.py`
+- `buildman/buildmanagerservicer.py`
+- `buildman/buildman_pb/buildman.proto` and generated Python/typing files
+- New focused build-manager/servicer tests; the existing `buildman/test/test_buildman.py` is not reliable evidence for the current constructor/API without first reconciling its stale assumptions
+- A repository-scoped build-output verification helper and focused model tests
+- `local-dev/builds/builds-config.yaml` or local build tooling only as needed for live validation
+- `HANDOFF.md`, planning `TODO.md`, and configuration documentation
+
+### Required validation and exclusions
+
+Run focused suites first, then the complete build endpoint/build-trigger/build-manager/configuration and affected registry manifest/blob suites on SQLite. Run persistence and completion-verification coverage on PostgreSQL. Run Python compilation, targeted mypy, Go config tests if changed, protobuf regeneration/diff checks, pre-commit over every changed file, and `git diff --check`. Live evidence must use a locally controlled compatible worker binary; a mocked worker or the existing stock image is not proof of alternative publication.
+
+Story 23 does not add notification/webhook payloads, audit digest fields, export/reporting/admin tools, hard-disable certification across all integrations, multi-architecture build output, proxy cache, mirrors, imports, Docker schema 1 alternatives, schema changes, migrations, rollout certification, logs/metrics, or physical-orphan recovery. Partial publication recovery remains Story 18; mixed worker/version rollout remains Story 30.
+
+## Historical implementation prompt (completed)
+
+The following prompt records the completed correction scope and is not an outstanding work list.
+
+```text
+Work only in `/Users/shossain/QuayWorkspace/shaon-feature-PQC`. The worktree contains unrelated, pre-existing uncommitted Stories 17/19/20/21 changes. Preserve every existing change. Do not reset, restore, rebase, stage, commit, amend, or access another worktree.
+
+Read completely before modifying files:
+
+- `/Users/shossain/QuayWorkspace/shaon-feature-PQC/AGENTS.md`
+- The Story 22 section at the top of `/Users/shossain/QuayWorkspace/shaon-feature-PQC/HANDOFF.md`
+- `/Users/shossain/Project_Documents/Quay_Post_Quantum_Cryptography/TODO.md`
+- Demo 14 and the cross-cutting requirements in `/Users/shossain/Project_Documents/Quay_Post_Quantum_Cryptography/PQC-Features.md`
+
+Story 22 already has post-review fixes for legacy alternative-keyed Clair reports and non-direct local-layer download URLs. Preserve those fixes and their tests. Do not redesign canonical report storage or layer routing.
+
+Resolve the remaining Story 22 implementation issues using test-first development:
+
+1. Enforce the Story 19 Docker schema 1 boundary in the API v1 security endpoint. After repository authorization and repository-local lookup, only the manifest's exact historical canonical SHA-256 identity may access schema 1 security information. Retained stale SHA-384, SHA-512, and noncanonical SHA-256 registrations must return the established API v1 404 without exposing whether another identity or report exists. Preserve normal canonical SHA-256 schema 1 behavior and allowlist semantics.
+2. Add endpoint tests for malformed syntax, unknown algorithms, enabled but unregistered identities, disabled canonical SHA-256, stale schema 1 alternative registrations, noncanonical schema 1 SHA-256 registrations, cross-repository aliases, and unauthenticated/unauthorized requests. Prove authorization runs before malformed, disabled, or schema-aware identity checks and that all inaccessible cases use the intended non-disclosing response.
+3. Add transition-completion tests for both `V4SecurityScanner` and `V4SecurityScannerV2`. Start with a completed status and a report available only under the old first registration. Prove API lookup serves the old report, changes the status to `PENDING`, both worker paths index the canonical SHA-256 manifest and local-layer hashes, successful completion removes `legacy_scanner_digest` metadata, and later API/cache reads request only canonical SHA-256.
+4. Recheck GC compatibility for canonical and legacy report keys, including final-owner deletion across repositories and idempotent missing-report cleanup. Do not weaken the durable queue or canonical ownership checks.
+5. Keep remote layers unchanged: Quay passes their original descriptor digest and external URL because it does not own their bytes. If no live Clair environment is available, record SHA-384/SHA-512 remote-layer validation as infrastructure-blocked rather than passed.
+
+Likely files:
+
+- `endpoints/api/secscan.py`
+- `endpoints/api/test/test_secscan.py`
+- `data/secscan_model/secscan_v4_model.py`
+- `data/secscan_model/secscan_v4_model_v2.py` only if a failing transition test proves a production change is required
+- `data/secscan_model/test/test_secscan_v4_model.py`
+- `data/secscan_model/test/test_secscan_v4_model_v2.py`
+- `data/model/gc.py` and `data/model/test/test_gc.py` only for proven cleanup defects
+- `HANDOFF.md` and planning `TODO.md`
+
+Do not add a schema migration, new digest registration API, SHA-384/SHA-512 schema 1 semantics, proxy-cache/mirror/import work, build behavior, notifications/webhooks, or Story 30 rollout certification.
+
+Before running tests or tools, present the exact command set and receive approval. Use the worktree executables through `.venv/bin` or add `$PWD/.venv/bin` to `PATH`; bare `pytest`, `pre-commit`, and `alembic` are not available on the host PATH.
+
+Required validation after approval:
+
+- Focused API schema 1 and negative tests on SQLite.
+- Focused legacy-transition tests for both scanner workers on SQLite and PostgreSQL.
+- Complete affected security endpoint, scanner model, Clair API/URL, and GC suites.
+- Existing Story 19 schema 1 regression selection.
+- Targeted pre-commit over every changed file and `git diff --check`.
+- Live Clair only if an isolated Clair environment is actually available; otherwise report it as infrastructure-blocked.
+
+Explain the root cause of every production change. Keep evidence for product defects, test defects, command failures, and infrastructure blocks separate. Finish by updating the Story 22 handoff with exact changed files, commands, outcomes, remaining risks, and a concise recommendation on whether Story 22 can remain Done.
+
+Start by reporting the preserved worktree state, the current post-review fixes, the exact stale-schema-1 execution path, and the first failing tests you will add.
+```
+
+---
+
+# Stories 20 and 21 API/UI Implementation Handoff
+
+## Status and authority
+
+Stories 20 and 21 are implemented and locally **Done**:
+
+- Story 20: **Expose registered digest identities in the Quay API**.
+- Story 21: **Display and manage registered digest identities in the Quay UI**.
+
+Story 20 defines the additive `manifest_digests` contract and Story 21 consumes that contract in both React and Angular. No database schema, migration, configuration, Jira issue, pull request, canonical storage rule, or unrelated Story 17/19 behavior was changed.
+
+The designated Quay worktree is `/Users/shossain/QuayWorkspace/shaon-feature-PQC` on branch `shaon-feature-PQC`, HEAD `ad50cf9b983726edb0a1db2aef94399ab1d40230`, with merge base `d81004d24669132d45df8fbd1eafc86c149e38fa` against `upstream/master`. All pre-existing Story 17 and Story 19 modifications remain in place.
+
+## Implementation result
+
+- The OCI model now performs one repository-scoped bulk lookup of explicit `RepositoryManifestDigest` rows, preserves registration order, computes enabled/preferred state from the active allowlist, and suppresses stale noncanonical Docker schema 1 registrations. It never synthesizes canonical SHA-256 inventory entries.
+- API v1 manifest detail, tag list/history, and repository-embedded tags now return `manifest_digests` entries containing `digest`, `algorithm`, `is_enabled`, and `is_preferred`. Existing singular fields retain their prior values. Discovery response schemas document the additive field.
+- React now shares absent-versus-empty fallback and preferred-selection logic across tag display, digest search/sort, copy, digest pull commands, navigation, details, tag operations, and history. Disabled identities remain visible but cannot drive normal actions.
+- Angular now uses the same identity rules in tag lists, filtering, manifest links/pages, pull dialogs, labels/tag operations, and history. Its manifest link no longer assumes `sha256:` or a fixed prefix length.
+- Added model/API tests, React utility/component tests, an Angular manifest-link Jasmine spec, and a dual-UI Playwright test. No generated frontend bundles were added.
+
+Validation completed:
+
+- OCI manifest model: **29 passed**.
+- API v1 manifest/tag/repository suites: **89 passed**.
+- React: **1,312 passed** across 177 files. Production build passed.
+- Angular production build passed. Dual-UI Playwright: **2 passed**, including preferred selection, retained disabled identities, React full-digest copy, and Angular navigation after identity selection.
+- Python compilation, Black checks for changed backend files, Prettier checks for changed React/Playwright files, and `git diff --check` passed.
+- The legacy Angular Karma runner is not a usable local gate: its installed dependency set omits `d3` and other configured browser files, causing a pre-test `d3 is not defined` failure with zero tests executed. `test:node` is also blocked by the legacy decorator/reflect-metadata harness under Node 25. The successful Angular production build and Chromium Playwright path provide executable Angular coverage.
+
+Post-review corrections separate React manifest-list architecture selection from repository identity selection, load each selected child manifest's own inventory, keep Clair on its pre-Story-22 manifest reference, and avoid passing parent aliases through ordinary manifest-list tag navigation. React and Angular permanent-history cleanup now choose explicit retained registrations and may intentionally select disabled registrations only for that destructive workflow. Added focused tests cover child inventory loading, navigation separation, retained disabled cleanup, digest-pull suppression, selected pull values, and alias search/navigation. Playwright's mocked digest values now use valid algorithm lengths.
+
+## Main finding
+
+The Quay API v1 and both supported UIs still treat one digest as the manifest identity. That is insufficient once a manifest has multiple repository registrations:
+
+- API v1 manifest detail returns `digest` from the identity used to resolve the manifest.
+- API v1 tag history/list responses and repository-embedded tags return one `manifest_digest`, currently sourced from the canonical manifest row.
+- React types, filtering, links, copy actions, pull commands, details, history, and tag operations consume those singular fields.
+- Angular tag lists, history, manifest pages, pull dialogs, and tag operations do the same. Its reusable `manifest-link` additionally recognizes only `sha256:`, strips a fixed seven-character prefix, labels the result `SHA256`, and falls back to an image ID for every other algorithm.
+
+The existing singular fields cannot safely be redefined: tests and clients depend on them, and manifest detail intentionally echoes the successfully resolved route identity. The required design is therefore additive. The new field must come only from explicit rows in `RepositoryManifestDigest`; it must never use the canonical-SHA-256 fallback in `get_repository_manifest_digests` when no registration exists.
+
+## Story 20 API contract
+
+Add `manifest_digests` to all three API v1 response families that currently expose a manifest identity:
+
+1. `GET /api/v1/repository/{repository}/manifest/{manifestref}`: top-level `manifest_digests` for the returned manifest.
+2. `GET /api/v1/repository/{repository}/tag/`: `manifest_digests` on every tag-history or active-tag item.
+3. `GET /api/v1/repository/{repository}` with `includeTags=true`: `manifest_digests` on every value in the embedded `tags` map.
+
+The field is always present on these successful responses when served by the new backend. This lets a new UI distinguish an old backend, where the field is absent, from a new backend with a legacy manifest that has no explicit registrations, where the field is an empty array.
+
+Each array item has this shape:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `digest` | string | Complete registered identity, including algorithm prefix |
+| `algorithm` | string | Parsed algorithm name, such as `sha256`, `sha384`, or `sha512` |
+| `is_enabled` | boolean | Whether the algorithm is in the request-serving instance's current `ALLOWED_HASH_ALGORITHMS` |
+| `is_preferred` | boolean | Whether normal tag resolution would select this enabled registration under the existing deterministic selection rules |
+
+Contract rules:
+
+- Return only explicit registrations whose `repository_id` and `manifest_id` both match the authorized repository and returned manifest.
+- Never synthesize or return unregistered `Manifest.digest` in `manifest_digests`.
+- Keep existing `digest` and `manifest_digest` fields byte-for-byte compatible. Mark them as legacy singular fields in API documentation; do not silently reinterpret them as the registration list or preferred identity.
+- Include retained registrations for disabled algorithms with `is_enabled=false`. Inventory is not a pullability claim. This is necessary so authorized destructive lifecycle workflows can still identify retained content.
+- Set `is_preferred=true` only for an identity that is both returned and currently enabled. At most one item is preferred. If no returned identity is enabled, every item is false.
+- Apply the Story 19 schema-aware boundary: Docker schema 1 may return only its explicitly registered historical canonical SHA-256 identity. Stale SHA-384 or SHA-512 schema 1 rows remain stored for lifecycle cleanup but must not be advertised as usable manifest identities.
+- Preserve deterministic order. Use the existing registration creation order (`RepositoryManifestDigest.id`), because current repository-visible selection uses that order after preferring an explicit canonical identity. Do not rely on unordered SQL results.
+- Do not add canonical-storage fields, internal IDs, registration row IDs, or blob/layer aliases. Layer `blob_digest` and manifest-list descriptor digests are different contracts.
+- Do not materialize legacy registrations during an API inventory GET. A new backend returns an empty array for a manifest with no explicit row; Registry V2's existing successful legacy read remains responsible for lazy SHA-256 materialization.
+- Treat `is_enabled` as response-time advisory state. Every operation must still enforce its own server-side authorization, repository scope, schema rules, and eventually Story 28's complete hard-disable policy.
+
+An illustrative response fragment is:
+
+```json
+"manifest_digest": "sha256:legacy-value",
+"manifest_digests": [
+  {
+    "digest": "sha384:registered-value",
+    "algorithm": "sha384",
+    "is_enabled": true,
+    "is_preferred": true
+  },
+  {
+    "digest": "sha512:registered-value",
+    "algorithm": "sha512",
+    "is_enabled": false,
+    "is_preferred": false
+  }
+]
+```
+
+The fragment deliberately shows why the legacy singular value and the authoritative registration list must remain separate.
+
+### API implementation shape
+
+Implement one repository-model bulk read, not one query per tag:
+
+- Add an explicit-registration bulk helper in `data/model/oci/manifest.py`. It should accept a repository ID and a bounded collection of manifest rows/IDs, query `RepositoryManifestDigest` once through the existing `(repository_id, manifest_id)` index, and return registrations grouped by manifest ID in registration-ID order. It must not call the fallback-returning helper for empty groups.
+- Put schema 1 filtering and preferred-selection logic in the model/registry-model layer so manifest detail, tag history, and repository-embedded tags cannot diverge.
+- Add the operation to `data/registry_model/interface.py` and implement it in `data/registry_model/registry_oci_model.py`. Keep endpoint code responsible only for serializing `algorithm`, `is_enabled`, and `is_preferred` against the current app configuration if the registry-layer return type does not carry those values.
+- Extend registry datatypes only as needed to transport already-loaded registrations. Avoid lazy per-object properties that create N+1 queries.
+- Pass the bulk result into `endpoints/api/tag.py::_tag_dict` for the page of at most 100 tags.
+- Extend `endpoints/api/repository_models_interface.py` and `endpoints/api/repository_models_pre_oci.py` so the repository endpoint's embedded map receives the same contract for its existing maximum of 500 tags.
+- Add the field in `endpoints/api/manifest.py::_manifest_dict` using the single returned manifest.
+- Define and attach JSON response schemas with `define_json_response` for these routes, allowing existing extra properties while making the new field visible in `/api/v1/discovery`. The current discovery output documents request schemas but has no response schema for these routes.
+
+No database migration or index is needed. PostgreSQL already has `repositorymanifestdigest_repository_id_manifest_id`. A read-only live plan for four Story 19 manifest IDs used one index scan, returned seven registrations, and completed in 0.043 ms on the local data set.
+
+### Story 20 correctness and compatibility tests
+
+Add focused coverage in the existing model, registry-interface, and API test files for:
+
+- SHA-256, SHA-384, and SHA-512 registrations on one manifest; exact values, order, algorithm labels, enabled state, and one preferred identity.
+- Manifest GET through each registered alias while preserving the existing singular `digest` behavior.
+- Active tag list, complete tag history including dead/reversion rows, pagination, `specificTag`, and repository-embedded tags.
+- A disabled registration remaining listed but not preferred, then becoming enabled/preferred after a config change without changing stored rows.
+- A manifest with no registration returning `manifest_digests: []` without a write or canonical fallback leak.
+- Explicit canonical SHA-256 registration versus an unregistered canonical SHA-256 value.
+- Docker schema 1 returning only an explicit canonical SHA-256 registration even if stale alternative rows exist.
+- Same canonical bytes or digest aliases in another repository never appearing in the response.
+- Existing 401/403/404 behavior and repository read authorization remaining unchanged.
+- A bounded query-count assertion for 100 tag-history items and 500 embedded tags to prevent N+1 regressions.
+- Swagger/discovery response schemas containing the additive field.
+- Exact regression assertions for all old singular fields and current response shapes.
+
+Do not expand Story 20 into a registration create/delete API, API-wide digest search endpoint, Clair, builds, events, exports, reporting, or operational repair.
+
+## Story 21 UI contract
+
+Both React and Angular are supported. The running local configuration has `FEATURE_UI_V2: true`, `DEFAULT_UI: "angular"`, and all three algorithms enabled. Story 21 is incomplete if only React changes.
+
+Shared UI behavior:
+
+- Treat `manifest_digests` as authoritative when present. If it is absent, fall back to the legacy singular field for mixed-version compatibility. If it is present but empty, show “No registered digest identities”; do not relabel the singular canonical value as registered.
+- Render the algorithm from the prefix; never assume a fixed prefix length or SHA-256 hash length.
+- Show a compact algorithm badge plus a shortened hash in tables, with the complete value available to assistive text, tooltip, and copy action.
+- Show all registered identities in a selector/popover. Select `is_preferred` by default; otherwise select the first enabled item. If none is enabled, show the retained identities as disabled and select none for normal actions.
+- Generate pull-by-digest commands only for an enabled selected identity. Tag-based pull commands remain unchanged.
+- Search the digest column across every `manifest_digests[].digest`, not only the legacy singular field. Sort by the displayed selected identity and keep tag grouping/tracks keyed to the existing manifest object, not split into one logical image per alias.
+- Permit enabled selected identities in existing navigation, copy, add/retarget, and restore flows. Permit disabled identities only where an existing destructive lifecycle endpoint intentionally bypasses the allowlist, such as permanent tag-history deletion. Disable normal pull, navigation, retarget, and restore actions for disabled identities with a clear reason.
+- Re-read state after mutations. Do not trust `is_enabled` as authorization or concurrency control.
+- Keep Clair/security requests on their existing identity path until Story 22. Keep cosign naming/correlation behavior unchanged. Keep builds, notifications, webhooks, audit payloads, exports, and admin repair outside Story 21.
+- Do not present layer/blob descriptor digests as alternative manifest registrations.
+
+### React implementation areas
+
+- Extend `Tag` and `ManifestByDigestResponse` in `web/src/resources/TagResource.ts` with an optional `manifest_digests` array and a shared identity type. Optionality is required for old-backend compatibility.
+- Harden `web/src/components/ManifestDigest.tsx` for arbitrary validated algorithm prefixes and hash lengths, and add a reusable identity selector/list component rather than duplicating selection rules.
+- Update `TagsList.tsx`, `TagsTable.tsx`, `TablePopover.tsx`, and the digest search selector so list display, copy, search, and pull commands use the selected registered identity.
+- Remove the hard-coded “SHA256” label and fixed `'sha256:'.length` slicing in the expanded tag row.
+- In tag details, separate “selected manifest object/architecture” from “selected registered identity.” The current `digest` state serves both purposes. Fetch the selected manifest's detail contract before offering its aliases; this is especially important for child manifests in an OCI index. Do not rewrite raw `manifest_data` descriptors.
+- Update `Details.tsx` and `DetailsCopyTags.tsx` so the displayed/copied identity and digest pull commands follow selection while labels, size, and security calls retain their existing integration semantics unless independently proven alias-safe.
+- Update tag-history rendering and restore/permanent-delete dialogs to carry the identity selected for that historical manifest, with the enabled/destructive distinction above.
+- Preserve current routes. A digest selector need not put aliases into the URL. Existing `?digest=` architecture handling should remain limited to the selected parent/child graph and must not allow an unrelated repository manifest merely because it resolves.
+
+### Angular implementation areas
+
+- Extend repository/tag and manifest response use in `static/js/directives/repo-view/repo-panel-tags.js` and `static/js/pages/manifest-view.js` with the same absent-versus-empty fallback rule.
+- Generalize `static/js/directives/ui/manifest-link/manifest-link.component.ts` and its template: parse at the first colon, render the real algorithm, shorten only the hash portion, copy the complete digest, and accept the registration collection/selection state.
+- Update `static/directives/repo-view/repo-panel-tags.html` and `static/partials/manifest-view.html` to show/select registered identities without duplicating a tag or manifest per alias.
+- Update `static/js/directives/ui/fetch-tag-dialog.js` so digest pull formats use an enabled selected identity and remain absent when no enabled registration exists.
+- Update Angular history and tag-operation dialogs so normal actions reject disabled identities while permanent cleanup may use retained registrations.
+- Add a derived all-identities search value to the existing `TableService.buildOrderedItems` fields; retain grouping and image tracks by the legacy manifest key so aliases do not fragment the table.
+- Do not hand-edit `static/build` bundles. Use the repository's supported Angular build pipeline and commit generated artifacts only if the normal project policy explicitly requires them.
+
+## Story 21 test plan
+
+React unit/component tests should prove:
+
+- SHA-256/SHA-384/SHA-512 labels, shortening, full-value copy, preferred selection, disabled rendering, empty state, and old-API fallback.
+- Digest search matches any alias; sort, selection, manifest tracks, and tag bulk selection remain stable.
+- Table and detail pull commands contain the chosen enabled full digest and never a disabled one.
+- Tag detail separates index architecture selection from identity selection and does not confuse layer descriptors with manifest identities.
+- Restore/retarget uses enabled identities; permanent cleanup can retain a disabled identity.
+- Existing SHA-256 snapshots and behavior remain unchanged.
+
+Add focused Angular Karma/Jasmine tests for `manifest-link`, tags filtering/selection, the fetch dialog, manifest page display, and history/operation gating. Angular currently has no focused manifest-link or fetch-tag spec, so Story 21 must add them rather than relying only on React tests.
+
+Add Playwright coverage that creates an isolated repository through existing fixtures, publishes a manifest with multiple explicit registrations, and runs against both `/react` and `/angular` modes. Verify:
+
+- every registered algorithm is visible and the full values copy correctly;
+- searching by a non-default alias finds the tag;
+- choosing SHA-384 or SHA-512 changes the digest pull command and the command succeeds against the registry;
+- disabled state suppresses normal pull/restore/retarget but leaves authorized permanent cleanup available;
+- schema 1 displays only SHA-256;
+- switching UI modes does not change the API contract or selected-value rules.
+
+Restore configuration byte-for-byte after any hard-disable test, use a fresh repository name, and remove only the test repository. Do not reuse or mutate retained Story 17/19 validation repositories.
+
+## Read-only evidence collected
+
+- Quay, PostgreSQL, Redis, and frontend containers were healthy; `/health/instance` returned HTTP 200. The Quay container is bind-mounted to the designated worktree.
+- Unchanged API characterization passed: `endpoints/api/test/test_manifest.py`, `test_tag.py`, and `test_repository.py` — **88 passed**.
+- Live read-only PostgreSQL inventory found repositories with SHA-256, SHA-384, and SHA-512 registrations. The retained Story 19 repository has four manifests and seven registration rows, including explicit canonical schema 1 registrations and deliberately stale schema 1 alternatives used to prove the boundary.
+- `/api/v1/discovery` confirms no response schema on the three target GET routes today. Existing write schemas document singular `manifest_digest` inputs.
+- API tag create/retarget, restore, and permanent-delete paths already call repository-scoped `lookup_manifest_by_digest`; registered alternative identities can therefore resolve without a new routing syntax. Deletion/lifecycle paths already have allow-dead or allowlist-independent behavior where required by prior stories.
+- Registry registration lookup is repository-scoped, and affected cache invalidation already iterates all registrations. No new identity cache is required for this API field.
+- Current React Playwright coverage exercises tag details, architecture switching, pull command copy, tag list digest copy, layers, and history, but it publishes ordinary SHA-256 content only.
+- Both UIs are selectable and tested through `/angular` and `/react`; Angular is not removable from this story merely because React is enabled.
+
+## Boundaries and risks
+
+- Story 20 must land before Story 21 or provide the exact contract in the same dependent change series.
+- Story 28 remains responsible for complete server-side hard-disable enforcement across Quay integrations. Stories 20/21 must not claim that the response-time status flag itself enforces an operation.
+- Story 22 owns Clair alias resolution. Using a selected alternative identity indiscriminately for current security widgets would silently expand scope and can break reports.
+- Raw OCI index descriptors identify exact child bytes and must remain unchanged. Child alias display requires fetching that child manifest's own API detail; replacing descriptor digests in `manifest_data` would corrupt the represented content contract.
+- API list/history responses can include dead tags whose registrations survive until GC. After GC removes the registration, an old history row can legitimately return an empty identity list while retaining its legacy singular value.
+- Mixed-version deployment behavior depends on the absent-versus-empty rule. Do not use JavaScript truthiness in a way that treats `[]` as permission to fall back to canonical SHA-256.
+- There is no evidence that a schema or migration is needed. Stop for a scope decision if implementation appears to require either, a new canonical identity field, registration mutation endpoints, or changes to deferred integrations.
+
+## Recommended implementation order
+
+1. Add failing model/interface tests for explicit-only bulk registration inventory, repository isolation, schema 1 filtering, disabled state, and bounded query count.
+2. Implement the Story 20 registry-model helper and API serialization; add response schemas and all three endpoint test families.
+3. Run the complete API/model/interface regressions and verify unchanged singular fields before starting UI work.
+4. Add the shared React identity type/component and unit tests, then integrate tag list, detail, pull, search, history, and operations.
+5. Add the equivalent Angular component/controller behavior and Karma tests.
+6. Add isolated dual-UI Playwright coverage and live pull verification through selected enabled identities.
+7. Run backend suites, React Vitest/type/lint/build checks, Angular Karma/build checks, focused Playwright in both modes, pre-commit, compilation, mypy for changed Python, and both diff checks.
+8. Review repository isolation, authorization, N+1 behavior, schema 1 boundaries, disabled cleanup, mixed-version fallback, and unchanged Story 17/19 work before changing either story's status.
+
+---
+
+# Story 19 Implementation Handoff
+
+## Authoritative product decision
+
+Docker schema 1 will remain strictly SHA-256-only. SHA-384 and SHA-512 schema 1 manifest identities and layer descriptors are **not required and will not be implemented**. Story 19 must create a complete, explicit, tested `UNSUPPORTED` boundary around PQC/configurable-digest interactions while preserving all historical SHA-256 behavior.
+
+Story 19 is not authorized to fix unrelated Docker schema 1 defects that existed before the PQC work. A production change is in scope only when the failure requires at least one PQC capability: an alternative repository registration, the configurable algorithm allowlist or SHA-256 hard-disable, generic registered-digest resolution, or alternative-digest publication/conversion. If a failure reproduces with ordinary SHA-256 schema 1 behavior without PQC features, classify it as pre-existing, document it, and stop for a scope decision rather than fixing it.
+
+This decision supersedes the earlier investigation option that allowed safe alternative schema 1 semantics. There is no alternative-semantics design branch to pursue.
+
+## Objective
+
+Implement and verify a comprehensive Docker schema 1 SHA-256-only boundary across Registry V2 publication, reads, tag selection, registered aliases, descriptors, conversion, deletion, caches, and lifecycle compatibility. Preserve Docker's historical signed-payload digest, signatures, embedded repository/tag behavior, rewriting and re-signing, SHA-256 conversions, and cleanup paths exactly unless a failing PQC-specific test proves a narrow boundary change is necessary.
+
+Do not assume every characterization failure authorizes production work. Separate PQC product failures, pre-existing defects, test defects, command defects, and environment failures.
+
+## Repository state to preserve
 
 - Worktree: `/Users/shossain/QuayWorkspace/shaon-feature-PQC`
 - Branch: `shaon-feature-PQC`
-- Base branch: `master`
-- Base and merge base: `d81004d24669132d45df8fbd1eafc86c149e38fa`
-- Pre-Story 13 HEAD: `2afe0fca9ccb30cd97ed1bb777dfc3c5cdd3865d`
-- Pre-Story 13 subject: `NO-ISSUE: test(registry): validate same-Quay digest copy`
-- Story 7 implementation: `b59c747e7482f174dee81508dd3aca363ef7d7e6`
-- Story 8 implementation: `bc21299727b875af15fa67a689677e69b9f688ff`
-- External-registry deferral: `229069a0180a43f36f89d25f34a5bd72ad7dab7f`
-- Pre-Story 14 HEAD: `943ac2c12dff1bbc8d6310886b5ab81747e29ca4`.
-- Pre-Story 14 subject: `NO-ISSUE: fix(registry): preserve legacy SHA-256 identities`.
-- Story 14 changes make registered manifest deletion include hidden lifecycle tags, suppress deleted native referrers, and invalidate native and fallback referrer caches. No schema, migration, configuration, blob unlink, repository/namespace cleanup, upload expiration, garbage collection, proxy, mirror, import, or Docker schema 1 alternative-identity behavior changed.
-- Story 14 implementation commit: `796bfeba39cdf66c99f41e9e5675e8f149f15365` (`NO-ISSUE: fix(registry): delete registered digest content`).
-- Story 14 validation-record commit and pre-Story 15 HEAD: `897b55bd15786ebd21f761b6de83f90593803b59` (`NO-ISSUE: docs(registry): correct Story 14 validation record`).
-- Story 15 removes target-repository blob registrations before canonical storage collection and removes residual target-repository manifest registrations before repository deletion. Repository and namespace marking still preserve registrations until their queued purge runs. No upload expiration, ordinary garbage-collection policy, physical orphan recovery, schema, migration, proxy, mirror, import, or Docker schema 1 alternative-identity behavior changed.
-- The Story 15 implementation is committed with subject `NO-ISSUE: fix(gc): remove repository digest registrations`. Its hash cannot be embedded in its own Git preimage; use `git rev-parse HEAD` and verify the subject.
-- Expected target status after the Story 15 commit: clean, with no staged, unstaged, or untracked files.
-- Story 16 makes abandoned-upload expiration retry storage cancellation before deleting the `BlobUpload` row that owns storage metadata and requested-digest hash state. Missing storage is idempotent success.
-- The initial Story 16 implementation is `0ad37c8ec03eae677fd868d37e836ffec5115de0` (`NO-ISSUE: fix(registry): retry abandoned upload cleanup`). Static review found that its per-pass failed-UUID exclusion set caused unbounded worker memory, a growing PostgreSQL `NOT IN` bind list, and quadratic query construction during broad storage failures.
-- The corrective Story 16 commit replaces that set with a fixed stale cutoff, a pass-start maximum primary key, and ascending primary-key cursor iteration. Its subject is `NO-ISSUE: fix(gc): bound abandoned upload cleanup retries`; use `git rev-parse HEAD` for the hash because a commit cannot contain its own ID.
-- Expected target status after the corrective commit: clean, with no staged, unstaged, or untracked files.
-- The planning repository had unrelated modified and untracked files before this update. This session changed only its current-session `.PITASKS.md` section and Story 16 status and evidence in `TODO.md`. The planning repository was not committed. `PQC-Features.md` was unchanged because the accepted capability boundary did not change.
+- HEAD at this planning update: `ad50cf9b983726edb0a1db2aef94399ab1d40230`
+- HEAD subject: `NO-ISSUE: fix(gc): bound abandoned upload cleanup retries`
+- `upstream/master` at the prior handoff: `d81004d24669132d45df8fbd1eafc86c149e38fa`
+- Prior merge base: `d81004d24669132d45df8fbd1eafc86c149e38fa`
+- Story 17 code/test diff SHA-256, excluding `HANDOFF.md`: `7e8ab50e2c777db5346c376e56ad346556b6ec1e12f4b3343e92787c893a636e`
+- Existing modified Quay files recorded by the prior handoff are `data/model/gc.py`, `data/model/oci/tag.py`, `data/model/storage.py`, `data/model/test/test_gc.py`, `util/secscan/v4/api.py`, `util/secscan/v4/test/test_v4_api.py`, `workers/gc/gcworker.py`, `workers/gc/test/test_gcworker.py`, and this handoff.
+- Story 18 is Deferred by explicit product decision. Failed publication may continue to leave physical bytes unreferenced; do not add physical-orphan recovery during Story 19.
+- This planning-only update changed no production or test code and ran no tests. The implementation session must verify current repository state rather than assuming the recorded state is unchanged.
 
-## Delivery status
+Do not reset, restore, rebase, amend, discard, overwrite existing work, alter remotes, push, update a pull request, or access `/Users/shossain/QuayWorkspace/11537-pqc-schema` or another worktree.
 
-- Story 1: **In progress**, pending independent evaluation.
-- Story 2: **In progress**, pending independent evaluation.
-- Story 3: **Done**.
-- Story 4: **Done**.
-- Story 5: **Done**.
-- Story 6: **Done**.
-- Story 7: **Done**.
-- Story 8: **Done**.
-- Story 9: **Deferred** by delivery-scope decision; no Story 9 code is present.
-- Story 10: **Done**, limited to client-mediated copies between normal repositories managed by this Quay deployment.
-- Story 11: **Deferred** with repository and organization mirroring.
-- Story 12: **Deferred** with external image import.
-- Story 13: **Done**.
-- Story 14: **Done**.
-- Story 15: **Done**.
-- Story 16: **Done**.
-- Recommended next work: **Story 17, garbage-collect unreferenced digest registrations and canonical content**.
+## Required start sequence
 
-Do not change Story 1 or Story 2 merely because later stories depend on their behavior.
+1. Read this entire handoff and `/Users/shossain/QuayWorkspace/shaon-feature-PQC/AGENTS.md` completely.
+2. Read the relevant database, testing, architecture, registry endpoint, schema 1, digest, conversion, registry-model, and OCI-model documentation and code listed below.
+3. Read `/Users/shossain/Project_Documents/Quay_Post_Quantum_Cryptography/AGENTS.md` and the relevant Story 19 and Demo 14 sections of `TODO.md` and `PQC-Features.md`.
+4. Audit branch, HEAD, upstream, merge base, status, staging, untracked files, worktrees, history, and complete committed/uncommitted diffs without accessing another worktree.
+5. Recompute the Story 17 code/test hash above and preserve every existing change. If it differs, explain the difference before proceeding.
+6. Create only the new implementation session's `.PITASKS.md` section. Update planning status only as permitted by the user's instructions and without disturbing unrelated planning changes.
+7. Run untouched baseline tests before adding characterization.
+8. Use test-first development and keep the failure classifications separate.
 
-## Non-negotiable identity contracts
+## Confirmed current behavior and PQC-specific gaps
 
-1. `ImageStorage.content_checksum` and `Manifest.digest` remain canonical SHA-256.
-2. Alternative identities remain repository-scoped `RepositoryBlobDigest` and `RepositoryManifestDigest` rows.
-3. Alternative-only content does not expose hidden canonical SHA-256.
-4. Canonical SHA-256 remains visible only when explicitly registered, historically visible before first registration, or intentionally created through a tag or SHA-256 route.
-5. Digest parsing is strict. Encoded values are lowercase and exact length.
-6. Supported algorithms are SHA-256, SHA-384, and SHA-512. The active API boundary must also allow the algorithm.
-7. Registrations are immutable, idempotent, and repository-scoped.
-8. Canonical graph, registration, quota, pruning, and tag changes remain transactionally consistent.
-9. Cache invalidation happens only after lifecycle transactions commit.
-10. Mirror-managed repositories retain their existing SHA-256-only ingestion boundary until a later story changes it.
+Static inspection confirmed the following. The implementation session must prove them with tests before changing production code.
 
-## Completed behavior
+- `endpoints/v2/manifest.py::write_manifest_by_digest` already rejects SHA-384/SHA-512 schema 1 route identities when those algorithms pass the generic allowlist check. SHA-256 compares against `parsed.digest`, Docker's historical schema 1 payload identity.
+- Schema 1 digest PUT tag query parameters are already rejected.
+- `endpoints/v2/test/test_manifest.py::test_schema1_digest_push_remains_sha256_only` covers enabled SHA-384/SHA-512 rejection and successful SHA-256 PUT, but not the complete boundary.
+- Generic repository manifest registration and resolution are schema-agnostic. A deliberately inserted alternative registration can identify a schema 1 manifest on generic lookup paths.
+- Generic tag identity selection can choose an alternative registration and can allow any registration to hide the canonical SHA-256 fallback.
+- Generic descriptor validation accepts SHA-384/SHA-512 schema 1 `blobSum` values when enabled.
+- Schema 2 and OCI schema 1 conversion currently copy source layer digest strings into generated schema 1 `blobSum` entries. An alternative-only source graph can therefore produce an unusable or unsupported schema 1 representation.
+- Digest GET/HEAD and digest DELETE do not currently apply a schema-aware alternative-alias boundary after resolving a registration.
+- These gaps arise from applying PQC's generic registered-identity behavior to schema 1. The historical schema 1 digest, signing, retargeting, and all-SHA-256 conversion implementations predate PQC and are preservation targets, not rewrite targets.
 
-### Stories 1-6 foundations
+## Required external contract
 
-- Configuration accepts nonempty unique combinations of `sha256`, `sha384`, and `sha512`; the default remains SHA-256.
-- Blob upload, resume, validation, pull, HEAD, and cross-repository mount support enabled registered identities while canonical bytes remain SHA-256.
-- Single manifests, OCI indexes, and Docker manifest lists support enabled route identities and mixed registered descriptors.
-- Tags resolve to deterministic enabled repository-visible identities.
-- Hidden canonical identities, disabled algorithms, and cross-repository aliases remain inaccessible.
+| Path | Required Story 19 behavior |
+| --- | --- |
+| Schema 1 PUT by SHA-384/SHA-512 digest | HTTP 400 `UNSUPPORTED`; no manifest, tag, registration, graph, quota, or cache mutation |
+| Schema 1 PUT containing a SHA-384/SHA-512 `blobSum` | HTTP 400 `UNSUPPORTED` before blob lookup or mutation |
+| GET/HEAD through an alternative registration pointing to schema 1 | HTTP 400 `UNSUPPORTED`; never return manifest bytes or establish supported cache behavior |
+| Schema 1 tag pull | Select only the canonical historical SHA-256 identity; ignore alternative registrations |
+| Schema 1 read/write while SHA-256 is disabled | HTTP 400 `UNSUPPORTED` with reason `disabled`; retain registrations, graph, tags, and bytes |
+| DELETE through an alternative schema 1 identity | HTTP 400 `UNSUPPORTED`; do not expire tags or mutate lifecycle state |
+| DELETE through canonical SHA-256 | Preserve authorized cleanup even when SHA-256 is disabled |
+| Retarget/re-sign | Preserve current behavior and create the historical SHA-256 payload identity for the rewritten manifest |
+| Schema 2/OCI/list/index conversion with an all-SHA-256 emitted schema 1 representation | Preserve existing bytes, content type, digest, signature behavior, architecture selection, and tag semantics |
+| Conversion that would emit a SHA-384/SHA-512 `blobSum` | HTTP 400 `UNSUPPORTED`; do not synthesize canonical registrations or expose unregistered canonical values |
+| Existing alternative schema 1 registrations | Retain for normal deletion/GC cleanup, but never use for reads, tag selection, or alternative-identity deletion |
+| Schema 1 child referenced by an alternative descriptor in a manifest list | Reject before graph publication; do not use an alternative alias to establish schema 1 semantics |
 
-### Story 7 artifact publication and pull
+### Error precedence to implement
 
-- Digest-addressed OCI artifacts accept enabled SHA-256, SHA-384, and SHA-512 identities.
-- Tag-addressed artifact publication remains canonical SHA-256 because the route carries no selected algorithm.
-- Artifact config, layers, and subject descriptors are strict-parsed and repository-resolved.
-- `Manifest.subject` stores the canonical subject SHA-256 internally.
-- Exact artifact bytes, media type, size, `artifactType`, registered response identity, GET, and HEAD behavior are preserved.
+- Authentication and authorization decorators retain their existing precedence.
+- Malformed digest syntax remains `DIGEST_INVALID` with reason `malformed`.
+- Unknown digest algorithms remain `UNSUPPORTED` with reason `unsupported`.
+- A well-formed SHA-384/SHA-512 identity known to apply to schema 1 is unsupported even if that algorithm is disabled globally, because the schema 1 capability does not exist.
+- Canonical SHA-256 schema 1 reads and writes use reason `disabled` when SHA-256 is disabled.
+- A cross-repository alternative digest that has no registration in the requested repository remains `MANIFEST_UNKNOWN`; do not probe or leak another repository merely to report the schema 1 boundary.
+- Deletion through canonical SHA-256 remains allowlist-independent. Deletion through an alternative schema 1 alias is unsupported rather than a supported cleanup identity.
 
-### Story 8 referrer discovery
+A digest-addressed GET cannot know the target media type from the route alone while alternative identities remain valid for schema 2 and OCI. Therefore, “before lookup” is not a realizable requirement for this read path. The enforceable boundary is: resolve only within the authorized repository, reject schema 1 before returning bytes or mutating state, and ensure cold or primed caches cannot bypass the rejection.
 
-- The referrers endpoint strict-parses and allowlist-checks the requested subject digest before repository lookup or referrer cache access.
-- Malformed, unsupported, disabled, unknown, hidden canonical, and cross-repository identities retain their established registry errors.
-- SHA-256, SHA-384, and SHA-512 subject aliases resolve only through target-repository visibility rules.
-- Canonical SHA-256 is used only for the internal subject graph query.
-- Native and fallback referrers return a deterministic enabled repository-visible artifact identity. Canonical SHA-256 remains preferred only when it is actually visible and enabled.
-- Descriptor digest, exact manifest byte size, media type, `artifactType`, annotations, and `OCI-Filters-Applied` are preserved.
-- Multiple subject aliases, multiple artifact aliases, and native/fallback overlap deduplicate by canonical manifest ID.
-- Fallback tags are searched across every repository-visible subject alias. Hidden canonical fallback tags are not searched.
-- Exact lowercase SHA-512 fallback names (`sha512-<128 hex>`) have a narrow manifest GET/HEAD/PUT route because their 135-character form cannot fit the ordinary 128-character OCI tag route. Normal tag limits are unchanged.
-- Digest-derived fallback tags enforce subject-algorithm hard-disable behavior on GET/HEAD, PUT, and digest-route tag parameters.
-- Filtered and unfiltered cache keys remain separate. The Story 8 cache namespace is versioned so stale SHA-256-only entries cannot suppress alternative referrers after deployment.
-- Cache entries retain all visible canonical artifacts and select enabled identities on every hit, so disable and re-enable changes apply without waiting for TTL.
-- Cached records are copied before hydration; repeated cache hits do not mutate cached dictionaries.
-- Native artifact publication invalidates filtered and unfiltered caches for every visible subject alias after commit.
-- Fallback-index tag publication resolves only visible digest-derived subject tags and invalidates every visible alias after commit. It invalidates artifact types from both previous and current fallback indexes.
-- Existing SHA-256 discovery, filtering, authorization, publication, pull, and protocol behavior remain intact.
+## Scope classification gate
 
-### Story 10 same-Quay copy
+Before each production change, answer:
 
-- A client can copy a complete mixed-digest image graph between normal repositories on this Quay deployment through standard Registry V2 requests.
-- Source tag resolution selects one deterministic enabled root identity. Digest-addressed child and root publication preserves the identities carried by the selected graph.
-- Cross-repository mounts reuse canonical `ImageStorage` and placements while registering only the requested blob identity at the destination.
-- The copied destination graph retains canonical SHA-256 internally while alternative-only canonical identities remain hidden.
-- Unrelated source manifest and blob aliases are not propagated to the destination.
-- Repeated mount and publication requests are idempotent. Existing authorization, repository isolation, conflict rollback, and hard-disable contracts apply unchanged.
-- Mirror-managed repositories remain SHA-256-only. Mirror workers, external registries, proxy cache, import, and artifact-copy variations are outside Story 10.
+1. Does the failing test require an alternative digest registration, configurable allowlist state, hard-disable, or another PQC behavior?
+2. Does the proposed fix leave the equivalent all-SHA-256 behavior unchanged?
+3. Can the fix be located in PQC endpoint/model selection and validation rather than historical schema 1 parsing, signing, or rewriting?
+4. Does it avoid migrations, alias repair, deferred integrations, and physical storage recovery?
 
-### Story 13 legacy SHA-256 compatibility
+If the answer to any question is no, stop and request a scope decision.
 
-- A successful canonical SHA-256 blob or manifest lookup materializes the historically valid repository-scoped SHA-256 registration when the repository/content pair has no registrations.
-- Legacy tag resolution materializes the canonical manifest registration only when SHA-256 is enabled and selected for the successful client-visible response.
-- Lazy writes recheck on the primary database, use the existing idempotent unique-index registration helpers, and participate in the caller's transaction. The steady-state registered manifest read remains one query.
-- Legacy single manifests, their configuration and layer blobs, direct digest GET/HEAD, and tag GET/HEAD retain exact bytes and SHA-256 response identities.
-- Adding SHA-384 or SHA-512 identities after lazy registration leaves canonical SHA-256 visible. Registrations and fallback remain repository-scoped.
-- Disabling SHA-256 blocks legacy and explicitly registered SHA-256 reads before cache lookup without deleting registrations or canonical content. Enabled alternative identities remain usable, and re-enabling SHA-256 restores canonical access and tag preference.
-- Unauthorized, malformed, disabled, and unknown requests retain their established registry errors. Normal SHA-256 publication, pull, and mount behavior remains compatible.
+## Implementation plan
 
-### Story 14 registered-identity deletion
+### Phase 1: preservation and untouched baseline
 
-- Authorized manifest deletion resolves exact repository-scoped SHA-256, SHA-384, or SHA-512 registrations even when the requested algorithm is disabled.
-- Deletion expires every alive tag for the manifest, including temporary hidden lifecycle tags used by untagged digest publication. All aliases then become unavailable through manifest GET, HEAD, referrer discovery, and repeated DELETE.
-- Native OCI artifact deletion invalidates filtered and unfiltered referrer caches for every visible subject identity after the tag transaction commits.
-- Fallback-index deletion invalidates subject caches derived from its digest-form fallback tag. Fresh and primed native/fallback discovery no longer returns deleted content.
-- Native referrer response hydration rechecks canonical reachability, so a stale cache record cannot re-expose a deleted artifact.
-- Manifest registrations, canonical manifests, graph links, blobs, and blob registrations remain for later lifecycle garbage collection. Story 14 does not remove canonical content physically.
-- Arbitrary blob DELETE remains HTTP 405 `UNSUPPORTED` for registered and disabled identities because unlinking a referenced blob would corrupt manifest graphs. It does not mutate registrations, upload links, or bytes.
-- Strict malformed/unsupported errors, unknown-content behavior, write authorization, repository isolation, immutable-tag behavior, and normal SHA-256 deletion remain intact.
+- Verify repository state and the Story 17 hash before modification.
+- Read and trace all code paths listed under “Code paths to trace.”
+- Run the existing schema 1 unit, endpoint, model, conversion, registry-interface, and focused protocol baselines on SQLite.
+- Run the database-sensitive baseline on PostgreSQL.
+- Record failures exactly; do not weaken or rewrite existing assertions.
 
-### Story 15 repository and namespace registration cleanup
+### Phase 2: test-first PQC characterization
 
-- Repository marking, namespace marking, and namespace grace periods retain digest registrations while content remains recoverable. Cleanup begins only when the repository GC path actually purges the hidden repository.
-- Repository purge removes every `RepositoryBlobDigest` row owned by the target before attempting canonical `ImageStorage` collection, preventing registration foreign keys from blocking cleanup.
-- Per-manifest cleanup retains `RepositoryManifestDigest` rows long enough to address all registered scanner identities, then removes them with each manifest. A final repository-scoped sweep removes residual legacy or inconsistent manifest registrations before repository deletion.
-- Namespace GC bulk-marks its repositories and sends each through the same repository purge invariant. Both dedicated repository and namespace workers are covered.
-- Cleanup is repository-scoped and retry-safe. Registrations owned by unrelated repositories and shared canonical SHA-256 storage still referenced outside the deleted repository remain unchanged.
-- No active algorithm allowlist is consulted for lifecycle cleanup. No registration is remapped, and canonical SHA-256 remains Quay's internal storage identity.
+Add focused tests before production changes.
 
-### Story 16 abandoned-upload and hash-state cleanup
+#### Publication
 
-- `requested_digest_algorithm`, `requested_digest_state`, canonical resumable SHA-256 state, byte counts, and storage metadata are all owned by one `BlobUpload` row. Deleting that row removes all persisted requested-digest state; no separate alternative-hash table, temporary link, or storage metadata row exists.
-- Explicit cancellation and successful monolithic or resumed finalization already deleted the whole row. Cancellation restores no hash state and therefore works for disabled, unsupported legacy, missing, partial, and corrupt persisted values without unsafe deserialization.
-- Successful finalization still writes exact bytes to the canonical SHA-256 CAS path, creates the repository-scoped requested identity and temporary `UploadedBlob` reachability in one database transaction, then deletes the upload row. `ImageStorage.content_checksum` remains SHA-256.
-- Abandoned-upload expiration now deletes a row only after targeted storage cancellation succeeds or reports `FileNotFoundError`. A transient storage failure retains the row, requested hash state, and storage metadata for the next scheduled pass.
-- Supported-backend review found no unsafe `FileNotFoundError` gap: Local has one temporary file; Fake is idempotent; Azure handles a missing single upload blob internally; Cloud suppresses an individual missing chunk but propagates other failures so partially completed multi-object cleanup retries; Swift queues every known segment and does not raise this exception; MultiCDN delegates. No storage behavior changed.
-- Each pass captures one stale-time cutoff and the current maximum `BlobUpload.id`, then selects one eligible row at a time with `id > cursor AND id <= maximum ORDER BY id`. The cursor advances before storage cancellation, so every selected upload is attempted at most once in that pass; failed rows remain intact and are retried on the next scheduled pass while unrelated stale rows continue.
-- Selection uses constant memory and at most five Peewee/SQLite bind parameters (three predicates plus `LIMIT`/`OFFSET`), with no growing `NOT IN` collection. New rows above the pass-start maximum and rows that become stale only as time advances are deferred. The primary-key range and deterministic order remain efficient on PostgreSQL without a schema change.
-- Concurrent purge or cancellation that removes a selected row is a safe no-op. Database deletion matches the selected ID, UUID, and creation time, so an immediately reused UUID or SQLite primary key is not mistaken for the selected upload. Repeated worker cleanup and already-missing chunks are idempotent.
-- The selection query loads only ID, UUID, storage metadata, location, and creation time. The worker never loads, parses, or restores requested hash state and never consults `ALLOWED_HASH_ALGORITHMS`. SHA-256, hintless legacy, SHA-384, SHA-512, disabled, unknown, partially populated, and corrupt rows follow the same cleanup path.
-- The Swift chunk cleanup worker remains storage-only. It idempotently removes queued segments and does not terminate or mutate a `BlobUpload` session.
+- Signed and unsigned schema 1 digest PUT using SHA-384 and SHA-512 while enabled.
+- The same requests while the route algorithm is disabled, proving capability precedence.
+- Canonical SHA-256 digest PUT while enabled and disabled.
+- Tag-addressed schema 1 PUT while SHA-256 is enabled and disabled.
+- Alternative, disabled, malformed, unknown, hidden, and cross-repository schema 1 `blobSum` values.
+- Schema 1 tag query parameter rejection.
+- Exact zero-mutation assertions for manifests, tags, `RepositoryManifestDigest`, `ManifestBlob`, `ManifestChild`, quota state, notifications, and relevant cache entries.
 
-## Story 8 root causes and changed files
+#### Reads and caches
 
-The unfinished behavior had six causes:
+- Deliberately insert a SHA-384/SHA-512 `RepositoryManifestDigest` for an existing schema 1 manifest to represent stale or corrupted PQC state.
+- GET and HEAD through that alias with cold and primed manifest caches.
+- Canonical SHA-256 GET and HEAD remain available and may materialize the historical SHA-256 registration without exposing the alternative alias.
+- Alternative aliases cannot hide canonical SHA-256 tag or digest behavior.
+- Disable SHA-256 while an alternative algorithm remains enabled; tag, canonical digest, and alternative digest requests must not bypass the hard disable.
+- Re-enable SHA-256 and prove immediate recovery without rewriting content.
+- Cover authorization, repository isolation, malformed and unknown identities, repeated operations, and no cross-repository leakage.
 
-1. `endpoints/v2/referrers.py` deliberately rejected every non-SHA-256 subject query.
-2. The registry model rebuilt native and cached descriptors through a SHA-256-only selector.
-3. Fallback discovery searched only the queried subject digest's fallback tag.
-4. Cache misses stored only identities enabled at load time, stale cached dictionaries were mutated during hydration, and the cache namespace still represented Demo 1 semantics.
-5. Fallback indexes carry no OCI subject, so their successful publication did not invalidate subject referrer caches.
-6. A SHA-512 fallback tag is 135 characters and could not match Quay's normal 128-character tag route.
+#### Tag selection, retargeting, and re-signing
 
-Production files changed:
+- Tag pulls select only canonical SHA-256 for schema 1, even when alternative registrations exist first or exclusively.
+- Existing lazy SHA-256 materialization remains idempotent and repository-scoped.
+- Retargeting a schema 1 manifest to a different tag rewrites and re-signs exactly as before.
+- The rewritten manifest has its own historical payload SHA-256 identity; no alternative registration is inherited or synthesized.
+- Embedded namespace, repository, and tag mismatch behavior remains unchanged unless a PQC-specific bypass is proven.
 
-- `endpoints/v2/referrers.py`
+#### Deletion and lifecycle
+
+- Alternative schema 1 digest DELETE returns exact `UNSUPPORTED` before tag expiry or cache invalidation.
+- Canonical SHA-256 digest DELETE still works while SHA-256 is disabled.
+- Tag deletion, repository purge, namespace purge, registration GC, canonical manifest/blob GC, scanner cleanup, and repeated cleanup remain independent of the active allowlist.
+- Existing alternative registration rows are removed only through established lifecycle cleanup; do not add a repair or migration path.
+- Story 18 physical bytes without database state remain untouched.
+
+#### Conversion and manifest lists
+
+- Characterize schema 2 and OCI single-manifest conversion to schema 1.
+- Characterize Docker manifest-list and OCI-index amd64/linux selection and conversion.
+- For all-SHA-256 inputs, assert exact existing returned bytes, historical digest, media type, signature validity, layer order, architecture selection, and zero repository-registration synthesis.
+- For source manifests whose generated schema 1 would contain SHA-384/SHA-512 `blobSum` values, assert precise `UNSUPPORTED` and no database/cache mutation.
+- Reject publication of a manifest-list descriptor that explicitly identifies a schema 1 child by SHA-384/SHA-512.
+- Do not create SHA-256 aliases solely to make an alternative-only graph consumable by a schema 1 client.
+
+#### Historical characterization only
+
+Add or retain regression evidence for signed JWS payload reconstruction, unsigned payload hashing, signature verification, malformed payloads, Unicode, embedded names/tags, image-ID rewriting, all-SHA-256 conversion, repeated push/pull, delete, and GC. A failure that reproduces without PQC features is not automatically in scope for production correction.
+
+### Phase 3: minimal PQC-only production enforcement
+
+Production edits are conditional on the failing tests. The likely change set is:
+
 - `endpoints/v2/manifest.py`
+  - Complete schema 1 route, descriptor, response, conversion, cache-result, and deletion enforcement.
+  - Preserve non-schema-1 SHA-384/SHA-512 behavior and existing error contracts.
+  - Validate stored or generated schema 1 before returning bytes.
+
 - `data/registry_model/registry_oci_model.py`
+  - Force allowlist-aware schema 1 tag selection to canonical SHA-256.
+  - Prevent cold or already-primed caches from exposing an alternative schema 1 identity.
+  - Preserve retarget/re-sign and all-SHA-256 conversion behavior.
+
 - `data/model/oci/manifest.py`
-- `data/cache/cache_key.py`
+  - Prevent PQC registration helpers from creating SHA-384/SHA-512 schema 1 registrations.
+  - Ensure a stale alternative registration cannot hide canonical schema 1 SHA-256 lookup and materialization.
+  - Reject alternative descriptors that explicitly identify schema 1 children before graph publication.
 
-Test files changed:
+Avoid changing `image/docker/schema1.py`, JWS signing, payload reconstruction, image-ID rewriting, `data/model/oci/tag.py`, schema 2/OCI conversion algorithms, or GC unless a failing PQC-specific test proves endpoint/model enforcement cannot establish the contract. Any such need is a review checkpoint, not automatic scope.
 
+### Phase 4: focused and broad validation
+
+Run focused Story 19 tests on SQLite and PostgreSQL where database behavior is involved, then run complete affected suites:
+
+- `image/docker/test/test_schema1.py`
+- `image/docker/schema2/test/test_manifest.py`
+- `image/docker/schema2/test/test_list.py`
+- `image/docker/schema2/test/test_conversion.py`
+- relevant OCI manifest and index conversion tests
 - `endpoints/v2/test/test_manifest.py`
-- `data/registry_model/test/test_interface.py`
-- `data/cache/test/test_cache.py`
-
-`data/registry_model/datatypes.py` and publication persistence were traced but required no Story 8 change. No schema or migration changed.
-
-## Story 10 result and changed files
-
-No production-code gap was found. The existing blob mount, digest-addressed manifest publication, `OCI-Tag`, graph persistence, and repository-scoped registration paths already compose into a correct same-deployment copy.
-
-Target-worktree files changed:
-
-- `endpoints/v2/test/test_manifest.py`
-- `HANDOFF.md`
-
-The planning repository also received the scoped Story 10 updates described under repository state. No schema or migration changed.
-
-## Story 13 root cause and changed files
-
-The legacy fallback was lookup-only. Before Story 13, canonical SHA-256 content with no registration row remained readable, and publication or mount paths preserved that identity before adding an alternative registration, but successful legacy blob GET/HEAD, manifest GET/HEAD, and tag resolution did not lazily persist the historical SHA-256 identity required by the contract.
-
-Production files changed:
-
-- `data/model/oci/blob.py`
-- `data/model/oci/manifest.py`
-- `data/registry_model/interface.py`
-- `data/registry_model/registry_oci_model.py`
-- `endpoints/v2/manifest.py`
-
-Test files changed:
-
+- `endpoints/v2/test/test_blob.py` when descriptor behavior is exercised
 - `data/model/oci/test/test_oci_manifest.py`
-- `endpoints/v2/test/test_blob.py`
-- `endpoints/v2/test/test_manifest.py`
-
-Documentation changed:
-
-- `HANDOFF.md`
-
-No schema or migration changed.
-
-## Story 14 root causes and changed files
-
-The deletion gaps had four causes:
-
-1. The manifest DELETE endpoint used normal visible lookup, so a digest-pushed manifest with only a hidden lifecycle tag returned `MANIFEST_UNKNOWN`.
-2. `delete_tags_for_manifest` selected visible tags only, leaving temporary hidden tags alive and the registered manifest reachable.
-3. Native referrer selection trusted cached/database candidates without rechecking canonical reachability after deletion.
-4. Manifest deletion invalidated manifest and tag caches but did not invalidate native subject or digest-form fallback referrer caches.
-
-Production files changed:
-
-- `data/model/oci/tag.py`
-- `data/registry_model/registry_oci_model.py`
-- `endpoints/v2/manifest.py`
-
-Test files changed:
-
 - `data/model/oci/test/test_oci_tag.py`
-- `endpoints/v2/test/test_blob.py`
+- `data/registry_model/test/test_interface.py`
+- relevant schema 1 selections in `test/registry/registry_tests.py`
+- focused Story 13 legacy compatibility, Story 14 deletion, Story 15 purge, Story 16 upload, and Story 17 GC regressions
+
+Also run targeted mypy for every changed production file, Python compilation for every changed Python file, pre-commit over every changed Quay file, `git diff --check`, and `git diff --check upstream/master`. Use PostgreSQL for registration materialization, transaction rollback, and any concurrency-sensitive evidence. Do not run destructive live cleanup against shared state.
+
+### Phase 5: final review and documentation
+
+- Review the complete diff for repository isolation, authorization, digest/error precedence, mutation ordering, cache bypasses, hidden canonical exposure, disabled-algorithm behavior, conversion correctness, deletion safety, and lifecycle independence.
+- Confirm all equivalent all-SHA-256 paths remain unchanged.
+- Update this Story 19 section with root cause, exact changed files, commands and outcomes, PostgreSQL evidence, failure classifications, remaining risks, and any pre-existing issues deliberately left unchanged.
+- Confirm explicitly that no migration, physical-orphan recovery, or deferred integration entered scope.
+- Mark Story 19 Done only when the complete SHA-256-only boundary and corrective definition of done are satisfied.
+
+## Code paths to trace
+
+- `image/docker/schema1.py`: signed/unsigned payloads, historical digest, signatures, embedded names/tags, `blobSum`, rewriting, and signing.
+- `image/docker/schema2/manifest.py`, `image/docker/schema2/list.py`, `image/oci/manifest.py`, and `image/oci/index.py`: generated schema 1 representations and platform selection.
+- `endpoints/v2/manifest.py`: PUT by tag/digest, GET/HEAD, content negotiation, response digest, conversion, DELETE, errors, and namespace checks.
+- `data/registry_model/registry_oci_model.py`: registration-aware lookup, tag selection, cache behavior, conversion, retarget/re-sign, deletion, and legacy-image adapters.
+- `data/model/oci/manifest.py` and `data/model/oci/tag.py`: canonical lookup, repository registrations, lazy SHA-256 materialization, graph publication, schema 1 tag restrictions, and lifecycle behavior.
+- `data/model/oci/retriever.py`, `data/registry_model/datatypes.py`, and `data/registry_model/manifestbuilder.py`: alias resolution, legacy image behavior, and generated schema 1 construction.
+- `test/registry/protocol_v2.py`, `test/registry/registry_tests.py`, schema 1 unit tests, conversion tests, endpoint tests, OCI model/tag tests, and registry-interface tests.
+
+## Non-goals and stop conditions
+
+Do not implement:
+
+- SHA-384/SHA-512 Docker schema 1 semantics.
+- A change to Docker's historical payload SHA-256 identity or signature format.
+- A fix for a defect reproducible on an equivalent pre-PQC all-SHA-256 path without explicit approval.
+- A schema, migration, index, configuration key, or stale-registration repair job.
+- Repository-visible aliases for generated schema 1 bytes or hidden canonical blob identities.
+- Proxy cache, mirroring, imports, builds, Clair lookup, API/UI, notifications, webhooks, events, export/reporting, operational tools, or physical-orphan recovery.
+- Changes to Stories 9, 11, 12, or 18.
+
+Stop and request a scope decision if satisfying the contract appears to require changing historical schema 1 parsing/signing/rewriting, exposing unregistered canonical values, synthesizing registrations for conversion, a migration, a deferred integration, or correction of a pre-existing non-PQC defect.
+
+## Copy-ready prompt for the implementation session
+
+```text
+Work only in `/Users/shossain/QuayWorkspace/shaon-feature-PQC`. Do not access another worktree.
+
+Before responding, read completely:
+
+- `/Users/shossain/QuayWorkspace/shaon-feature-PQC/AGENTS.md`
+- `/Users/shossain/QuayWorkspace/shaon-feature-PQC/HANDOFF.md`
+- `/Users/shossain/Project_Documents/Quay_Post_Quantum_Cryptography/AGENTS.md`
+- The relevant Story 19 sections of the planning repository's `TODO.md` and `PQC-Features.md`
+- Every repository document and code path required by the Story 19 section of `HANDOFF.md`
+
+Treat `HANDOFF.md` as authoritative for repository preservation, completed Stories 17–18 decisions, the explicit product decision that Docker schema 1 remains SHA-256-only, the PQC-only scope gate, the implementation contract, test strategy, validation requirements, and stop conditions.
+
+Implement Story 19 using test-first development. Do not design or implement SHA-384/SHA-512 Docker schema 1 semantics. Fix only failures caused by PQC/configurable-digest capabilities. If a failure reproduces on an equivalent ordinary all-SHA-256 pre-PQC path, classify and document it, then stop for a scope decision rather than fixing it.
+
+Before modifying production code:
+
+1. Audit and report branch, HEAD, upstream, merge base, status, staging, untracked files, worktrees, history, and complete committed/uncommitted diffs.
+2. Recompute and verify the Story 17 code/test hash recorded in `HANDOFF.md`.
+3. Preserve every existing change and create only this session's `.PITASKS.md` section.
+4. Run the untouched SQLite and PostgreSQL baselines required by `HANDOFF.md`.
+5. Add focused failing Story 19 characterization tests.
+
+Then implement the smallest PQC-only endpoint/model changes required by those tests. Preserve historical schema 1 payload hashing, signatures, rewriting, retargeting, all-SHA-256 conversion, deletion, and GC behavior. Keep Story 18 and every deferred integration out of scope.
+
+Classify product failures, pre-existing defects, test defects, command defects, and environment failures separately. Run the full validation matrix in `HANDOFF.md`, perform the final security and compatibility review, and update `HANDOFF.md` with exact changed files, commands, outcomes, PostgreSQL evidence, remaining risks, and scope confirmation.
+
+Start by giving me a concise summary of the preserved state, the SHA-256-only contract, the PQC-only scope gate, and the first failing-test slice you will add. Then proceed with the plan unless repository state conflicts with `HANDOFF.md`; if it conflicts, stop and report the conflict.
+```
+
+## Story 19 implementation outcome
+
+### Status
+
+Story 19 implementation is complete. Docker schema 1 remains strictly canonical SHA-256. SHA-384 and SHA-512 can still be configured for schema 2 and OCI content, but they cannot become Docker schema 1 route identities, registrations, response digests, generated layer descriptors, child descriptors, tag-selected identities, or deletion identities.
+
+The worktree remained on `shaon-feature-PQC` at pre-Story-17 HEAD `ad50cf9b983726edb0a1db2aef94399ab1d40230`. Before Story 19 edits, the preserved code/test diff excluding `HANDOFF.md` still matched `7e8ab50e2c777db5346c376e56ad346556b6ec1e12f4b3343e92787c893a636e`. Existing Story 17 and planning changes were not reverted, staged, or committed.
+
+### Root cause and implementation
+
+Generic configurable-digest support treated Docker schema 1 like schema 2 and OCI content at several shared boundaries. This allowed a requested SHA-384/SHA-512 digest or a stale `RepositoryManifestDigest` row to identify schema 1 bytes, hide the canonical SHA-256 lookup, influence tag selection, survive cache priming, enter graph publication, or reach deletion. Conversion also needed an output check because generated schema 1 descriptors are protocol-defined SHA-256 values even when their source manifest uses another configured digest.
+
+The correction is deliberately schema-aware and local:
+
+- `endpoints/v2/manifest.py` rejects alternative schema 1 publication before graph, tag, quota, alias, or blob mutation; rejects stale alternative identities after repository-local resolution on GET/HEAD/DELETE; validates converted schema 1 response and layer descriptors; and rejects graph descriptors that resolve locally to schema 1 through a stale alternative alias.
+- `data/model/oci/manifest.py` preserves canonical SHA-256 lookup when stale registrations exist, lazily and idempotently materializes the canonical registration, always selects canonical SHA-256 for schema 1, and rejects every noncanonical schema 1 registration, including a different SHA-256 value.
+- `data/registry_model/registry_oci_model.py` allows schema 1 tags to expose only the canonical SHA-256 identity and treats the tag as unavailable when SHA-256 is disabled.
+- Endpoint checks preserve authentication and strict parsing precedence. A known repository-local schema 1 alternative is `UNSUPPORTED` even when SHA-384/SHA-512 is disabled. An unregistered disabled digest retains the established generic `disabled` response, avoiding a compatibility regression or cross-repository probe.
+- Stale alternative rows are not repaired on read. They are ignored for serving and remain available to normal repository/namespace GC cleanup. Canonical deletion remains independent of the configurable alternative-digest allowlist; deleting through an alternative identity is mutation-free and unsupported.
+- Generated/retargeted schema 1 output remains signed and canonical. Existing schema 1 payload hashing, JWS construction, embedded-name rewriting, image-ID rewriting, `blobSum` behavior, and all-SHA-256 conversion code were not changed.
+
+Story 19 production changes are limited to:
+
+- `endpoints/v2/manifest.py`
+- `data/model/oci/manifest.py`
+- `data/registry_model/registry_oci_model.py`
+
+Story 19 coverage or fixture clarification was added in:
+
 - `endpoints/v2/test/test_manifest.py`
-
-Documentation changed:
-
-- `HANDOFF.md`
-
-No schema or migration changed. Blob unlink remained explicitly unsupported.
-
-## Story 15 root cause and changed files
-
-The registration tables have non-cascading foreign keys, while recursive repository deletion deliberately skips both registration models. Manifest GC already removed manifest registrations one manifest at a time, but repository purge never removed blob registrations before deleting canonical `ImageStorage`. Real placed blobs therefore raised a foreign-key failure and interrupted both dedicated repository GC and namespace GC. Placeholder-only model data could avoid the storage delete and complete through Peewee dependency cleanup, masking the production path gap.
-
-Production file changed:
-
-- `data/model/gc.py`
-
-Test files changed:
-
-- `data/model/test/test_gc.py`
-- `data/model/test/test_user.py`
+- `data/model/oci/test/test_oci_manifest.py`
+- `data/registry_model/test/test_interface.py`
 - `workers/test/test_namespacegcworker.py`
 - `workers/test/test_repositorygcworker.py`
 
-Documentation changed:
+No schema, migration, index, configuration key, schema 1 parser/signer, storage behavior, deferred integration, physical-orphan recovery, or Story 18 implementation was added.
 
-- `HANDOFF.md`
+### PostgreSQL through Podman
 
-No schema or migration changed.
+Docker was not installed (`/bin/bash: docker: command not found`). This was an environment limitation, not a product failure. PostgreSQL validation was completed with Podman 6.0.2 instead:
 
-## Story 16 root causes and changed files
+- Container: `quay-pqc-postgres`
+- Image: `docker.io/library/postgres:18`
+- Server observed during validation: PostgreSQL 18.6
+- Host endpoint: `localhost:55432`
+- Test URI: `postgresql://quay:quay@localhost:55432/quay`
+- The isolated database was recreated and `CREATE EXTENSION pg_trgm` was applied after the first Alembic bootstrap reported the missing required extension.
 
-The persistence trace and corrective static review found production gaps and test defects:
+Focused PostgreSQL iterations passed with **34 passed**, then **36 passed** after model-level enforcement. The final strict registration slice passed **4 passed**. Stories 13–17 PostgreSQL regression coverage passed **41 passed**.
 
-1. Requested-digest state is not separately persisted: it lives only in `BlobUpload`. Existing successful commit and explicit cancellation therefore already removed it correctly by deleting the row.
-2. Before `0ad37c8ec`, abandoned-upload expiration discarded `BlobUpload` and its targeted `storage_metadata` after storage cancellation failed. That commit correctly retained failures but tracked every failed UUID in a set and expanded the full set into `NOT IN` on every lookup. Under broad storage failure, memory and bind count grew linearly and cumulative query construction became quadratic.
-3. The correction uses constant-state keyset iteration: a fixed cutoff, one pass-start maximum ID, and one ascending ID cursor. Failures retain the complete row for the next pass; successes or safely established missing storage delete only the selected row identity.
-4. The original cleanup test failed to assert row removal, and a corrupt-state uploader test assumed initialized repositories had no registrations. The corrective characterization initially also used an unpatchable Peewee proxy and a backend-specific temporary path; those test defects were corrected before drawing product conclusions.
-5. Repository purge still bulk-deletes `BlobUpload` rows without targeted storage cancellation. Characterization proves requested hash state and storage metadata are removed while temporary bytes can remain for storage-wide partial-upload cleanup or later physical-orphan recovery. Production repository and namespace deletion remain outside Story 16.
+The final broad database-sensitive command was:
 
-Production files changed across Story 16 and this correction:
+```text
+TEST=true TEST_DATABASE_URI='postgresql://quay:quay@localhost:55432/quay' PYTHONPATH=. \
+  .venv/bin/python -m pytest -q --tb=short --disable-warnings \
+  endpoints/v2/test/test_manifest.py \
+  data/model/oci/test/test_oci_manifest.py \
+  data/registry_model/test/test_interface.py \
+  workers/test/test_repositorygcworker.py \
+  workers/test/test_namespacegcworker.py \
+  -k 'not test_manifest_registration_conflict_rolls_back_new_graph and not test_story6_parent_registration_conflict_rolls_back_graph_and_tag and not test_mount_rejects_destination_digest_remap'
+```
 
-- `data/model/blob.py`
-- `workers/blobuploadcleanupworker/blobuploadcleanupworker.py`
-- `workers/blobuploadcleanupworker/models_interface.py`
-- `workers/blobuploadcleanupworker/models_pre_oci.py`
+Result: **269 passed, 4 deselected**. This includes the PostgreSQL live canonical schema 1 registration race after its fixture was made schema-aware.
 
-Test files changed across Story 16 and this correction:
+A complete unfiltered PostgreSQL attempt produced **266 passed, 6 failed**. Two Story 19 effects were corrected: the bounded schema check raises the repeated schema 1 PUT ceiling from 27 to 28 queries, and a configurable registration race that selected an unspecified first manifest now exercises canonical schema 1 registration rather than attempting a forbidden SHA-512 schema 1 alias. The four remaining failures are pre-existing PostgreSQL test-transaction defects and were deliberately not changed:
 
+- `test_manifest_registration_conflict_rolls_back_new_graph[sha384]`
+- `test_manifest_registration_conflict_rolls_back_new_graph[sha512]`
+- `test_story6_parent_registration_conflict_rolls_back_graph_and_tag`
+- `test_mount_rejects_destination_digest_remap`
+
+Each test replaces `db_transaction` with `db.transaction()` while already running inside pytest's PostgreSQL transaction. The product reaches the expected conflict, but rollback also removes fixture state inserted before the nested transaction, so the postcondition cannot find that fixture. The blob-mount case does not execute any Story 19 code, all four pass on SQLite, and changing this generic transaction harness would violate the PQC-only scope gate.
+
+### Final validation evidence
+
+Untouched baselines before implementation passed:
+
+- Schema 1/schema 2/OCI image and conversion baseline: **71 passed**.
+- Focused SQLite endpoint/model/interface baseline: **32 passed**.
+- Focused registry protocol baseline: **20 passed**.
+- Focused PostgreSQL baseline: **16 passed**.
+
+End-state evidence:
+
+- Complete affected SQLite set (`endpoints/v2/test/test_manifest.py`, OCI manifest model, registry interface, repository GC, and namespace GC): **271 passed, 2 expected PostgreSQL-only skips**.
+- Earlier wider affected SQLite matrix, including the other selected model/interface/worker regressions: **426 passed, 3 expected skips**.
+- Schema 1, schema 2, OCI image, and conversion suite: **71 passed**.
+- Image/schema plus selected protocol compatibility slice: **78 passed**.
+- Broad registry protocol slice: **279 passed**.
+- GC/security-scanner regression slice: **21 passed**.
+- Migration tests: **2 passed**; no Story 19 migration exists.
+- Final pre-commit over every modified tracked file: passed, including hardcoded-secret detection, Black, isort, flake8, configuration checks, whitespace, and EOF checks.
+- Targeted mypy over eight affected production modules: passed with no issues.
+- Python compilation of the three Story 19 production modules: passed.
+- `git diff --check` and `git diff --check upstream/master`: passed.
+- Final Story 19 code/test diff SHA-256 across the eight files listed above, excluding handoff/task documentation: `232fdf5075526d88f5094d7b0a752b9b4967f39ec8b7ca4d855ca8f58c3bad48`.
+
+One attempted regression command named nonexistent `data/model/test/test_storage.py`; this was a command defect and was rerun with valid paths. Ambiguous generic configurable-digest and namespace-GC fixtures that accidentally selected schema 1 were narrowed to explicit non-schema-1 behavior or direct stale-row construction rather than weakening the production guard. A final error-precedence experiment expecting a disabled unregistered cross-repository digest to become `MANIFEST_UNKNOWN` contradicted established coverage; the test-only assumption was removed and the existing generic `disabled` contract was retained.
+
+### Security, compatibility, and residual risk review
+
+- Authorization decorators and repository-scoped resolution remain in their original order. No global alias lookup or cross-repository existence oracle was added.
+- Rejections happen before publication/deletion mutation. Snapshot coverage includes manifests, digest registrations, blobs, graph links, tags, and quota rows.
+- Cold and primed cache behavior, repository isolation, malformed/unsupported/disabled precedence, SHA-256 hard-disable, canonical recovery, and stale-row preservation are covered.
+- Canonical all-SHA-256 GET/HEAD/tag/PUT/DELETE, signing, conversion bytes, retarget/re-sign, and GC lifecycle remain green.
+- Generic SHA-384/SHA-512 schema 2 and OCI support remains green.
+- No MySQL run was performed. The Podman PostgreSQL run covers the required registration materialization and live unique-index race; the four unrelated PostgreSQL transaction-fixture failures above remain visible technical debt.
+- No destructive cleanup was run against shared state. The Podman database was isolated for this validation.
+
+Story 19 satisfies the local definition of done. Stories 9, 11, 12, and 18 remain deferred, and all integrations listed as Story 19 non-goals remain outside this change.
+
+---
+
+# Story 18 Deferred Handoff
+
+## Status and accepted decision
+
+Story 18 is **Deferred** by explicit product decision. Quay will retain its existing storage-first publication behavior: if database publication fails after physical finalization, unreferenced canonical bytes may remain in storage indefinitely. No physical-orphan discovery or deletion worker will be added in the current PQC delivery sequence.
+
+This does not block core configurable-digest publication, pull, tagging, mounting, artifact, referrer, deletion, or registration-aware GC behavior. It retains an existing upstream Quay storage-leak limitation rather than introducing a new deletion or data-corruption risk. `upstream/master` already finalizes physical storage before `commit_blob_upload` creates database state.
+
+No Story 18 production code, tests, schema, migration, configuration, worker, or storage-driver behavior was added. A future implementation still requires either migration-backed publication/recovery state or the backend-wide inventory, durable queue state, grace period, and primary-database synchronization described below. A local/S3-only, best-effort, unbounded, or grace-period-only implementation remains unacceptable.
+
+## Exact recovery contract derived from code
+
+A conforming implementation must scan only finalized canonical paths of the form `sha256/<prefix>/<hex>`, never `uploads/`, Swift `segments/`, legacy `sharedimages/`, or repository-visible SHA-384/SHA-512 identities. For each configured physical location it must:
+
+- enumerate a fixed-size age-aware page, persist the backend cursor, and resume after process failure without starving sparse or later keys;
+- defer objects younger than a fixed safe grace period;
+- durably and idempotently retry each failed deletion;
+- acquire the same primary-database critical synchronization used by publication, then recheck immediately before deletion that no `ImageStorage` exists for the canonical checksum and that no durable publication intent is active;
+- treat any `ImageStorage` row as a global reference. Its registrations, placements, manifest graph, uploads, repositories, namespaces, and replication state are thereby preserved transitively;
+- treat a missing object as successful convergence, while treating partial or uncertain backend state as a retryable failure;
+- remain independent of `ALLOWED_HASH_ALGORITHMS` and never create a registration or repository-visible identity.
+
+CAS paths contain no repository or namespace identity. Recovery therefore must use global primary-database absence; repository-scoped discovery is neither possible nor safe.
+
+## Root cause and publication trace
+
+`data/registry_model/blobuploader.py::_BlobUploadManager.commit_to_blob` calls `prefetch_to_storage` before `commit_prefetched_blob`. `_finalize_blob_storage` moves or copies the temporary upload to canonical SHA-256 storage while the database connection is deliberately closed. Only afterward does `OCIModel.commit_blob_upload` transactionally create `ImageStorage`, `ImageStoragePlacement`, `UploadedBlob`, and `RepositoryBlobDigest` and delete `BlobUpload`.
+
+If that transaction fails, `complete_when_uploaded` invokes `cancel_upload`. Because `prefetched_digest` is set, cancellation intentionally does not remove the canonical object; it deletes the remaining `BlobUpload` row. This is the exact physical-orphan window. The same ordering is used by normal Registry V2, legacy V1, and the deferred proxy prefetch primitive. Manifest, index, and artifact publication stores manifest bytes in PostgreSQL and references already-published blobs; it does not create a second physical manifest CAS object.
+
+Storage replication copies a referenced CAS object to a destination before adding `ImageStoragePlacement`. A failed placement write can leave an unrecorded destination copy, but the canonical checksum still has an `ImageStorage` owner. Under the required invariant it must be preserved, not treated as a physical orphan.
+
+## Why the current architecture is insufficient
+
+- `BaseStorage`/`BaseStorageV2` and `DistributedStorage` expose no finalized-object inventory or object-age API. Local and fake storage expose no listing; Azure and Swift expose no Quay inventory wrapper; cloud listing exists only inside upload/MPU cleanup; MultiCDN delegates only its existing methods.
+- There is no durable CAS inventory cursor or physical-deletion retry queue. `QueueItem` can store such state, but no queue lifecycle, per-location seed, or continuation protocol exists.
+- A grace period does not close the publication race. A concurrent re-upload can find an old canonical object, cancel its temporary bytes, and then publish database state without refreshing the old object's modification time.
+- `BLOB_DELETE_<digest>` Redis locking does not span `_finalize_blob_storage` through database publication. `GlobalLock` explicitly says Redis is not tier 1 and must not protect critical code. Existing blob creation also falls back to lockless creation when the lock is unavailable.
+- `BlobUpload` has canonical SHA-256 hash state but no queryable canonical digest, finalized timestamp, or foreign key to an `ImageStorage` reservation. An orphan has no database row on which recovery can take a row lock.
+
+## Failure characterization
+
+- **Finalized CAS bytes with no database record / publication rollback:** confirmed by the existing prefetch characterization on SQLite and PostgreSQL. Code ordering shows a later transaction failure leaves the finalized object and cancellation removes the upload row.
+- **Live content adjacent to an orphan:** an indexed exact `ImageStorage.content_checksum` lookup can distinguish each candidate, but inventory does not exist.
+- **Publication/recovery race:** unsafe without a shared primary-database synchronization point, even with object age and an immediate recheck.
+- **Repeated cleanup / deletion failure:** deletion is idempotent on local, fake, and cloud missing objects, but Azure and Swift surface missing/delete errors differently. Durable retry state is absent.
+- **Multiple locations and shared paths:** the same canonical path exists independently per location and can be shared by all repositories. Any global `ImageStorage` owner must preserve every copy under the stated invariant.
+- **Missing objects and partial backend state:** S3 multipart data, cloud `uploads/`, Azure upload blobs, and Swift segments have backend-specific lifecycle behavior. Existing upload, MPU, and Swift chunk cleanup must remain separate from finalized-CAS recovery.
+- **Sparse inventories / more than one batch:** no backend-neutral continuation token or durable cursor exists, so bounded exhaustive progress cannot currently be guaranteed.
+- **Disabled algorithms:** irrelevant to physical discovery because final paths and `ImageStorage.content_checksum` remain canonical SHA-256.
+- **Repository/namespace isolation:** finalized CAS keys encode neither; only global absence is valid.
+- **Temporary versus finalized objects:** temporary keys use `uploads/` or Swift `segments/`; finalized CAS uses `sha256/...`. Existing `BlobUploadCleanupWorker`, cloud partial-upload/MPU cleanup, and `ChunkCleanupWorker` own the temporary paths.
+
+## PostgreSQL and storage evidence
+
+Read-only PostgreSQL inspection found `imagestorage_content_checksum` on `ImageStorage.content_checksum`. The required global preservation probe is constant size:
+
+`SELECT 1 FROM imagestorage WHERE content_checksum = $1 LIMIT 1`.
+
+The tiny local table selected a sequential scan at normal cost. With `enable_seqscan=off`, PostgreSQL used an `Index Only Scan` on `imagestorage_content_checksum` with an index condition on the candidate checksum. This proves the immediate primary-database recheck is bounded and index-capable without another index. No destructive storage or database operation was run.
+
+Backend inspection found modification time only through backend-specific APIs: S3 listing returns `LastModified`; Azure blob properties and Swift object metadata can provide age but are not normalized; local `stat` is not exposed; fake storage has no age. No storage driver offers a bounded finalized-CAS page contract.
+
+## Commands and outcomes
+
+All Quay commands ran from `/Users/shossain/QuayWorkspace/shaon-feature-PQC` with `TEST=true PYTHONPATH=.` unless noted.
+
+- Story 17 diff verification: `git diff --no-ext-diff -- . ':!HANDOFF.md' | shasum -a 256` before Story 18 changes — **passed**, `7e8ab50e2c777db5346c376e56ad346556b6ec1e12f4b3343e92787c893a636e`.
+- Finalized-without-publication characterization: `.venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_blobuploader.py::test_prefetch_finalizes_bytes_without_repository_visibility` — **2 passed** on SQLite and **2 passed** on PostgreSQL.
+- Preserved Story 17 focus: `.venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/test/test_gc.py -k story17` — **17 passed, 43 deselected** on SQLite and PostgreSQL.
+- Replication and temporary chunk behavior: `.venv/bin/python -m pytest -q --tb=short --disable-warnings workers/test/test_storagereplication.py workers/test/test_chunkcleanupworker.py` — **6 passed**.
+- Read-only plan: `PGOPTIONS='-c default_transaction_read_only=on -c enable_seqscan=off' psql ... -c "EXPLAIN ... SELECT 1 FROM public.imagestorage WHERE content_checksum = ... LIMIT 1"` — **Index Only Scan using `imagestorage_content_checksum`**.
+- `git diff --check` and `git diff --check upstream/master` — **passed**.
+
+The complete affected regression, mypy, compilation, migration, and pre-commit matrix was intentionally not run because Story 18 was deferred before production implementation. This is an accepted scope decision, not a product-test failure.
+
+## Changed files and scope confirmation
+
+Story 18 changed only:
+
+- `HANDOFF.md` — this deferred decision, assessment, and evidence.
+- Planning repository `.PITASKS.md` — only this session's task section.
+- Planning repository `TODO.md` — Story 18 status and accepted deferral note.
+
+All Story 17 code and test changes remain byte-for-byte preserved. Stories 9, 11, and 12 remain Deferred. Proxy cache, mirroring, imports, Docker schema 1, API/UI, builds, Clair lookup, operational tooling, schema, migrations, configuration, and pull requests were not changed.
+
+---
+
+# Story 17 Corrective Handoff
+
+## Status
+
+Story 17 corrective work is complete in `/Users/shossain/QuayWorkspace/shaon-feature-PQC`. Both independent-review findings are resolved without a schema change or Story 18 work.
+
+- Branch: `shaon-feature-PQC`
+- Pre-Story 17 HEAD: `ad50cf9b983726edb0a1db2aef94399ab1d40230`
+- HEAD subject: `NO-ISSUE: fix(gc): bound abandoned upload cleanup retries`
+- `upstream/master`: `d81004d24669132d45df8fbd1eafc86c149e38fa`
+- Merge base: `d81004d24669132d45df8fbd1eafc86c149e38fa`
+- Nothing is staged and there are no untracked Quay files.
+- Final uncommitted code/test diff SHA-256, excluding this handoff: `7e8ab50e2c777db5346c376e56ad346556b6ec1e12f4b3343e92787c893a636e`
+
+Modified Quay files:
+
+- `data/model/gc.py`
+- `data/model/oci/tag.py`
+- `data/model/storage.py`
 - `data/model/test/test_gc.py`
-- `data/registry_model/test/test_blobuploader.py`
-- `endpoints/v2/test/test_blob.py`
-- `workers/blobuploadcleanupworker/test/test_blobuploadcleanupworker.py`
-- `workers/test/test_chunkcleanupworker.py`
-
-Documentation changed:
-
+- `util/secscan/v4/api.py`
+- `util/secscan/v4/test/test_v4_api.py`
+- `workers/gc/gcworker.py`
+- `workers/gc/test/test_gcworker.py`
 - `HANDOFF.md`
 
-The corrective Quay commit changes exactly `data/model/blob.py`, `data/model/test/test_gc.py`, `workers/blobuploadcleanupworker/blobuploadcleanupworker.py`, `workers/blobuploadcleanupworker/models_interface.py`, `workers/blobuploadcleanupworker/models_pre_oci.py`, `workers/blobuploadcleanupworker/test/test_blobuploadcleanupworker.py`, and `HANDOFF.md`. Planning `TODO.md` is updated but remains uncommitted; `PQC-Features.md` is unchanged because accepted scope did not change.
+Preserve all changes. Do not reset, restore, rebase, amend, discard, overwrite, push, alter remotes, or access `/Users/shossain/QuayWorkspace/11537-pqc-schema`.
 
-No schema, migration, configuration, digest registration, ordinary manifest/blob garbage collection, repository/namespace deletion production path, proxy, mirror, import, or Docker schema 1 behavior changed.
+## Corrected behavior
 
-## Verification evidence
+### Bounded repository discovery
 
-### Baseline and failing regressions
+`data/model/oci/tag.py::find_repository_with_garbage` no longer starts from `Repository` with four correlated `EXISTS` branches.
 
-Baseline before Story 8 changes:
+- Tags, uploads, blob registrations, and manifest registrations each drive an independent primary-key range query.
+- Every source range spans at most `GC_CANDIDATE_COUNT` IDs, is ordered and limited, and uses a randomized start for large source tables. Tables whose maximum ID fits in one range start at ID 1, avoiding small-database misses and test flakiness.
+- The four repository-ID streams are combined with `UNION ALL`, deduplicated, limited to `GC_CANDIDATE_COUNT`, and randomized before one repository is returned.
+- Expired-tag policy, immutable-tag behavior, namespace enabled state, repository deletion state, expired-upload behavior, registration reachability, and read-replica selection are preserved.
+- Selection uses constant-size SQL and parameters. It creates no growing bind list, unbounded Python collection, repository N+1 probe, index, or migration.
+- A sparse primary-key range can return no candidate even when another range contains garbage. This is intentional bounded sampling; the 30-second worker repeats with new random ranges. Expired content is never treated as live because of a missed range.
 
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py -k 'sha256_referrer_query_and_artifact_type_filter or alternative_referrer_subject_query_is_unsupported_when_enabled or referrer_subject_query_parses_strictly_before_capability_check'`
+### Durable scanner cleanup
 
-Result: **6 passed, 68 deselected**.
+Manifest deletion no longer removes the only scanner identities and then performs best-effort API calls.
 
-The first Story 8 endpoint regression failed before production changes: **4 failed, 74 deselected**. SHA-384 and SHA-512 subjects returned the temporary `UNSUPPORTED` boundary, and a SHA-384 artifact was omitted from a SHA-256 subject response.
+- Registration IDs determine scanner identity order. A legacy manifest with no registration uses only its canonical SHA-256 digest.
+- `QueueItem`/`WorkQueue`, an existing durable facility, stores one cleanup item per identity inside the same database transaction that deletes registrations and the manifest.
+- A failed destructive transaction rolls back both registry deletion and queue insertion.
+- The GC worker processes a bounded scanner-cleanup batch independently of repository candidate discovery, including when no repository policy or candidate is found.
+- Scanner API failures leave queue items available for later passes and restore the retry count, so retries do not expire after a fixed number of failures.
+- Before any external delete, the primary database is checked for a canonical `Manifest.digest` or `RepositoryManifestDigest.digest` in any repository. A still-referenced report is preserved; deletion of the final owner will enqueue the identity again.
+- Scanner API calls occur outside the destructive manifest transaction.
+- Clair report DELETE now treats HTTP 404 as idempotent success. This covers duplicate queue entries and a successful API delete followed by failed queue completion.
+- Repeated cleanup converges and does not expose, create, remap, or consult the configured allowlist for any digest identity.
 
-The fallback cache regression also failed before its supporting production change: **1 failed, 121 deselected** because fallback-tag publication left primed alias caches empty.
+The scanner implementation trace found one active cleanup implementation, `V4SecurityScanner.garbage_collect_manifest_report`; `SecurityScannerModelProxy` delegates to it, `NoopV4SecurityScanner` rejects unsupported use, and the V2 scanner class is an indexer rather than the proxy's cleanup implementation. Clair reports are addressed by manifest digest, so global exact-digest ownership is the preservation boundary.
 
-### Final focused and broad tests
+### Existing Story 17 behavior retained
 
-Focused Story 8 endpoint selection:
+- Ordinary GC independently retries unreachable manifest and blob registration cleanup with bounded primary-key cursors and chunks.
+- Manifest and blob reachability is rechecked in destructive transactions.
+- Blob GC locks `ImageStorage`, removes only target-repository registrations, and treats every remaining registration, graph link, and upload as a global canonical-content reference.
+- Shared storage survives cleanup of one repository and is collected only after its final global reference disappears.
+- Quota rollback/exactly-once behavior, foreign-key safety, cache ordering, repository/namespace purge paths, and disabled-algorithm cleanup remain intact.
+- Registry V2 arbitrary blob DELETE remains HTTP 405 `UNSUPPORTED`.
 
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py -k 'story8 or referrer_subject_query or alternative_referrer_subject_query or sha256_referrer_query'`
+## PostgreSQL query-plan evidence
 
-Result: **16 passed, 68 deselected**.
+A read-only `EXPLAIN (COSTS ON, FORMAT JSON)` was executed against `postgresql://quay:quay@localhost:5432/quay` for the final four-source query.
 
-Focused registry referrer selection:
+- Root node: `Limit`, followed by `Unique`/`Sort` and `Append` of the four source branches.
+- All four source tables appeared below bounded source subqueries: `tag`, `uploadedblob`, `repositoryblobdigest`, and `repositorymanifestdigest`.
+- There were no correlated `SubPlan` nodes and no repository-root discovery scan.
+- The tiny local tables caused PostgreSQL to choose sequential scans for some bounded source ranges and small lookup tables; `repositoryblobdigest` already used its primary-key index.
+- The same read-only plan with `SET LOCAL enable_seqscan = off` used `pk_tag`, `pk_uploadedblob`, `pk_repositoryblobdigest`, and `pk_repositorymanifestdigest`, proving every source range is index-capable without a new index.
 
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_interface.py -k 'referrer or fallback_tag_publication'`
+The generated-SQL characterization also requires four lower/upper primary-key bounds, four source orders/limits, the four source tables, three `UNION ALL` operators, an outer limit, and a constant parameter count.
 
-Result: **9 passed, 113 deselected**.
+## Test-first record and failure classification
 
-Complete manifest endpoint suite:
+Pre-change baseline:
 
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py`
+- SQLite Story 17: **10 passed, 43 deselected**.
+- PostgreSQL Story 17: **10 passed, 43 deselected**.
 
-Result: **84 passed**.
+Corrective characterization:
 
-Complete registry interface suite:
+- Finder contract tests failed before production changes because no bounded four-source query builder or matching query shape existed.
+- Scanner characterization failed because cleanup was called directly after identity deletion and no durable queue item existed.
+- Exact Clair idempotence characterization produced **1 failed, 1 passed**: HTTP 404 was incorrectly converted to `APIRequestFailure`; HTTP 503 remained retryable as required.
 
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_interface.py`
+Failure classifications:
 
-Result: **120 passed, 2 skipped**. The skips remain the PostgreSQL-only blob and manifest registration race tests that passed in earlier sessions.
-
-OCI manifest and cache suites:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/oci/test/test_oci_manifest.py data/cache/test/test_cache.py`
-
-Result: **43 passed**.
-
-SHA-256 registry protocol push/pull regression:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings test/registry/registry_tests.py -k 'test_basic_push_pull_by_manifest'`
-
-Result: **3 passed, 1,456 deselected**.
-
-### Story 10 tests
-
-Focused same-Quay copy contract:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py -k story10`
-
-Result: **1 passed, 84 deselected**.
-
-Complete manifest and blob endpoint suites:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py endpoints/v2/test/test_blob.py`
-
-Result: **141 passed**.
-
-Complete registry interface suite:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_interface.py`
-
-Result: **120 passed, 2 skipped**. The skips remain the PostgreSQL-only registration race tests that passed in earlier sessions.
-
-Relevant SHA-256 registry protocol push, pull, and mount coverage:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings test/registry/registry_tests.py -k 'test_basic_push_pull_by_manifest or blob_mount'`
-
-Result: **255 passed, 1,204 deselected**.
-
-### Story 13 tests
-
-Initial characterization before production changes:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_blob.py endpoints/v2/test/test_manifest.py -k story13`
-
-Result: **4 failed, 141 deselected**. Legacy content was readable, but no lazy blob or manifest SHA-256 registration was created.
-
-Focused final Story 13 coverage:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_blob.py endpoints/v2/test/test_manifest.py data/model/oci/test/test_oci_manifest.py -k story13`
-
-Result: **5 passed, 164 deselected**.
-
-Complete affected manifest and blob endpoint suites:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py endpoints/v2/test/test_blob.py`
-
-Result: **145 passed**.
-
-Complete relevant OCI manifest model and registry-interface suites:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/oci/test/test_oci_manifest.py data/registry_model/test/test_interface.py`
-
-Result: **144 passed, 2 skipped**. The skips are the PostgreSQL-only registration races covered separately below.
-
-PostgreSQL Story 13 atomicity and registration-race coverage:
-
-`TEST=true TEST_DATABASE_URI='postgresql://quay:quay@localhost:5432/quay' PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/oci/test/test_oci_manifest.py data/registry_model/test/test_interface.py -k 'story13 or repository_digest_registration_live_concurrency'`
-
-Result: **2 passed, 144 deselected**.
-
-`TEST=true TEST_DATABASE_URI='postgresql://quay:quay@localhost:5432/quay' PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_interface.py::test_repository_digest_registration_live_concurrency data/registry_model/test/test_interface.py::test_repository_manifest_digest_registration_live_concurrency`
-
-Result: **2 passed**.
-
-Existing SHA-256 registry protocol push, pull, and mount regressions:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings test/registry/registry_tests.py -k 'test_basic_push_pull_by_manifest or blob_mount'`
-
-Result: **255 passed, 1,204 deselected**.
-
-Targeted mypy:
-
-`.venv/bin/mypy data/model/oci/blob.py data/model/oci/manifest.py data/registry_model/interface.py data/registry_model/registry_oci_model.py endpoints/v2/manifest.py`
-
-Result: **passed**, no issues in five source files.
-
-### Story 14 tests
-
-Initial characterization from the Quay worktree:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/oci/test/test_oci_tag.py endpoints/v2/test/test_manifest.py endpoints/v2/test/test_blob.py -k story14`
-
-Result: **4 failed, 5 passed, 241 deselected**. Two failures demonstrated product gaps: an untagged registered artifact returned `MANIFEST_UNKNOWN`, and a deleted fallback index remained in a primed referrer cache. Two failures were test defects: one helper created a repository under a name different from the fixture helper's fixed lookup, and one assertion passed a database `Repository` row to an API expecting `RepositoryReference` after deletion had succeeded. After those test defects and the first production gaps were corrected, a later focused run exposed the additional product gap that native referrer hydration did not recheck deleted-artifact reachability. Code tracing and the corrected model characterization also confirmed that hidden lifecycle tags had to be included in deletion. The first attempted command was run from the planning directory and could not find `.venv/bin/python`; it did not execute tests.
-
-Final focused SQLite coverage:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/oci/test/test_oci_tag.py endpoints/v2/test/test_manifest.py endpoints/v2/test/test_blob.py -k story14`
-
-Result: **9 passed, 241 deselected**.
-
-Complete manifest and blob endpoint suites:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_manifest.py endpoints/v2/test/test_blob.py`
-
-Result: **153 passed**.
-
-Complete OCI tag model suite:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/oci/test/test_oci_tag.py`
-
-Result: **96 passed, 1 skipped**. The skip is an existing database-specific case.
-
-Complete registry interface suite:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_interface.py`
-
-Result: **120 passed, 2 skipped**. The skips remain the PostgreSQL-only registration races validated in Story 13.
-
-Focused PostgreSQL Story 14 coverage:
-
-`TEST=true TEST_DATABASE_URI='postgresql://quay:quay@localhost:5432/quay' PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/oci/test/test_oci_tag.py endpoints/v2/test/test_manifest.py endpoints/v2/test/test_blob.py -k story14`
-
-Result: **9 passed, 241 deselected**.
-
-Broad SHA-256 registry deletion, deleted-digest pull, push/pull, and mount regressions:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings test/registry/registry_tests.py -k 'test_delete_manifest or test_attempt_pull_by_manifest_digest_for_deleted_tag or test_basic_push_pull_by_manifest or blob_mount'`
-
-Result: **273 passed, 1,186 deselected**.
-
-Final SHA-256 registry deletion and deleted-digest pull selection after the last production adjustment:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings test/registry/registry_tests.py -k 'test_delete_manifest or test_attempt_pull_by_manifest_digest_for_deleted_tag'`
-
-Result: **18 passed, 1,441 deselected**.
-
-### Story 15 tests
-
-The first characterization command used the final focused selection but produced **3 test-defect failures and 75 deselections** because a reused manifest fixture helper is fixed to `devtable/newrepo`; it could not populate the differently named repositories. No production conclusion was drawn from that run. After correcting only test setup, the same selection produced **3 product failures, 1 pass, and 74 deselections**. Dedicated repository purge and both worker paths raised `peewee.IntegrityError: FOREIGN KEY constraint failed` while deleting `ImageStorage` referenced by `RepositoryBlobDigest`. The placeholder-storage namespace model case passed because existing storage cleanup deliberately defers placeholders.
-
-Final focused SQLite coverage:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/test/test_gc.py data/model/test/test_user.py workers/test/test_repositorygcworker.py workers/test/test_namespacegcworker.py -k story15`
-
-Result: **4 passed, 74 deselected**.
-
-Focused PostgreSQL coverage:
-
-`TEST=true TEST_DATABASE_URI='postgresql://quay:quay@localhost:5432/quay' PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/test/test_gc.py data/model/test/test_user.py workers/test/test_repositorygcworker.py workers/test/test_namespacegcworker.py -k story15`
-
-Result: **4 passed, 74 deselected**.
-
-Complete affected model and worker suites:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/test/test_gc.py data/model/test/test_user.py workers/test/test_repositorygcworker.py workers/test/test_namespacegcworker.py`
-
-Result: **78 passed**.
-
-Complete repository API endpoint and model-adapter suites:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/api/test/test_repository.py endpoints/api/test/test_repository_models_pre_oci.py`
-
-Result: **49 passed**.
-
-SHA-256 registry deletion regressions:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings test/registry/registry_tests.py -k 'test_delete_manifest or test_attempt_pull_by_manifest_digest_for_deleted_tag'`
-
-Result: **18 passed, 1,441 deselected**.
-
-### Story 16 tests
-
-The first three baseline commands were mistakenly launched from the planning directory. Each returned `/bin/bash: .venv/bin/python: No such file or directory`; no tests ran. The corrected baseline commands ran from the Quay worktree.
-
-Corrected pre-change baseline:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_blobuploader.py`
-
-Result: **2 failed, 29 passed**. Both failures were pre-existing test defects: the corrupt-state test assumed an initialized repository had zero digest registrations.
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings workers/blobuploadcleanupworker/test/test_blobuploadcleanupworker.py`
-
-Result: **8 passed**. The existing row-removal check did not assert its result, so this did not prove state deletion.
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_blob.py -k 'cancel or alternative_chunked_blob_upload_resume_and_pull or alternative_monolithic_upload_infers_algorithm_without_hint or final_sha256_is_authoritative'`
-
-Result: **6 passed, 54 deselected**.
-
-Initial Story 16 characterization before production changes:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_blobuploader.py -k story16`
-
-Result: **4 passed, 31 deselected**.
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings workers/blobuploadcleanupworker/test/test_blobuploadcleanupworker.py -k story16`
-
-Result: **2 failed, 1 passed, 8 deselected**. One failure demonstrated the product gap: the row and retry metadata disappeared after storage cancellation failed. The other was a test defect caused by attempting to hash `mock.call` objects.
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings endpoints/v2/test/test_blob.py -k story16`
-
-Result: **2 passed, 60 deselected**.
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings workers/test/test_chunkcleanupworker.py`
-
-Result: **1 passed**.
-
-After production correction, the same four selections passed with **4**, **4**, **2**, and **1** tests respectively. A later direct repository-deletion characterization produced **1 test-defect failure and 4 passes** because it bypassed Quay's required purge sequence and hit expected foreign-key protection. It was removed; repository purge removes the upload row before the repository, which is the same missing-row race already covered.
-
-Complete affected upload model, uploader, endpoint, and worker suites:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/test/test_blob.py data/model/test/test_model_blob.py data/registry_model/test/test_blobuploader.py endpoints/v2/test/test_blob.py workers/blobuploadcleanupworker/test/test_blobuploadcleanupworker.py workers/test/test_chunkcleanupworker.py`
-
-Result: **115 passed**.
-
-Complete storage suites:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings storage/test`
-
-Result: **159 passed**.
-
-Existing SHA-256 upload, finalization, cancellation, chunk, overlap, and resume regressions:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings test/registry/registry_tests.py -k 'test_basic_push_pull_by_manifest or test_cancel_upload or test_chunked_blob_uploading or test_chunked_uploading_mismatched_chunks or test_chunked_uploading_missing_first_chunk'`
-
-Result: **24 passed, 1,435 deselected**.
-
-Relevant PostgreSQL coverage:
-
-`TEST=true TEST_DATABASE_URI='postgresql://quay:quay@localhost:5432/quay' PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/test/test_blob.py data/model/test/test_model_blob.py data/registry_model/test/test_blobuploader.py endpoints/v2/test/test_blob.py workers/blobuploadcleanupworker/test/test_blobuploadcleanupworker.py workers/test/test_chunkcleanupworker.py -k 'story16 or cancel_upload or basic_upload_blob or blobupload_sha_state or blobuploadcleanupworker'`
-
-Result: **29 passed, 86 deselected**.
-
-After Black formatting, the final focused selection passed:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_blobuploader.py endpoints/v2/test/test_blob.py workers/blobuploadcleanupworker/test/test_blobuploadcleanupworker.py workers/test/test_chunkcleanupworker.py -k 'story16 or alternative_monolithic_upload_infers_algorithm_without_hint'`
-
-Result: **13 passed, 97 deselected**.
-
-#### Corrective static-review validation
-
-The first corrective command was launched without changing from the planning directory because the command runner did not honor a requested working-directory field. It returned `/bin/bash: .venv/bin/python: No such file or directory`; no tests ran. This was a validation-command defect.
-
-After correcting two characterization-test defects, the following pre-production command ran against `0ad37c8ec` plus tests only:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings workers/blobuploadcleanupworker/test/test_blobuploadcleanupworker.py data/model/test/test_gc.py -k 'story16_expiration_bounds_high_failure_cardinality or story16_expiration_tolerates_upload_disappearance_and_repeated_cleanup or story16_repository_purge_discards_upload_metadata_without_storage_cancellation'`
-
-Result: **2 failed, 1 passed, 53 deselected**. The product failures showed the growing `NOT IN` query and deletion of a replacement row selected by UUID; repository-purge characterization passed and showed the existing storage limitation.
-
-Corrective-run classifications:
-
-- **Product failures:** the unbounded exclusion query and UUID-based replacement-row deletion above; both are fixed.
-- **Test defects:** the first characterization tried to patch Peewee's immutable proxy and assumed a LocalStorage upload path while the fixture used FakeStorage; a later assertion assumed SQLite could not reuse a deleted integer primary key. Tests were corrected without weakening the contracts.
+- **Product failures:** repository-root correlated discovery, absent durable scanner retry state, and non-idempotent handling of an already-deleted Clair report. All are fixed.
+- **Test defects:** initial finder/scanner fixtures used a manifest helper fixed to `devtable/newrepo`, one invalid policy setter value was replaced with a direct fixture update, one legacy scanner fixture lacked an expired tag, and one SQL-shape assertion assumed SQLite `?` placeholders on PostgreSQL. These were corrected without weakening behavior.
+- **Validation-command defects:** the first baseline command ran from the planning directory and could not find `.venv/bin/python`; the first direct scanner API test command exposed the existing need to bootstrap `app` before importing that module. Neither was a product result.
+- **Formatting passes:** initial pre-commit passes reformatted Python and reordered imports; final pre-commit passed without changes.
 - **Environment failures:** none.
-- **Validation-command defects:** the first pytest invocation ran from the planning directory, and a standalone SQL-rendering probe used an uninitialized Peewee proxy. Neither executed product validation.
 
-Final focused corrective coverage:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/registry_model/test/test_blobuploader.py endpoints/v2/test/test_blob.py workers/blobuploadcleanupworker/test/test_blobuploadcleanupworker.py workers/test/test_chunkcleanupworker.py data/model/test/test_gc.py -k 'story16 or alternative_monolithic_upload_infers_algorithm_without_hint'`
-
-Result: **16 passed, 139 deselected**.
-
-Complete affected upload-model, repository-GC characterization, uploader, endpoint, and worker suites:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/test/test_blob.py data/model/test/test_model_blob.py data/model/test/test_gc.py data/registry_model/test/test_blobuploader.py endpoints/v2/test/test_blob.py workers/blobuploadcleanupworker/test/test_blobuploadcleanupworker.py workers/test/test_chunkcleanupworker.py`
-
-Result: **160 passed**.
-
-Complete storage suites:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings storage/test`
-
-Result: **159 passed**.
-
-Existing SHA-256 upload, finalization, cancellation, chunk, overlap, and resume regressions:
-
-`TEST=true PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings test/registry/registry_tests.py -k 'test_basic_push_pull_by_manifest or test_cancel_upload or test_chunked_blob_uploading or test_chunked_uploading_mismatched_chunks or test_chunked_uploading_missing_first_chunk'`
-
-Result: **24 passed, 1,435 deselected**.
-
-Focused PostgreSQL cursor, constant-query-shape, fixed-cutoff, retry, race, and repository-purge coverage:
-
-`TEST=true TEST_DATABASE_URI='postgresql://quay:quay@localhost:5432/quay' PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings workers/blobuploadcleanupworker/test/test_blobuploadcleanupworker.py data/model/test/test_gc.py -k 'story16_expiration_bounds_high_failure_cardinality or story16_expiration_uses_fixed_stale_cutoff or story16_expiration_retries_storage_failure_before_discarding_state or story16_expiration_tolerates_upload_disappearance_and_repeated_cleanup or story16_repository_purge_discards_upload_metadata_without_storage_cancellation'`
-
-Result: **5 passed, 52 deselected**.
-
-Broader relevant PostgreSQL coverage:
-
-`TEST=true TEST_DATABASE_URI='postgresql://quay:quay@localhost:5432/quay' PYTHONPATH=. .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/test/test_blob.py data/model/test/test_model_blob.py data/model/test/test_gc.py data/registry_model/test/test_blobuploader.py endpoints/v2/test/test_blob.py workers/blobuploadcleanupworker/test/test_blobuploadcleanupworker.py workers/test/test_chunkcleanupworker.py -k 'story16 or cancel_upload or basic_upload_blob or blobupload_sha_state or blobuploadcleanupworker'`
-
-Result: **32 passed, 128 deselected**. After the final deterministic-order assertion, the complete corrective worker Story 16 selection passed on PostgreSQL with **6 passed, 8 deselected**; the same selection passed on SQLite with **6 passed, 8 deselected**.
-
-No live validation was repeated. The existing live Story 16 run already proved successful targeted expiration against the real worker and local storage. Reproducing broad storage failure safely would require injected faults and many deliberately stale uploads, for which the isolated SQLite and PostgreSQL query-shape tests provide stronger evidence without risking unrelated local uploads.
-
-### Static checks
-
-Story 16's first pre-commit pass reformatted `workers/blobuploadcleanupworker/test/test_blobuploadcleanupworker.py` with Black, so that pass correctly returned nonzero. The final pass over every changed Quay file passed without changes.
-
-Story 16 targeted mypy:
-
-`.venv/bin/mypy data/model/blob.py workers/blobuploadcleanupworker/blobuploadcleanupworker.py workers/blobuploadcleanupworker/models_interface.py workers/blobuploadcleanupworker/models_pre_oci.py`
-
-Result: **passed**, no issues in four source files.
-
-Story 16 compilation and whitespace:
-
-`.venv/bin/python -m compileall -q data/model/blob.py data/registry_model/test/test_blobuploader.py endpoints/v2/test/test_blob.py workers/blobuploadcleanupworker/blobuploadcleanupworker.py workers/blobuploadcleanupworker/models_interface.py workers/blobuploadcleanupworker/models_pre_oci.py workers/blobuploadcleanupworker/test/test_blobuploadcleanupworker.py workers/test/test_chunkcleanupworker.py && git diff --check && git diff --check upstream/master`
-
-Result: **passed**.
-
-The first corrective pre-commit command returned nonzero only because Black reformatted `models_pre_oci.py` and the worker test, and isort reordered the GC-test imports:
-
-`.venv/bin/pre-commit run --files data/model/blob.py data/model/test/test_gc.py workers/blobuploadcleanupworker/blobuploadcleanupworker.py workers/blobuploadcleanupworker/models_interface.py workers/blobuploadcleanupworker/models_pre_oci.py workers/blobuploadcleanupworker/test/test_blobuploadcleanupworker.py`
-
-The final command over every corrective Quay file, with `HANDOFF.md` added to the same file list, passed without changes.
-
-Corrective targeted mypy:
-
-`.venv/bin/mypy data/model/blob.py workers/blobuploadcleanupworker/blobuploadcleanupworker.py workers/blobuploadcleanupworker/models_interface.py workers/blobuploadcleanupworker/models_pre_oci.py`
-
-Result: **passed**, no issues in four source files.
-
-Corrective compilation and whitespace:
-
-`.venv/bin/python -m compileall -q data/model/blob.py data/model/test/test_gc.py workers/blobuploadcleanupworker/blobuploadcleanupworker.py workers/blobuploadcleanupworker/models_interface.py workers/blobuploadcleanupworker/models_pre_oci.py workers/blobuploadcleanupworker/test/test_blobuploadcleanupworker.py && git diff --check && git diff --check upstream/master`
-
-Result: **passed**.
-
-Pre-commit passed over every Story 8 target-worktree file. Earlier passes reformatted Python with Black; the final pass made no changes.
-
-Targeted mypy:
-
-`.venv/bin/mypy data/cache/cache_key.py data/model/oci/manifest.py data/registry_model/registry_oci_model.py endpoints/v2/manifest.py endpoints/v2/referrers.py`
-
-Result: **passed**, no issues in five source files.
-
-Compilation and whitespace:
-
-`.venv/bin/python -m compileall -q data/cache/cache_key.py data/cache/test/test_cache.py data/model/oci/manifest.py data/registry_model/registry_oci_model.py data/registry_model/test/test_interface.py endpoints/v2/manifest.py endpoints/v2/referrers.py endpoints/v2/test/test_manifest.py && git diff --check && git diff --check master`
-
-Result: **passed**.
-
-Story 10 pre-commit passed for `endpoints/v2/test/test_manifest.py` after the first Black pass reformatted the file. Python compilation and `git diff --check` also passed.
-
-Story 13 pre-commit passed for every changed Quay file after the first pass reformatted five Python files. Python compilation and `git diff --check` passed.
-
-Story 14 pre-commit passed for all six changed Quay files. The first virtual-environment run reformatted `endpoints/v2/test/test_blob.py`; the final run made no changes. A prior invocation through the shell `PATH` did not run because `pre-commit` was unavailable there.
-
-Story 14 targeted mypy:
-
-`.venv/bin/mypy data/model/oci/tag.py data/registry_model/registry_oci_model.py endpoints/v2/manifest.py`
-
-Result: **passed**, no issues in three source files.
-
-Story 14 compilation and whitespace:
-
-`.venv/bin/python -m compileall -q data/model/oci/tag.py data/model/oci/test/test_oci_tag.py data/registry_model/registry_oci_model.py endpoints/v2/manifest.py endpoints/v2/test/test_blob.py endpoints/v2/test/test_manifest.py && git diff --check && git diff --check master`
-
-Result: **passed**.
-
-Story 15 pre-commit passed over all six changed Quay files. The first run reformatted and reordered imports in the five Python files; the final run made no changes.
-
-Story 15 targeted mypy:
-
-`.venv/bin/mypy data/model/gc.py`
-
-Result: **passed**, no issues in the production file.
-
-Story 15 compilation and whitespace:
-
-`.venv/bin/python -m compileall -q data/model/gc.py data/model/test/test_gc.py data/model/test/test_user.py workers/test/test_namespacegcworker.py workers/test/test_repositorygcworker.py && git diff --check && git diff --check upstream/master`
-
-Result: **passed**.
-
-## Live Story 8 validation
-
-The running local Quay container was bind-mounted from the target worktree. `REFERRERS_API` was enabled and the active allowlist was `['sha256', 'sha384', 'sha512']`.
-
-The final successful repository was `localhost:8080/testuser/pqc-story8-1fff541c`; isolation was checked against `testuser/pqc-story8-1fff541c-other`.
-
-Key identities:
-
-- Subject SHA-384: `sha384:8fb7cf51f5221ee322067a3c70dd73f718d0a999a1f4a0a4d1a89bbe409da8cd534acc2bc42ca7d738c2eed4506e3b59`
-- Subject SHA-512: `sha512:722558fc07e5c2d82f47739d74f71fe04814832c9cd31e00a2e3139bb35d7b0f5ac3ed522f90501d12e0a87d39a137cc23ea13c859391332a1fbc567d2125b68`
-- Hidden subject SHA-256: `sha256:f559c30eefea1de04aa122544e1a5ac85cf67d57bb8b3bddb0cd70098eec2b11`
-- Native artifact SHA-384: `sha384:4a4a382ffd22e7b9b6e294db2543cf7480c0f0f23ff1329d0cdb9cbb5570ff7705ea6dc1bbed6475e9fd5d7fc089f44a`
-- Native artifact SHA-512 alias: `sha512:a2a78ebc8252a1e87c198667c4bd4de3ed3fad77bda40704e4ff892f01f1c1739a7140dad24511841c7e5497134cd18a1b9a2d90cf751b0be39ef6ba75e8cf2b`
-- Fallback artifact SHA-512: `sha512:62a76e7af3ab625507ec368483b33133d37ec30fe78232e7b15b27cd94e1882ae499b09edb0b56119561e71498c5712f1d36cfc2e32b537efb5976432d9e6865`
-
-Live outcomes:
-
-- Empty filtered and unfiltered caches were primed through both subject aliases before artifact publication.
-- Native artifact publication refreshed both aliases immediately.
-- SHA-384 and SHA-512 fallback indexes published successfully, including the 135-character SHA-512 fallback tag.
-- Both subject aliases returned byte-for-byte identical two-descriptor responses. The response SHA-256 was `df2c550ff7ba73e7342a85b55af85d978b74d951e9fd8c7e8eb7f9d7f2f04779`.
-- Native/fallback overlap deduplicated to one native descriptor. The native descriptor selected SHA-384 deterministically; the fallback-only descriptor selected SHA-512.
-- Descriptor size, media type, and `artifactType` matched exact artifact bytes.
-- Signature, SBOM, and missing filters returned the expected descriptors and `OCI-Filters-Applied` header.
-- GET and HEAD through returned identities returned exact artifact bytes, content lengths, media types, and digest headers.
-- Hidden canonical subject GET returned HTTP 404 `MANIFEST_UNKNOWN`; referrer query returned HTTP 400 `MANIFEST_INVALID`.
-- A fallback tag built from hidden canonical SHA-256 was not included in discovery.
-- The cross-repository subject alias returned HTTP 400 `MANIFEST_INVALID`.
-- An unauthenticated referrer request returned HTTP 401.
-- Read-only database inspection confirmed canonical SHA-256 artifact and subject storage with repository-scoped SHA-384/SHA-512 registrations.
-
-The first live attempt failed because the temporary script supplied an invalid OCI image config; that was a validation-script defect. The second attempt identified the real 128-character route limit for SHA-512 fallback tags. The final flow passed after the narrow route fix. Live repositories were not deleted because lifecycle cleanup is outside Story 8.
-
-## Live Story 10 validation
-
-The local Quay container was bind-mounted from the target worktree and used `ALLOWED_HASH_ALGORITHMS: ['sha256', 'sha384', 'sha512']`. `regctl` 0.11.5 copied the existing source `localhost:8080/testuser/pqc-story4:sha512` to `localhost:8080/testuser/pqc-story10-1788297397:copy` on the same deployment with forced recursive traversal.
-
-Live outcomes:
-
-- Source and destination returned the same SHA-512 root: `sha512:0bd23dcfecb44322dd952511fc3c392f2eb652f3eb6dac7c352156a43b782a957b8cf23b26633bffc66c56acbdb82e6f805501661cd55b011e01673a4a72963c`.
-- Source and destination root manifest bytes were identical.
-- Independent hashing verified 52 unique objects: one index, 17 child manifests, 17 configurations, and 17 layers.
-- The destination had 18 SHA-512 manifest registrations and 34 SHA-512 blob registrations.
-- Every destination blob registration referenced the same `ImageStorage` row as its source registration. No copied blob required another physical object.
-- The unregistered canonical SHA-256 root and a sampled canonical SHA-256 blob remained inaccessible at the destination.
-
-The first live health probe hung while the long-running local container was otherwise present. Restarting only `quay-quay` restored service. The first read-only database inspection script omitted application initialization and failed before querying; the corrected script passed. These were environment and validation-script issues, not copy failures. The live repository was not deleted because repository cleanup remains later lifecycle work.
-
-## Live Story 13 validation
-
-The running `quay-quay` container was bind-mounted from the target worktree. After one restart repaired an unhealthy local service key and loaded the changed code, instance health returned HTTP 200 and the active allowlist was SHA-256, SHA-384, and SHA-512.
-
-A fresh OCI single manifest and its configuration and layer were published to `localhost:8080/testuser/pqc-story13-live:legacy`. The three SHA-256 registration rows were then removed directly from the dedicated local validation repository to simulate content predating the registration tables.
-
-Key identities:
-
-- Manifest SHA-256: `sha256:79503b66a3368375691e60ce9466ec219eb0623630ee0396ffaab554aca12e96`
-- Configuration SHA-256: `sha256:1469859180c47a3ef84f3c0e939ca79282ad0875c07eb5190f1ef01653d2c1de`
-- Layer SHA-256: `sha256:d7f71ce14f226b9d64143dad86d197fbc60588fe837ef13dcc5e11172b805321`
-- Manifest SHA-512: `sha512:fa35dee192b657c691347a52b07ba35c7ee11432431666473a620bbb3048a8cebe6c664d3f6b66b28c245f03a1aaf4779565b6534098ddc1ce69bdae91ac472a`
-- Configuration SHA-512: `sha512:615023b5bdc18c85f3de512d279b3748cb40219348abdd2188d0b66b6fddbf13dece2a8557ab28a26a01c3cb72bab703e285237a027f49d069c406854a961b9b`
-- Layer SHA-512: `sha512:7619b0352ead07abc02f1fb67c8132ca0a48a636850361bc8aced4e27e14b010dc83e3404f983429c34c649fb3d63e5dc7093fb3aa861dcc27129bd0414f8746`
-
-Live outcomes:
-
-- Tag and canonical digest manifest GET/HEAD returned HTTP 200, exact bytes, media type, and canonical digest headers.
-- Configuration and layer GET/HEAD returned HTTP 200, exact bytes, lengths, and canonical digest headers.
-- Repeated requests produced exactly one manifest and two blob SHA-256 registrations with the expected canonical mappings.
-- Manifest and blob GET/HEAD in an unrelated existing repository returned HTTP 404 and created no registration there.
-- SHA-512 blob uploads and digest-addressed manifest publication added alternative registrations while both canonical SHA-256 identities remained readable.
-- With SHA-256 removed from the active allowlist, canonical manifest and blob GET/HEAD returned HTTP 400 `UNSUPPORTED` with `reason: disabled`; SHA-512 GET/HEAD remained HTTP 200; and the legacy tag selected the enabled SHA-512 identity.
-- Database inspection while disabled still showed two manifest registrations and four blob registrations. Canonical rows and bytes were not deleted.
-- The configuration file was restored byte-for-byte, Quay was restarted, health returned HTTP 200, canonical manifest and blob access returned HTTP 200, and the tag again preferred SHA-256.
-- Unauthenticated manifest and blob requests returned HTTP 401. Malformed SHA-256 returned HTTP 400 `DIGEST_INVALID/malformed`. Unknown canonical values returned `MANIFEST_UNKNOWN` or `BLOB_UNKNOWN` with HTTP 404.
-
-The first `regctl` copy attempts returned unauthorized because the running stack's service key was unhealthy; a direct request confirmed `Unknown service key`, and restarting only `quay-quay` repaired the environment. Three temporary validation commands were also defective: the first SQL query used the nonexistent `quayuser` table instead of quoted `user`, one `psql -c` command incorrectly expected variable interpolation, and the first HEAD loop used `curl -X HEAD`, which waited for a body. Corrected commands passed. These were environment or validation-script failures, not product test failures. The dedicated live repository and two empty repositories from the failed copy attempts were not deleted because repository cleanup is outside Story 13.
-
-## Live Story 14 validation
-
-The running `quay-quay` container was bind-mounted from the target worktree. Instance health returned HTTP 200 and the initial allowlist was SHA-256, SHA-384, and SHA-512. The dedicated repository was `localhost:8080/testuser/pqc-story14-live-1788331630`.
-
-Key identities:
-
-- Subject SHA-512: `sha512:067885a63490613fce2dc53160df716bb9250ff1a6aa9f0339c0ae948eaabd87a5eb7c5cfe0d80b2e5140943e697b27624980642153c766bfcf52402d98ee563`
-- Native artifact SHA-512: `sha512:41821b2e957a31e19c0e27e4cfbd7243b9e933fd6c1b9b54e12b7a0c34a8d90153080ebba90d233f449994ee7d3807859d03c75e4504b45c62b52ac8b2893b3f`
-- Native artifact SHA-384 alias: `sha384:49b5eb7722d6de746bddf6b572e7ccb17aad4cd89d4994c3e420ff11a3729518969ecd40ce221c28d7d269ffbb1b05b4`
-- Fallback-only artifact SHA-384: `sha384:c106fbe1acdc0031eaf2843446242a0b3aa4d041588bdee851ee7a37adc9c56b3168204ade23e81ad6a4889c2d2ba753`
-- Fallback index SHA-512: `sha512:04fc6c6f2253a362ba96bc1482cfd0953ba0bbc795f39a9bc5c60405dbed49ff879e0b6d5a527856be001061b8781292d908fab9187d5f4f6415e3cd2cd616ba`
-- Sample registered blob SHA-512: `sha512:2cad476a6a6a68bb7e0319ab26f8d5c0e74fdbe0e3b4da7f6022ba605994eafd15b53e5343e669f42c87ab7fb7cb6e7fe734a4f9fd1bbeea6f932a9506f3c7a7`
-
-Live outcomes:
-
-- A tagged SHA-512 subject, untagged native artifact with SHA-512 and SHA-384 identities, untagged fallback-only SHA-384 artifact, and SHA-512 fallback index were published successfully.
-- Two identical referrer requests primed the cache and returned exactly the native SHA-512 artifact and fallback-only SHA-384 artifact.
-- SHA-512 was removed temporarily from the active allowlist. While disabled, deleting the native artifact and fallback index through their SHA-512 identities each returned HTTP 202.
-- Blob DELETE through the disabled registered SHA-512 identity returned HTTP 405 `UNSUPPORTED`, and a SHA-512 manifest GET returned the expected HTTP 400 disabled error.
-- The configuration was restored byte-for-byte to SHA-256 `4de46dadfc727018452ddd490056beb5f5af736e1d0f5751cb8ddb942430731f`, Quay restarted, and health returned HTTP 200.
-- After restore, native artifact GET/HEAD through SHA-512 and SHA-384 and fallback-index GET/HEAD through SHA-512 returned HTTP 404. The fallback tag returned HTTP 404. Referrer discovery returned an empty descriptor list from the previously primed cache path.
-- The subject, fallback-only artifact, and sample blob remained readable through their registered identities, proving deletion was scoped and blob DELETE did not mutate content.
-- Read-only PostgreSQL inspection showed canonical SHA-256 manifests with repository registrations retained. The deleted native artifact and fallback index had zero alive tags; the subject and fallback-only artifact each had one. Six blob registrations, six recent-upload links, and six manifest-blob links remained.
-
-Container restarts produced transient connection resets and one three-second readiness-probe timeout before health returned 200; no registry operation failed. The first read-only `psql -c` command incorrectly assumed client-variable expansion and failed before querying; the corrected literal-safe command passed. This was a validation-script defect, not a product failure. The live repository was not deleted because repository cleanup is Story 15.
-
-## Live Story 15 validation
-
-The running `quay-quay` container was bind-mounted from the target worktree. Instance health returned HTTP 200, and local PostgreSQL was accepting connections. Two pre-existing disposable repositories were purged through the real `mark_repository_for_deletion` and `RepositoryGCWorker._perform_gc` path.
-
-- `testuser/pqc-story14-live-1788331630` had five manifest registrations and six blob registrations before marking. Marking retained all registrations. Worker purge removed the repository and all eleven target rows while leaving every unrelated manifest and blob registration count unchanged.
-- The Story 14 purge attempted existing security-scanner report cleanup, but the optional local scanner at `localhost:6000` was unavailable. The existing cleanup code logged and tolerated those environment failures; repository and registration cleanup completed.
-- `testuser/pqc-story5-destination-01a05e37` had one blob registration pointing to canonical `ImageStorage` shared with another repository. Marking retained it. Worker purge removed the target repository and registration, preserved every unrelated registration, preserved the other repository's registration, and retained the shared canonical SHA-256 storage row.
-- Queue rows created by the direct validation scripts were removed after synchronous worker invocation.
-
-The first read-only repository inventory script called the guarded `FullIndexedCharField.startswith` operation and failed before querying. The corrected script used `match_prefix` and passed. This was a validation-script defect. Later five-second and fifteen-second health probes timed out while the container remained running; restarting only `quay-quay` restored HTTP 200 health on the sixth two-second retry. This was a local environment failure after the successful registry cleanup, not a product-test failure. No live namespace was destroyed; the namespace worker path passed against both SQLite and PostgreSQL test databases.
-
-## Live Story 16 validation
-
-The running `quay-quay` container was bind-mounted from the target worktree. Instance health returned HTTP 200, local PostgreSQL was healthy, and the active allowlist was SHA-256, SHA-384, and SHA-512. Before the test, PostgreSQL contained zero `BlobUpload` rows and zero uploads older than the two-day cleanup threshold, so invoking expiration after aging only the dedicated upload was safe.
-
-The dedicated repository was `localhost:8080/testuser/pqc-story16-live-1788335016`. Four chunked sessions were created: a SHA-512 finalization session, SHA-384 cancellation session, SHA-512 expiration session, and unrelated active SHA-384 session. Read-only PostgreSQL inspection after the chunks showed all four rows with non-null requested hash state and storage metadata, with byte counts 21, 25, 23, and 31 respectively.
-
-Key identities:
-
-- Requested SHA-512: `sha512:f2cc8db58e36410acf437557b30f7d19e5f14f5aa60141ce6cb89637bdaed84807c7d92bb5b68bd8a25ae837f6830106c0d8fd0202dc1552cb7979dbe5d4f2d4`
-- Canonical SHA-256: `sha256:a6be1b18cc1f2272cdfc292b9d6cc2471a075ee264f16ec17d1a122687514f5a`
-
-Live outcomes:
-
-- The SHA-512 upload finalized from a second chunk with HTTP 201. Its upload row disappeared, one canonical SHA-256 `ImageStorage` row and one requested SHA-512 repository registration existed, and exact GET bytes independently hashed to the requested SHA-512 value.
-- The SHA-384 upload canceled with HTTP 204 and its row, requested state, metadata, and temporary upload disappeared.
-- The dedicated SHA-512 abandoned upload was aged by 60 days only after confirming no unrelated stale upload existed. Direct invocation of the real `BlobUploadCleanupWorker._cleanup_uploads` removed its row and local temporary upload.
-- The unrelated fresh SHA-384 row and non-null requested state remained after expiration. It was then canceled normally, leaving no dedicated live upload rows.
-- The finalized canonical row, requested registration, exact bytes, unrelated content, and instance health remained intact throughout cleanup.
-
-One initial container configuration inspection used `podman exec` without stdin attachment and printed no output. The corrected `python -c` command showed the three-algorithm allowlist. This was a validation-command defect, not a product failure. No configuration was changed. The dedicated finalized repository remains for inspection.
-
-## Active limitations and deferred work
-
-- Proxy cache, repository mirroring, organization mirroring, external image import, and all related external-registry or live interoperability validation are explicitly deferred until reassigned.
-- Story 9 remains unimplemented. A partial Story 9 attempt was fully reverted before this handoff update.
-- Complete-image copy is supported only between normal repositories managed by the same Quay deployment while the external-registry deferral is active. Artifact-copy and referrer-copy variations remain unvalidated.
-- Builds, Clair, UI, garbage collection, conformance, and operational tooling remain later stories.
-- Full blob unlink, ordinary registration-aware garbage collection, and physical orphan cleanup remain lifecycle work. Upload cancellation and expiration remove requested hash state and retry failed targeted storage cleanup. Repository and namespace purge still bulk-delete upload rows without targeted cancellation, so they discard hash state and storage metadata while temporary upload chunks can remain for storage-wide partial-upload cleanup or later physical-orphan recovery. Changing deletion storage orchestration remains outside Story 16.
-- Story 14 expires manifest lifecycle tags but intentionally leaves registrations, canonical rows, graph links, and bytes until repository deletion or later garbage collection. Arbitrary blob DELETE remains unsupported.
-- PostgreSQL blob and manifest registration races passed again in Story 13; MySQL concurrency remains unrun.
-- SHA-384 resumable hashing passed on local macOS arm64 and an existing Linux aarch64 image. Clean Linux builds, Linux x86_64 packaging, and cross-architecture resume remain unproven.
-- Podman and Skopeo rejected SHA-384 manifest pulls client-side in earlier tests; client interoperability remains tool-specific.
-- No OCI Distribution conformance, broad client matrix, mixed-version, mixed-region, object-storage, replication, performance, or production-readiness claim is made.
-- Deferred items D1-D8 remain deferred unless explicitly reassigned.
-
-## Recommended next story
-
-Proceed with **Story 17: garbage-collect unreferenced digest registrations and canonical content**.
-
-Start with characterization of ordinary manifest and blob garbage collection after tags and temporary `UploadedBlob` links expire. Prove registration-removal ordering, shared canonical-content preservation, retries, concurrency, and repository isolation. Keep physical orphan recovery, Docker schema 1 alternative identities, and deferred integrations outside Story 17 unless the tracker is deliberately revised.
+## Final validation evidence
+
+All commands ran from `/Users/shossain/QuayWorkspace/shaon-feature-PQC` with `TEST=true PYTHONPATH=.` unless shown otherwise.
+
+- Focused Story 17 SQLite: `.venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/test/test_gc.py -k story17` — **17 passed, 43 deselected**.
+- Focused Story 17 PostgreSQL: `TEST_DATABASE_URI='postgresql://quay:quay@localhost:5432/quay' .venv/bin/python -m pytest -q --tb=short --disable-warnings data/model/test/test_gc.py -k story17` — **17 passed, 43 deselected**.
+- GC/repository/namespace model and worker group: `data/model/test/test_gc.py data/model/test/test_repository.py data/model/test/test_user.py workers/gc/test/test_gcworker.py workers/test/test_repositorygcworker.py workers/test/test_namespacegcworker.py` — **114 passed**.
+- Storage: `storage/test` — **159 passed**.
+- Quota model/workers: the seven `data/model/test/test_*quota*.py` files plus the three quota worker test files — **104 passed**.
+- Scanner model/interface: `data/secscan_model/test` — **113 passed**.
+- Clair API: `util/secscan/v4/test/test_v4_api.py` — **17 passed**.
+- Manifest/blob endpoints: `endpoints/v2/test/test_manifest.py endpoints/v2/test/test_blob.py` — **155 passed**.
+- Repository API/model adapters: `endpoints/api/test/test_repository.py endpoints/api/test/test_repository_models_pre_oci.py` — **49 passed**.
+- OCI manifest/tag models: `data/model/oci/test/test_oci_manifest.py data/model/oci/test/test_oci_tag.py` — **120 passed, 1 existing skip**.
+- Registry interface: `data/registry_model/test/test_interface.py` — **120 passed, 2 expected SQLite skips for PostgreSQL-only races**.
+- Registration migration: `data/migrations/test/test_repository_digest_registration.py` — **2 passed**.
+- Story 14 focused SQLite/PostgreSQL: OCI tag plus manifest/blob endpoint files with `-k story14` — **9 passed** on each database.
+- Story 15 focused SQLite/PostgreSQL: GC/user and repository/namespace worker files with `-k story15` — **4 passed** on each database.
+- Story 16 final focused SQLite: uploader/blob endpoint/upload worker/chunk worker/GC files with `-k 'story16 or alternative_monolithic_upload_infers_algorithm_without_hint'` — **16 passed**.
+- Story 16 focused PostgreSQL cursor/race/retry selection — **5 passed**.
+- Broad SHA-256 deletion, deleted-digest pull, push/pull, and mount selection: `test/registry/registry_tests.py -k 'test_delete_manifest or test_attempt_pull_by_manifest_digest_for_deleted_tag or test_basic_push_pull_by_manifest or blob_mount'` — **273 passed, 1,186 deselected**.
+- Five repeated finder runs selecting `test_has_garbage` and the mount-only Story 17 finder test — **2 passed** per run.
+- Targeted mypy: `data/model/gc.py data/model/storage.py data/model/oci/tag.py util/secscan/v4/api.py workers/gc/gcworker.py` — **passed**.
+- Python compilation over every changed Python file — **passed**.
+- `git diff --check` and `git diff --check upstream/master` — **passed**.
+- Pre-commit over every changed Python file — **passed without changes** after the recorded formatting passes.
+
+No destructive live GC was run. The shared local instance still contains retained validation repositories and potentially unrelated data; isolated PostgreSQL tests and read-only plan inspection provide the required database evidence without risking them.
+
+## Scope and remaining risks
+
+- No schema, migration, index, configuration, physical-storage inventory, or physical-orphan repair was added.
+- Physical storage with no database record remains Story 18.
+- Proxy cache, mirroring, imports, Docker schema 1 alternative identities, API/UI, builds, events, Clair report lookup, and operational tooling remain unchanged.
+- Stories 9, 11, and 12 remain Deferred. D1-D8 remain unchanged.
+- The finder deliberately trades one-pass exhaustive discovery for a fixed amount of indexed work. Sparse ID ranges can delay a candidate until a later 30-second pass; they cannot cause deletion of live content.
+- Duplicate scanner tasks are safe because global references are rechecked and Clair report deletion is idempotent. A prolonged scanner outage grows the durable queue with deleted manifest identities; retries remain bounded per worker pass but require scanner recovery to drain.
+- MySQL concurrency remains outside the local PostgreSQL validation boundary.
+
+## Completion checklist
+
+- [x] Preserve existing work and create only the corrective session's planning task section.
+- [x] Set Planning Story 17 to In progress before corrective production changes.
+- [x] Rerun the untouched SQLite and PostgreSQL baseline.
+- [x] Add failing finder-scale/query-shape characterization.
+- [x] Implement bounded source-driven discovery and obtain a safe read-only PostgreSQL plan.
+- [x] Add failing scanner API characterization and implement durable, idempotent, cross-repository-safe retries using existing persistence.
+- [x] Add reachability-recheck coverage and run it on PostgreSQL.
+- [x] Run every required focused, affected, regression, typing, compilation, whitespace, and pre-commit group.
+- [x] Keep Story 18 physical-orphan recovery out of scope.
+- [x] Update this handoff and restore Planning Story 17 to Done only after corrective completion.
+
+Story 17 is **Done** under the local definition of done. Story 18 may be planned next, but should start only after this corrective pass is accepted.

@@ -1190,24 +1190,128 @@ def test_get_cached_repo_blob(registry_model):
             )
 
 
-def test_create_manifest_and_retarget_tag(registry_model):
+def _schema1_manifest_for_retarget_tracking(registry_model, tag_name):
     repository_ref = registry_model.lookup_repository("devtable", "simple")
     latest_tag = registry_model.get_repo_tag(repository_ref, "latest")
     manifest = registry_model.get_manifest_for_tag(latest_tag).get_parsed_manifest()
 
-    builder = DockerSchema1ManifestBuilder("devtable", "simple", "anothertag")
+    builder = DockerSchema1ManifestBuilder("devtable", "simple", tag_name)
     builder.add_layer(manifest.blob_digests[0], '{"id": "%s"}' % "someid")
     sample_manifest = builder.build(docker_v2_signing_key)
     assert sample_manifest is not None
+    return repository_ref, sample_manifest
 
-    another_manifest, tag = registry_model.create_manifest_and_retarget_tag(
-        repository_ref, sample_manifest, "anothertag", storage, verify_quota=True
+
+def test_create_manifest_and_retarget_tag(registry_model):
+    repository_ref, sample_manifest = _schema1_manifest_for_retarget_tracking(
+        registry_model, "anothertag"
     )
+
+    with patch.object(
+        model_cache.repo_modification_tracker, "mark_repo_modified"
+    ) as mark_repo_modified:
+        another_manifest, tag = registry_model.create_manifest_and_retarget_tag(
+            repository_ref,
+            sample_manifest,
+            "anothertag",
+            storage,
+            verify_quota=True,
+        )
+
     assert another_manifest is not None
     assert tag is not None
-
     assert tag.name == "anothertag"
     assert another_manifest.get_parsed_manifest().manifest_dict == sample_manifest.manifest_dict
+    mark_repo_modified.assert_called_once_with("devtable", "simple")
+
+
+def test_create_manifest_and_retarget_tag_multiple_tags_marks_once(registry_model):
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+    sample_manifest = _create_schema2_manifest_with_labels(repository_ref, {})
+    tag_names = ["another-tag-1", "another-tag-2", "another-tag-3"]
+
+    with patch.object(
+        model_cache.repo_modification_tracker, "mark_repo_modified"
+    ) as mark_repo_modified:
+        created_manifest, tag = registry_model.create_manifest_and_retarget_tag(
+            repository_ref,
+            sample_manifest,
+            tag_names[0],
+            storage,
+            additional_tag_names=tag_names[1:],
+        )
+
+    assert created_manifest is not None
+    assert tag is not None
+    assert tag.name == tag_names[0]
+    assert all(registry_model.get_repo_tag(repository_ref, name) for name in tag_names)
+    mark_repo_modified.assert_called_once_with("devtable", "simple")
+
+
+def test_create_manifest_and_retarget_tag_without_tracker(registry_model):
+    repository_ref, sample_manifest = _schema1_manifest_for_retarget_tracking(
+        registry_model, "no-tracker"
+    )
+
+    with patch.object(model_cache, "repo_modification_tracker", None):
+        created_manifest, tag = registry_model.create_manifest_and_retarget_tag(
+            repository_ref, sample_manifest, "no-tracker", storage
+        )
+
+    assert created_manifest is not None
+    assert tag is not None
+
+
+def test_create_manifest_and_retarget_tag_ignores_tracker_failure(registry_model):
+    repository_ref, sample_manifest = _schema1_manifest_for_retarget_tracking(
+        registry_model, "tracker-failure"
+    )
+    tracker = MagicMock()
+    tracker.mark_repo_modified.side_effect = RuntimeError("Redis unavailable")
+
+    with patch.object(model_cache, "repo_modification_tracker", tracker):
+        created_manifest, tag = registry_model.create_manifest_and_retarget_tag(
+            repository_ref, sample_manifest, "tracker-failure", storage
+        )
+
+    assert created_manifest is not None
+    assert tag is not None
+    tracker.mark_repo_modified.assert_called_once_with("devtable", "simple")
+
+
+def test_create_manifest_commit_failure_does_not_mark_repository(registry_model):
+    if db.transaction_depth() > 0:
+        pytest.skip("the PostgreSQL fixture owns the top-level transaction commit")
+
+    repository_ref, sample_manifest = _schema1_manifest_for_retarget_tracking(
+        registry_model, "commit-failure"
+    )
+    previous_transaction_factory = db_transaction.obj
+    db_transaction.initialize(lambda: db.transaction())
+    try:
+        with (
+            patch.object(
+                model_cache.repo_modification_tracker, "mark_repo_modified"
+            ) as mark_repo_modified,
+            patch.object(db.obj, "commit", side_effect=RuntimeError("forced commit failure")),
+            pytest.raises(RuntimeError, match="forced commit failure"),
+        ):
+            registry_model.create_manifest_and_retarget_tag(
+                repository_ref, sample_manifest, "commit-failure", storage
+            )
+    finally:
+        db_transaction.initialize(previous_transaction_factory)
+
+    mark_repo_modified.assert_not_called()
+    assert registry_model.get_repo_tag(repository_ref, "commit-failure") is None
+    assert (
+        not Manifest.select()
+        .where(
+            Manifest.repository == repository_ref.id,
+            Manifest.digest == sample_manifest.digest,
+        )
+        .exists()
+    )
 
 
 def test_create_manifest_and_retarget_tag_with_quota(registry_model):

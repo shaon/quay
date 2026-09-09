@@ -317,13 +317,41 @@ class TestRegistryProxyModelCreateManifestAndRetargetTag:
             self.upstream_repository,
             self.user,
         )
-        manifest, tag = proxy_model._create_manifest_and_retarget_tag(
-            repo_ref, input_manifest, self.tag
-        )
+        with patch.object(oci.tag, "mark_repository_modified") as mark_repository_modified:
+            manifest, tag = proxy_model._create_manifest_and_retarget_tag(
+                repo_ref, input_manifest, self.tag
+            )
         assert manifest is not None
         assert tag is not None
         assert manifest.internal_manifest_bytes.as_unicode() == UBI8_8_4_MANIFEST_SCHEMA2
         assert manifest.digest == UBI8_8_4_DIGEST
+        mark_repository_modified.assert_called_once_with(self.orgname, self.upstream_repository)
+
+    @patch("data.registry_model.registry_proxy_model.Proxy", MagicMock())
+    def test_failure_after_retarget_does_not_mark_repository(self, create_repo):
+        repo_ref = create_repo(self.orgname, self.upstream_repository, self.user)
+        input_manifest = parse_manifest_from_bytes(
+            Bytes.for_string_or_unicode(UBI8_8_4_MANIFEST_SCHEMA2),
+            DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE,
+        )
+        proxy_model = ProxyModel(
+            self.orgname,
+            self.upstream_repository,
+            self.user,
+        )
+
+        with (
+            patch.object(oci.tag, "mark_repository_modified") as mark_repository_modified,
+            patch.object(
+                oci.manifest,
+                "register_repository_manifest_digest",
+                side_effect=RuntimeError("registration failure"),
+            ),
+            pytest.raises(RuntimeError, match="registration failure"),
+        ):
+            proxy_model._create_manifest_and_retarget_tag(repo_ref, input_manifest, self.tag)
+
+        mark_repository_modified.assert_not_called()
 
     @patch("data.registry_model.registry_proxy_model.Proxy", MagicMock())
     def test_create_8_4_tag_for_existing_manifest(self, create_repo):
@@ -1075,9 +1103,7 @@ class TestRegistryProxyDigestBoundary:
             ["sha256", "sha384", "sha512"],
         )
         self.user = get_user("devtable")
-        self.org = create_organization(
-            self.orgname, f"{self.orgname}@devtable.com", self.user
-        )
+        self.org = create_organization(self.orgname, f"{self.orgname}@devtable.com", self.user)
         self.org.save()
         create_proxy_cache_config(
             org_name=self.orgname,
@@ -1087,9 +1113,7 @@ class TestRegistryProxyDigestBoundary:
 
     @pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
     @patch("data.registry_model.registry_proxy_model.Proxy", MagicMock())
-    def test_digest_pull_is_rejected_before_upstream_or_persistence(
-        self, create_repo, algorithm
-    ):
+    def test_digest_pull_is_rejected_before_upstream_or_persistence(self, create_repo, algorithm):
         repo_ref = create_repo(self.orgname, self.upstream_repository, self.user)
         proxy_model = ProxyModel(self.orgname, self.upstream_repository, self.user)
         digest = f"{algorithm}:" + "a" * (hashlib.new(algorithm).digest_size * 2)
@@ -1131,9 +1155,7 @@ class TestRegistryProxyDigestBoundary:
             )
 
         assert exc_info.value.algorithm == algorithm
-        proxy_model._proxy.manifest_exists.assert_called_once_with(
-            "latest", ACCEPTED_MEDIA_TYPES
-        )
+        proxy_model._proxy.manifest_exists.assert_called_once_with("latest", ACCEPTED_MEDIA_TYPES)
         proxy_model._proxy.get_manifest.assert_not_called()
         assert get_repository(self.orgname, "uncached") is None
 

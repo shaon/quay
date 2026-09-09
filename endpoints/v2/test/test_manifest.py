@@ -8,7 +8,7 @@ from flask import url_for
 from playhouse.test_utils import count_queries
 
 from app import app as realapp
-from app import docker_v2_signing_key, instance_keys, storage
+from app import docker_v2_signing_key, instance_keys, model_cache, storage
 from auth.auth_context_type import ValidatedAuthContext
 from data import model
 from data.cache.impl import InMemoryDataModelCache
@@ -2249,7 +2249,12 @@ def test_digest_push_reports_only_committed_tags_without_duplicating_manifest(
         "Content-Type": DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE,
     }
 
-    with patch.dict(realapp.config, {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha512"]}):
+    with (
+        patch.dict(realapp.config, {"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha512"]}),
+        patch.object(
+            model_cache.repo_modification_tracker, "mark_repo_modified"
+        ) as mark_repo_modified,
+    ):
         untagged = conduct_call(
             client,
             "v2.write_manifest_by_digest",
@@ -2294,6 +2299,8 @@ def test_digest_push_reports_only_committed_tags_without_duplicating_manifest(
         assert tagged.headers["Docker-Content-Digest"] == manifest_info["external_digest"]
         assert tagged.headers["Location"].endswith("/manifests/" + manifest_info["external_digest"])
         assert tagged.headers.getlist("OCI-Tag") == [tag_name]
+        mark_repo_modified.assert_called_once_with("devtable", "simple")
+        mark_repo_modified.reset_mock()
 
         duplicated = conduct_call(
             client,
@@ -2314,6 +2321,8 @@ def test_digest_push_reports_only_committed_tags_without_duplicating_manifest(
             "/manifests/" + manifest_info["external_digest"]
         )
         assert duplicated.headers.getlist("OCI-Tag") == [tag_name, second_tag_name]
+        mark_repo_modified.assert_called_once_with("devtable", "simple")
+        mark_repo_modified.reset_mock()
 
         conventional = conduct_call(
             client,
@@ -2330,6 +2339,7 @@ def test_digest_push_reports_only_committed_tags_without_duplicating_manifest(
             "/manifests/" + manifest_info["canonical_digest"]
         )
         assert conventional.headers.getlist("OCI-Tag") == []
+        mark_repo_modified.assert_called_once_with("devtable", "simple")
 
     assert manifest_query.count() == 1
     repository_ref = registry_model.lookup_repository("devtable", "simple")
@@ -2530,6 +2540,9 @@ def test_digest_push_with_multiple_tags_rolls_back_atomically(client, app):
     with (
         toggle_feature("IMMUTABLE_TAGS", True),
         patch.dict(realapp.config, {"ALLOWED_HASH_ALGORITHMS": ["sha512"]}),
+        patch.object(
+            model_cache.repo_modification_tracker, "mark_repo_modified"
+        ) as mark_repo_modified,
     ):
         set_tag_immutable(repository_ref.id, "latest", True)
         response = conduct_call(
@@ -2547,6 +2560,7 @@ def test_digest_push_with_multiple_tags_rolls_back_atomically(client, app):
             raw_body=manifest_info["bytes"],
         )
 
+    mark_repo_modified.assert_not_called()
     assert response.get_json()["errors"][0]["code"] == "TAG_IMMUTABLE"
     assert registry_model.get_repo_tag(repository_ref, new_tag) is None
     assert registry_model.get_repo_tag(repository_ref, "latest").manifest.id == original_manifest_id
@@ -2555,6 +2569,14 @@ def test_digest_push_with_multiple_tags_rolls_back_atomically(client, app):
         .where(
             RepositoryManifestDigest.repository == repository_ref.id,
             RepositoryManifestDigest.digest == manifest_info["external_digest"],
+        )
+        .exists()
+    )
+    assert (
+        not Manifest.select()
+        .where(
+            Manifest.repository == repository_ref.id,
+            Manifest.digest == manifest_info["canonical_digest"],
         )
         .exists()
     )
