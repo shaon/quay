@@ -3,7 +3,7 @@ from collections import namedtuple
 from contextvars import ContextVar
 
 from cachetools.func import lru_cache
-from peewee import SQL, IntegrityError
+from peewee import SQL, Case, IntegrityError, fn
 
 from data.database import (
     ImageStorage,
@@ -47,6 +47,106 @@ _blob_lock_fallback = ContextVar("blob_lock_fallback", default=None)
 
 # role lock identifiers
 _GC_LOCK_ROLES = frozenset({"gcworker", "repositorygcworker", "namespacegcworker"})
+
+
+REQUESTED_DIGEST_PREFIXES = ("sha384:", "sha512:")
+
+
+def is_requested_identity(digest):
+    """
+    Returns True if a client-visible blob digest is a SHA-384 or SHA-512 identity, matched against
+    requested_content_checksum. Accepts a string or a digest_tools.Digest.
+    """
+    return str(digest).startswith(REQUESTED_DIGEST_PREFIXES)
+
+
+def is_sha256_identity(digest):
+    """
+    Returns True if a client-visible blob digest is matched the way it is today: against
+    content_checksum on rows whose requested_content_checksum is NULL. That is every digest that
+    is not a SHA-384 or SHA-512 identity.
+    """
+    return not is_requested_identity(digest)
+
+
+def identity_clause(digest):
+    """
+    PROJQUAY-10117 identity rule. Returns the predicate matching ImageStorage rows whose
+    client-visible identity is `digest`:
+
+    - a SHA-384 or SHA-512 digest matches requested_content_checksum;
+    - a SHA-256 digest matches content_checksum on a row whose requested_content_checksum is NULL.
+
+    Every lookup resolving a client-visible blob digest to a storage row must use this. Only GC
+    reference checks, the blob deletion lock, the first-row check during publication, and the
+    placement check in stored-bytes verification may match on content_checksum alone.
+    """
+    digest = str(digest)
+    if not is_requested_identity(digest):
+        return (ImageStorage.content_checksum == digest) & (
+            ImageStorage.requested_content_checksum >> None
+        )
+    return ImageStorage.requested_content_checksum == digest
+
+
+def storage_identity(image_storage):
+    """
+    Returns the client-visible digest of a storage row.
+    """
+    return image_storage.requested_content_checksum or image_storage.content_checksum
+
+
+def _has_placement_expr():
+    """
+    SQL expression that is 1 when the current ImageStorage row has any placement, else 0. Rows
+    without placements are proxy-cache placeholders.
+    """
+    placed = ImageStoragePlacement.select(ImageStoragePlacement.id).where(
+        ImageStoragePlacement.storage == ImageStorage.id
+    )
+    return Case(None, [(fn.EXISTS(placed), 1)], 0)
+
+
+def repository_selection_order():
+    """
+    Selection order for repository lookups (pull, manifest creation, layer listing, mount
+    source): lowest row ID, placeholders last.
+    """
+    return [_has_placement_expr().desc(), ImageStorage.id.asc()]
+
+
+def _is_placeholder(image_storage):
+    return not (
+        ImageStoragePlacement.select()
+        .where(ImageStoragePlacement.storage == image_storage.id)
+        .exists()
+    )
+
+
+def select_sha256_publication_row(digest, location=None):
+    """
+    Selection order for publishing a SHA-256 identity: among SHA-256 rows stored in CAS, the lowest
+    row ID with a placement at `location`, or else the lowest row ID. SHA-256 rows stored outside
+    CAS are never reused. Raises ImageStorage.DoesNotExist if there is none.
+    """
+    assert not is_requested_identity(digest)
+    base = ImageStorage.select().where(identity_clause(digest), ImageStorage.cas_path == True)
+
+    if location is not None:
+        location_id = getattr(location, "id", location)
+        placed = (
+            base.join(ImageStoragePlacement)
+            .where(ImageStoragePlacement.location == location_id)
+            .order_by(ImageStorage.id)
+            .first()
+        )
+        if placed is not None:
+            return placed
+
+    found = base.order_by(ImageStorage.id).first()
+    if found is None:
+        raise ImageStorage.DoesNotExist()
+    return found
 
 
 def _is_gcworker_holder(holder_id):
@@ -414,7 +514,7 @@ def _get_or_create_blob_with_lock(digest, lock_acquired=True, may_create=True, *
     another worker has created the reference already), we return the found reference.
     """
     try:
-        return ImageStorage.get(content_checksum=digest)
+        return select_sha256_publication_row(digest)
     except ImageStorage.DoesNotExist:
         if not may_create:
             raise LockAcquireTimeout(
@@ -427,7 +527,7 @@ def _get_or_create_blob_with_lock(digest, lock_acquired=True, may_create=True, *
             return ImageStorage.create(content_checksum=digest, **blob_attrs)
         except IntegrityError as e:
             logger.warning("Another worker already created blob %s: %s", digest, e)
-            return ImageStorage.get(content_checksum=digest)
+            return select_sha256_publication_row(digest)
 
 
 def get_or_create_blob_with_lock(digest, skip_lock=False, **blob_attrs):
@@ -518,32 +618,48 @@ def get_layer_path_for_storage(storage_uuid, cas_path, content_checksum):
 
 def lookup_repo_storages_by_content_checksum(repo, checksums, with_uploads=False):
     """
-    Looks up repository storages (without placements) matching the given repository and checksum.
+    Looks up repository storages (without placements) whose client-visible identity matches the
+    given digests, applying the identity rule and the repository selection order (lowest row ID,
+    placeholders last). Returns at most one row per digest.
+
+    Without `with_uploads`, only rows linked through ManifestBlob are considered; with it, rows
+    linked through UploadedBlob are considered too, and the best row across both is returned.
     """
     checksums = list(set(checksums))
     if not checksums:
         return []
 
-    # If the request is not with uploads, simply return the blobs found under the manifests
-    # for the repository.
     if not with_uploads:
-        return _lookup_repo_storages_by_content_checksum(repo, checksums, ManifestBlob)
+        return list(_lookup_repo_storages_by_content_checksum(repo, checksums, ManifestBlob))
 
-    # Otherwise, first check the UploadedBlob table and, once done, then check the ManifestBlob
-    # table.
     found_via_uploaded = list(
         _lookup_repo_storages_by_content_checksum(repo, checksums, UploadedBlob)
     )
-    if len(found_via_uploaded) == len(checksums):
-        return found_via_uploaded
-
-    checksums_remaining = set(checksums) - {
-        uploaded.content_checksum for uploaded in found_via_uploaded
-    }
     found_via_manifest = list(
-        _lookup_repo_storages_by_content_checksum(repo, checksums_remaining, ManifestBlob)
+        _lookup_repo_storages_by_content_checksum(repo, checksums, ManifestBlob)
     )
-    return found_via_uploaded + found_via_manifest
+    return _select_best_per_identity(found_via_uploaded + found_via_manifest)
+
+
+def _select_best_per_identity(storages):
+    """
+    Given candidate storage rows, returns one per client-visible identity, by lowest row ID with
+    placeholders last.
+    """
+    best = {}
+    placeholder_cache = {}
+
+    def sort_key(row):
+        if row.id not in placeholder_cache:
+            placeholder_cache[row.id] = _is_placeholder(row)
+        return (placeholder_cache[row.id], row.id)
+
+    for row in storages:
+        identity = storage_identity(row)
+        current = best.get(identity)
+        if current is None or sort_key(row) < sort_key(current):
+            best[identity] = row
+    return list(best.values())
 
 
 def _lookup_repo_storages_by_content_checksum(repo, checksums, model_class):
@@ -560,13 +676,15 @@ def _lookup_repo_storages_by_content_checksum(repo, checksums, model_class):
             ImageStorage.select(
                 ImageStorage.id,
                 ImageStorage.content_checksum,
+                ImageStorage.requested_content_checksum,
                 ImageStorage.image_size,
                 ImageStorage.uuid,
                 ImageStorage.cas_path,
                 ImageStorage.uncompressed_size,
             )
             .join(model_class)
-            .where(model_class.repository == repo, ImageStorage.content_checksum == checksum)
+            .where(model_class.repository == repo, identity_clause(checksum))
+            .order_by(*repository_selection_order())
             .limit(1)
             .alias(query_alias)
         )

@@ -663,7 +663,10 @@ class Blob(
             db_id=image_storage.id,
             uuid=image_storage.uuid,
             inputs=dict(placements=placements, storage_path=storage_path),
-            digest=image_storage.content_checksum,
+            # The client-visible identity: the requested sha384/sha512 digest when set, otherwise
+            # the SHA-256 content checksum. Storage paths use content_checksum separately.
+            digest=getattr(image_storage, "requested_content_checksum", None)
+            or image_storage.content_checksum,
             compressed_size=image_storage.image_size,
             uncompressed_size=image_storage.uncompressed_size,
             uploading=image_storage.uploading,

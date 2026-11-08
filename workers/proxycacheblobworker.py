@@ -15,7 +15,12 @@ from data.database import (
     db_transaction,
 )
 from data.model import repository, user
-from data.model.storage import get_image_location_for_id, get_layer_path
+from data.model.storage import (
+    get_image_location_for_id,
+    get_layer_path,
+    identity_clause,
+    repository_selection_order,
+)
 from data.registry_model.datatypes import RepositoryReference
 from data.registry_model.registry_proxy_model import ProxyModel
 from util.locking import GlobalLock
@@ -72,7 +77,7 @@ class ProxyCacheBlobWorker(QueueWorker):
             .join(ImageStorage)
             .where(
                 ManifestBlob.repository_id == repo_id,
-                ImageStorage.content_checksum == blob_digest,
+                identity_clause(blob_digest),
             )
             .distinct()
         )
@@ -150,8 +155,9 @@ class ProxyCacheBlobWorker(QueueWorker):
                     .join(ManifestBlob)
                     .where(
                         ManifestBlob.repository_id == repo_id,
-                        ImageStorage.content_checksum == digest,
+                        identity_clause(digest),
                     )
+                    .order_by(*repository_selection_order())
                     .get()
                 )
             except ImageStorage.DoesNotExist:

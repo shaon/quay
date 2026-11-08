@@ -1318,8 +1318,10 @@ class OCIModel(RegistryDataInterface):
         is being pushed. Returns False if the mounting fails.
         """
         with db_disallow_replica_use():
-            storage = model.blob.temp_link_blob(
-                target_repository_ref._db_id, blob.digest, expiration_sec
+            # Link the exact source row resolved under the identity rule; re-resolving by digest
+            # could link a different row (PROJQUAY-10117).
+            storage = model.blob.temp_link_blob_storage(
+                target_repository_ref._db_id, blob._db_id, expiration_sec
             )
             return bool(storage)
 
@@ -1431,7 +1433,9 @@ class OCIModel(RegistryDataInterface):
             blob_query = self._lookup_repo_storages_by_content_checksum(
                 repo_id, blob_digests, storage
             )
-            storage_map = {blob.content_checksum: blob for blob in blob_query}
+            storage_map = {
+                model.storage.storage_identity(blob): blob for blob in blob_query
+            }
 
         layers = parsed.get_layers(retriever)
         if layers is None:

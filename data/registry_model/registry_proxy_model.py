@@ -44,6 +44,8 @@ from data.model.storage import (
     get_image_location_for_id,
     get_layer_path,
     get_or_create_blob_with_lock,
+    identity_clause,
+    repository_selection_order,
     with_blob_lock_or_fallback,
 )
 from data.registry_model.blobuploader import (
@@ -710,8 +712,9 @@ class ProxyModel(OCIModel):
                     .join(ManifestBlob)
                     .where(
                         ManifestBlob.repository_id == repository_ref.id,
-                        ImageStorage.content_checksum == blob_digest,
+                        identity_clause(blob_digest),
                     )
+                    .order_by(*repository_selection_order())
                     .get()
                 )
             except ImageStorage.DoesNotExist:

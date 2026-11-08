@@ -33,7 +33,10 @@ from data.model.oci.tag import (
     get_child_manifests,
 )
 from data.model.quota import QuotaOperation, update_quota
-from data.model.storage import lookup_repo_storages_by_content_checksum
+from data.model.storage import (
+    lookup_repo_storages_by_content_checksum,
+    storage_identity,
+)
 from image.docker.schema1 import ManifestException
 from image.docker.schema2 import EMPTY_LAYER_BLOB_DIGEST, EMPTY_LAYER_BYTES
 from image.docker.schema2.list import MalformedSchema2ManifestList
@@ -699,7 +702,7 @@ def _build_blob_map(
 
     if digests:
         query = lookup_repo_storages_by_content_checksum(repository_id, digests, with_uploads=True)
-        blob_map.update({s.content_checksum: s for s in query})
+        blob_map.update({storage_identity(s): s for s in query})
         for digest_str in digests:
             if digest_str not in blob_map:
                 logger.warning(

@@ -23,7 +23,12 @@ from data.model import (
     db_transaction,
 )
 from data.model import storage as storage_model
-from data.model.storage import get_or_create_blob_with_lock, with_blob_lock_or_fallback
+from data.model.storage import (
+    get_or_create_blob_with_lock,
+    identity_clause,
+    select_sha256_publication_row,
+    with_blob_lock_or_fallback,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +65,7 @@ def _store_blob_record_and_temp_link_in_repo(
     """
     with db_transaction():
         try:
-            storage = ImageStorage.get(content_checksum=blob_digest)
+            storage = select_sha256_publication_row(blob_digest, location_obj)
             save_changes = False
 
             if storage.image_size is None:
@@ -128,17 +133,41 @@ def temp_link_blob(repository_id, blob_digest, link_expiration_s):
     """
     Temporarily links to the blob record from the given repository.
 
+    The record is resolved globally under the identity rule (lowest row ID). Prefer
+    temp_link_blob_storage, which links an exact, already-resolved row.
+
     If the blob record is not found, return None.
     """
     assert blob_digest
 
     with db_transaction():
-        try:
-            storage = ImageStorage.get(content_checksum=blob_digest)
-        except ImageStorage.DoesNotExist:
+        storage = (
+            ImageStorage.select()
+            .where(identity_clause(blob_digest))
+            .order_by(ImageStorage.id)
+            .first()
+        )
+        if storage is None:
             return None
 
         _temp_link_blob(repository_id, storage, link_expiration_s)
+        return storage
+
+
+def temp_link_blob_storage(repository_id, storage_id, link_expiration_s):
+    """
+    Temporarily links the exact ImageStorage row `storage_id` to the given repository.
+
+    Returns the storage row, or None if it does not exist or could not be linked.
+    """
+    with db_transaction():
+        try:
+            storage = ImageStorage.get(id=storage_id)
+        except ImageStorage.DoesNotExist:
+            return None
+
+        if _temp_link_blob(repository_id, storage, link_expiration_s) is None:
+            return None
         return storage
 
 
@@ -223,13 +252,19 @@ def get_shared_blob(digest):
     Returns the ImageStorage blob with the given digest or, if not present, returns None.
 
     This method is *only* to be used for shared blobs that are globally accessible, such as the
-    special empty gzipped tar layer that Docker no longer pushes to us.
+    special empty gzipped tar layer that Docker no longer pushes to us. Only SHA-256 rows match.
     """
     assert digest
-    try:
-        return ImageStorage.get(content_checksum=digest)
-    except ImageStorage.DoesNotExist:
-        return None
+    return _get_shared_sha256_row(digest)
+
+
+def _get_shared_sha256_row(digest):
+    return (
+        ImageStorage.select()
+        .where(identity_clause(digest))
+        .order_by(ImageStorage.id)
+        .first()
+    )
 
 
 def get_or_create_shared_blob(digest, byte_data, storage):
@@ -244,9 +279,10 @@ def get_or_create_shared_blob(digest, byte_data, storage):
     assert byte_data is not None and isinstance(byte_data, bytes)
     assert storage
 
-    try:
-        return ImageStorage.get(content_checksum=digest)
-    except ImageStorage.DoesNotExist:
+    existing = _get_shared_sha256_row(digest)
+    if existing is not None:
+        return existing
+    else:
         preferred = storage.preferred_locations[0]
         location_obj = ImageStorageLocation.get(name=preferred)
 
