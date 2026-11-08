@@ -3658,3 +3658,381 @@ def test_push_new_blob_while_registry_lock_held(
         expected_status=200,
         headers=headers,
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# PROJQUAY-10117 Proposal 1: configurable digest algorithms (blob uploads).
+# ---------------------------------------------------------------------------------------------
+
+ALL_HASH_ALGORITHMS = ["sha256", "sha384", "sha512"]
+LIVESERVER_PREFIX = "http://localhost:5000"
+
+
+def _alg_digest(algorithm, data):
+    return "%s:%s" % (algorithm, hashlib.new(algorithm, data).hexdigest())
+
+
+@pytest.fixture()
+def all_hash_algorithms(liveserver, registry_server_executor, app_reloader):
+    with ConfigChange(
+        "ALLOWED_HASH_ALGORITHMS",
+        ALL_HASH_ALGORITHMS,
+        registry_server_executor.on(liveserver),
+        liveserver,
+    ):
+        yield
+
+
+def _push_headers(protocol, session, repo="newrepo", namespace="devtable"):
+    repo_name = protocol.repo_name(namespace, repo)
+    token, _ = protocol.auth(
+        session,
+        ("devtable", "password"),
+        namespace,
+        repo,
+        scopes=["repository:%s:push,pull" % repo_name],
+    )
+    return {"Authorization": "Bearer " + token}, repo_name
+
+
+def _error_code(response):
+    return response.json()["errors"][0]["code"]
+
+
+def _location(response):
+    return response.headers["Location"][len(LIVESERVER_PREFIX) :]
+
+
+def _upload(protocol, session, headers, repo_name, data, digest, path, hint=None, expected=201):
+    """Uploads `data` via blob upload path A, B, C or a monolithic PUT, finishing with `digest`."""
+    if path == "A":
+        return protocol.conduct(
+            session,
+            "POST",
+            "/v2/%s/blobs/uploads/" % repo_name,
+            params=dict(digest=digest),
+            data=data,
+            expected_status=expected,
+            headers=headers,
+        )
+
+    params = {}
+    if path == "B" or hint is not None:
+        params["digest-algorithm"] = hint or digest.split(":", 1)[0]
+    response = protocol.conduct(
+        session,
+        "POST",
+        "/v2/%s/blobs/uploads/" % repo_name,
+        params=params,
+        expected_status=202,
+        headers=headers,
+    )
+    location = _location(response)
+
+    if path == "PUT":
+        # The whole body arrives with the final PUT.
+        return protocol.conduct(
+            session,
+            "PUT",
+            location,
+            params=dict(digest=digest),
+            data=data,
+            expected_status=expected,
+            headers=headers,
+        )
+
+    half = len(data) // 2
+    for start, chunk in ((0, data[:half]), (half, data[half:])):
+        chunk_headers = dict(headers)
+        chunk_headers["Content-Range"] = "%d-%d" % (start, start + len(chunk) - 1)
+        response = protocol.conduct(
+            session,
+            "PATCH",
+            location,
+            data=chunk,
+            expected_status=202,
+            headers=chunk_headers,
+        )
+        location = _location(response)
+
+    return protocol.conduct(
+        session,
+        "PUT",
+        location,
+        params=dict(digest=digest),
+        expected_status=expected,
+        headers=headers,
+    )
+
+
+def _assert_blob_served(protocol, session, headers, repo_name, data, digest):
+    for method in ("HEAD", "GET"):
+        response = protocol.conduct(
+            session,
+            method,
+            "/v2/%s/blobs/%s" % (repo_name, digest),
+            expected_status=200,
+            headers=headers,
+        )
+        assert response.headers["Docker-Content-Digest"] == digest
+        if method == "GET":
+            assert response.content == data
+
+
+def _assert_blob_not_served(protocol, session, headers, repo_name, digest):
+    for method in ("HEAD", "GET"):
+        protocol.conduct(
+            session,
+            method,
+            "/v2/%s/blobs/%s" % (repo_name, digest),
+            expected_status=404,
+            headers=headers,
+        )
+
+
+@pytest.mark.parametrize("algorithm", ALL_HASH_ALGORITHMS)
+@pytest.mark.parametrize("path", ["A", "B", "C", "PUT"])
+def test_requested_digest_blob_upload_paths(
+    algorithm, path, v22_protocol, liveserver_session, all_hash_algorithms
+):
+    """Every blob upload path publishes the requested digest and reports it in Location and
+    Docker-Content-Digest; a SHA-384/512-only blob is never served under its internal SHA-256."""
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    data = layer_bytes_for_contents(("%s %s contents" % (algorithm, path)).encode("ascii"))
+    digest = _alg_digest(algorithm, data)
+
+    response = _upload(v22_protocol, liveserver_session, headers, repo_name, data, digest, path)
+    assert response.headers["Docker-Content-Digest"] == digest
+    assert response.headers["Location"].endswith("/v2/%s/blobs/%s" % (repo_name, digest))
+
+    _assert_blob_served(v22_protocol, liveserver_session, headers, repo_name, data, digest)
+    if algorithm != "sha256":
+        _assert_blob_not_served(
+            v22_protocol, liveserver_session, headers, repo_name, _alg_digest("sha256", data)
+        )
+
+
+@pytest.mark.parametrize(
+    "hint, final", [("sha512", "sha384"), ("sha384", "sha512"), ("sha512", "sha256")]
+)
+def test_requested_digest_final_digest_overrides_hint(
+    hint, final, v22_protocol, liveserver_session, all_hash_algorithms
+):
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    data = layer_bytes_for_contents(("hint %s final %s" % (hint, final)).encode("ascii"))
+    digest = _alg_digest(final, data)
+    _upload(v22_protocol, liveserver_session, headers, repo_name, data, digest, "C", hint=hint)
+    _assert_blob_served(v22_protocol, liveserver_session, headers, repo_name, data, digest)
+
+
+@pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
+def test_requested_digest_disallowed_writes_at_default_allowlist(
+    algorithm, v22_protocol, liveserver_session, app_reloader
+):
+    """At the default [sha256] allowlist, a write naming sha384/sha512 returns 400 DIGEST_INVALID:
+    upload digest (POST and final PUT), digest-algorithm hint, and mount (opening no upload)."""
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    data = layer_bytes_for_contents(b"disallowed write contents")
+    digest = _alg_digest(algorithm, data)
+
+    response = _upload(
+        v22_protocol, liveserver_session, headers, repo_name, data, digest, "A", expected=400
+    )
+    assert _error_code(response) == "DIGEST_INVALID"
+
+    response = v22_protocol.conduct(
+        liveserver_session,
+        "POST",
+        "/v2/%s/blobs/uploads/" % repo_name,
+        params={"digest-algorithm": algorithm},
+        expected_status=400,
+        headers=headers,
+    )
+    assert _error_code(response) == "DIGEST_INVALID"
+
+    response = v22_protocol.conduct(
+        liveserver_session,
+        "POST",
+        "/v2/%s/blobs/uploads/" % repo_name,
+        params={"mount": digest, "from": "devtable/simple"},
+        expected_status=400,
+        headers=headers,
+    )
+    assert _error_code(response) == "DIGEST_INVALID"
+    assert "Location" not in response.headers
+    assert "Docker-Upload-UUID" not in response.headers
+
+    response = _upload(
+        v22_protocol, liveserver_session, headers, repo_name, data, digest, "C", expected=400
+    )
+    assert _error_code(response) == "DIGEST_INVALID"
+
+    # A sha256 hint is accepted at the default allowlist.
+    v22_protocol.conduct(
+        liveserver_session,
+        "POST",
+        "/v2/%s/blobs/uploads/" % repo_name,
+        params={"digest-algorithm": "sha256"},
+        expected_status=202,
+        headers=headers,
+    )
+
+
+@pytest.mark.parametrize(
+    "bad_digest",
+    [
+        "sha512:" + "A" * 128,
+        "sha512:" + "a" * 127,
+        "sha384:" + "a" * 64,
+        "SHA512:" + "a" * 128,
+        "md5:" + "a" * 32,
+        "sha1:" + "a" * 40,
+    ],
+)
+def test_requested_digest_malformed_or_unsupported_writes(
+    bad_digest, v22_protocol, liveserver_session, all_hash_algorithms
+):
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    data = layer_bytes_for_contents(b"malformed write contents")
+
+    for path in ("A", "C"):
+        response = _upload(
+            v22_protocol, liveserver_session, headers, repo_name, data, bad_digest, path,
+            expected=400,
+        )
+        assert _error_code(response) == "DIGEST_INVALID"
+
+    response = v22_protocol.conduct(
+        liveserver_session,
+        "POST",
+        "/v2/%s/blobs/uploads/" % repo_name,
+        params={"mount": bad_digest, "from": "devtable/simple"},
+        expected_status=400,
+        headers=headers,
+    )
+    assert _error_code(response) == "DIGEST_INVALID"
+
+
+@pytest.mark.parametrize("hint", ["sha1", "SHA512", "md5", "sha3-512", ""])
+def test_requested_digest_bad_hint(hint, v22_protocol, liveserver_session, all_hash_algorithms):
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    response = v22_protocol.conduct(
+        liveserver_session,
+        "POST",
+        "/v2/%s/blobs/uploads/" % repo_name,
+        params={"digest-algorithm": hint},
+        expected_status=400,
+        headers=headers,
+    )
+    assert _error_code(response) == "DIGEST_INVALID"
+
+
+@pytest.mark.parametrize("algorithm", ALL_HASH_ALGORITHMS)
+@pytest.mark.parametrize("path", ["A", "B", "C"])
+def test_requested_digest_content_mismatch(
+    algorithm, path, v22_protocol, liveserver_session, all_hash_algorithms
+):
+    """Bytes that don't match a requested SHA-384/512 digest return 400 DIGEST_INVALID; SHA-256
+    mismatches keep today's 400 BLOB_UPLOAD_INVALID. Nothing is published."""
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    data = layer_bytes_for_contents(b"mismatched contents")
+    wrong = _alg_digest(algorithm, data + b"other")
+
+    response = _upload(
+        v22_protocol, liveserver_session, headers, repo_name, data, wrong, path, expected=400
+    )
+    expected_code = "BLOB_UPLOAD_INVALID" if algorithm == "sha256" else "DIGEST_INVALID"
+    assert _error_code(response) == expected_code
+    _assert_blob_not_served(v22_protocol, liveserver_session, headers, repo_name, wrong)
+
+
+@pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
+def test_requested_digest_new_row_while_gc_holds_lock(
+    algorithm, v22_protocol, liveserver_session, liveserver, registry_server_executor,
+    all_hash_algorithms,
+):
+    """Publishing a new SHA-384/512 storage row while GC holds BLOB_DELETE_<sha256> returns a
+    retryable 503 UNAVAILABLE; a retry after the lock is released succeeds."""
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    data = layer_bytes_for_contents(("gc lock %s" % algorithm).encode("ascii"))
+    digest = _alg_digest(algorithm, data)
+
+    executor = registry_server_executor.on(liveserver)
+    sha256 = _alg_digest("sha256", data)
+    assert executor.hold_blob_lock(sha256, 60).status_code == 200
+
+    start = time.time()
+    response = _upload(
+        v22_protocol, liveserver_session, headers, repo_name, data, digest, "B", expected=503
+    )
+    assert _error_code(response) == "UNAVAILABLE"
+    assert time.time() - start < 20
+    _assert_blob_not_served(v22_protocol, liveserver_session, headers, repo_name, digest)
+
+    assert executor.release_blob_lock(sha256).status_code == 200
+    _upload(v22_protocol, liveserver_session, headers, repo_name, data, digest, "B")
+    _assert_blob_served(v22_protocol, liveserver_session, headers, repo_name, data, digest)
+
+
+@pytest.mark.parametrize("algorithm", ALL_HASH_ALGORITHMS)
+def test_requested_digest_corrupt_stored_object(
+    algorithm, v22_protocol, liveserver_session, liveserver, registry_server_executor,
+    all_hash_algorithms,
+):
+    """Stored-bytes verification failure on reuse returns 500 UNKNOWN; nothing is published and
+    the stored object is not repaired."""
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    data = layer_bytes_for_contents(("corrupt object %s" % algorithm).encode("ascii"))
+    digest = _alg_digest(algorithm, data)
+    corrupt = bytes([data[0] ^ 0xFF]) + data[1:]
+
+    executor = registry_server_executor.on(liveserver)
+    assert executor.put_cas_object(_alg_digest("sha256", data), corrupt.hex()).status_code == 200
+
+    response = _upload(
+        v22_protocol, liveserver_session, headers, repo_name, data, digest, "B", expected=500
+    )
+    assert _error_code(response) == "UNKNOWN"
+    _assert_blob_not_served(v22_protocol, liveserver_session, headers, repo_name, digest)
+
+
+@pytest.mark.parametrize("algorithm", ALL_HASH_ALGORITHMS)
+def test_requested_digest_mount_links_exact_identity(
+    algorithm, v22_protocol, liveserver_session, all_hash_algorithms
+):
+    """Mounting a blob publishes only the mounted digest in the target repository."""
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session, repo="mountsource")
+    data = layer_bytes_for_contents(("mount %s" % algorithm).encode("ascii"))
+    digest = _alg_digest(algorithm, data)
+    _upload(v22_protocol, liveserver_session, headers, repo_name, data, digest, "A")
+
+    target_headers, target_repo = _push_headers(v22_protocol, liveserver_session, repo="mounttarget")
+    # The target token also needs pull on the source repository.
+    token, _ = v22_protocol.auth(
+        liveserver_session,
+        ("devtable", "password"),
+        "devtable",
+        "mounttarget",
+        scopes=[
+            "repository:%s:push,pull" % target_repo,
+            "repository:%s:pull" % repo_name,
+        ],
+    )
+    target_headers = {"Authorization": "Bearer " + token}
+
+    response = v22_protocol.conduct(
+        liveserver_session,
+        "POST",
+        "/v2/%s/blobs/uploads/" % target_repo,
+        params={"mount": digest, "from": repo_name},
+        expected_status=201,
+        headers=target_headers,
+    )
+    assert response.headers["Docker-Content-Digest"] == digest
+
+    _assert_blob_served(v22_protocol, liveserver_session, target_headers, target_repo, data, digest)
+    if algorithm != "sha256":
+        _assert_blob_not_served(
+            v22_protocol, liveserver_session, target_headers, target_repo,
+            _alg_digest("sha256", data),
+        )

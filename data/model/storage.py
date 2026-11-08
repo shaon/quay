@@ -149,6 +149,40 @@ def select_sha256_publication_row(digest, location=None):
     return found
 
 
+def checksum_has_storage_rows(content_checksum):
+    """
+    Returns True if any ImageStorage row, of any requested digest, has this content checksum.
+    Matches on content_checksum alone (GC reference / first-row check).
+    """
+    return ImageStorage.select().where(ImageStorage.content_checksum == content_checksum).exists()
+
+
+def checksum_has_cas_placement(content_checksum, location_id):
+    """
+    Returns True if any CAS ImageStorage row, of any requested digest, with this content checksum
+    has a placement at the location. Matches on content_checksum alone (placement check in
+    stored-bytes verification).
+    """
+    return (
+        ImageStorage.select()
+        .join(ImageStoragePlacement)
+        .where(
+            ImageStorage.content_checksum == content_checksum,
+            ImageStorage.cas_path == True,
+            ImageStoragePlacement.location == location_id,
+        )
+        .exists()
+    )
+
+
+def blob_lock_may_create():
+    """
+    Returns False if with_blob_lock_or_fallback is running its function after GC held the
+    BLOB_DELETE lock past the acquire timeout; a missing storage row must not be created then.
+    """
+    return _blob_lock_fallback.get() != _BLOB_LOCK_TIMED_OUT
+
+
 def _is_gcworker_holder(holder_id):
     """
     Checks if the holder of the lock is one of the three GC workers.

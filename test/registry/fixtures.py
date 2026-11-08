@@ -138,6 +138,11 @@ def registry_server_executor(app):
         set_tag_immutable(repo_ref.id, tag_name, True)
         return "OK"
 
+    def put_cas_object(digest, content_hex):
+        # Writes bytes at a blob's CAS path with no ImageStorage row (an orphaned object).
+        storage.put_content(["local_us"], storage.blob_path(digest), bytes.fromhex(content_hex))
+        return "OK"
+
     held_blob_locks = {}
 
     def hold_blob_lock(digest, ttl, holder_id="repositorygcworker:7:test"):
@@ -188,6 +193,7 @@ def registry_server_executor(app):
     executor.register("delete_manifests", delete_manifests)
     executor.register("make_tag_immutable", make_tag_immutable)
     executor.register("hold_blob_lock", hold_blob_lock)
+    executor.register("put_cas_object", put_cas_object)
     executor.register("release_blob_lock", release_blob_lock)
     return executor
 

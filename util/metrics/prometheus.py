@@ -108,6 +108,14 @@ gc_storage_blobs_deleted = Counter(
     "quay_gc_storage_blobs_deleted", "number of storage blobs deleted"
 )
 
+# Blob integrity alerts (PROJQUAY-10117): a reread's SHA-256 differs from the saved upload state,
+# or stored-bytes verification failed before reusing an existing CAS object.
+blob_integrity_failures = Counter(
+    "quay_blob_integrity_failures_total",
+    "number of blob uploads cancelled because stored or reread bytes failed verification",
+    labelnames=["reason"],
+)
+
 # GC iterations
 gc_repos_purged = Counter(
     "quay_gc_repos_purged",

@@ -17,7 +17,11 @@ from auth.permissions import (
     SuperUserPermission,
 )
 from auth.registry_jwt_auth import get_auth_headers, process_registry_jwt_auth
-from data.model import PushesDisabledException, QuotaExceededException
+from data.model import (
+    BlobStorageMissingException,
+    PushesDisabledException,
+    QuotaExceededException,
+)
 from data.readreplica import ReadOnlyModeException
 from data.registry_model import registry_model
 from endpoints.decorators import anon_allowed, route_show_if
@@ -79,6 +83,15 @@ def handle_lock_acquire_timeout(error):
     # Transient: another holder (e.g. GC) has the blob's BLOB_DELETE lock. Clients retry a 503.
     logger.warning("Returning 503: %s", error)
     return _format_error_response(TemporarilyUnavailable())
+
+
+@v2_bp.app_errorhandler(BlobStorageMissingException)
+def handle_blob_storage_missing(error):
+    # Transient: GC deleted the CAS object while no row referenced it. Clients retry a 503.
+    logger.warning("Returning 503: %s", error)
+    return _format_error_response(
+        TemporarilyUnavailable(message="The blob is no longer in storage. Please retry the push.")
+    )
 
 
 def _format_error_response(error: V2RegistryException) -> Response:

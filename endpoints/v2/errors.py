@@ -228,6 +228,16 @@ class PushesDisabled(V2RegistryException):
 
 
 class TemporarilyUnavailable(V2RegistryException):
-    def __init__(self, detail=None):
-        message = "The blob is temporarily locked by another operation. Please retry the request."
+    def __init__(self, detail=None, message=None):
+        message = (
+            message
+            or "The blob is temporarily locked by another operation. Please retry the request."
+        )
         super(TemporarilyUnavailable, self).__init__("UNAVAILABLE", message, detail, 503)
+
+
+class UnknownError(V2RegistryException):
+    def __init__(self, detail=None, message=None):
+        super(UnknownError, self).__init__(
+            "UNKNOWN", message or "unknown error", detail, 500
+        )

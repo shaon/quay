@@ -1214,7 +1214,14 @@ class OCIModel(RegistryDataInterface):
                 repository_ref, blob_digest, include_placements=True
             )
 
-    def create_blob_upload(self, repository_ref, new_upload_id, location_name, storage_metadata):
+    def create_blob_upload(
+        self,
+        repository_ref,
+        new_upload_id,
+        location_name,
+        storage_metadata,
+        requested_digest_algorithm=None,
+    ):
         """
         Creates a new blob upload and returns a reference.
 
@@ -1227,7 +1234,11 @@ class OCIModel(RegistryDataInterface):
 
             try:
                 upload_record = model.blob.initiate_upload_for_repo(
-                    repo, new_upload_id, location_name, storage_metadata
+                    repo,
+                    new_upload_id,
+                    location_name,
+                    storage_metadata,
+                    requested_digest_algorithm=requested_digest_algorithm,
                 )
                 return BlobUpload.for_upload(upload_record, location_name=location_name)
             except database.Repository.DoesNotExist:
@@ -1253,6 +1264,7 @@ class OCIModel(RegistryDataInterface):
         byte_count,
         chunk_count,
         sha_state,
+        requested_digest_state=None,
     ):
         """
         Updates the fields of the blob upload to match those given.
@@ -1269,6 +1281,7 @@ class OCIModel(RegistryDataInterface):
             upload_record.byte_count = byte_count
             upload_record.chunk_count = chunk_count
             upload_record.sha_state = sha_state
+            upload_record.requested_digest_state = requested_digest_state
             upload_record.save()
             return BlobUpload.for_upload(upload_record)
 
@@ -1281,9 +1294,25 @@ class OCIModel(RegistryDataInterface):
             if upload_record is not None:
                 upload_record.delete_instance()
 
-    def commit_blob_upload(self, blob_upload, blob_digest_str, blob_expiration_seconds):
+    def commit_blob_upload(
+        self,
+        blob_upload,
+        blob_digest_str,
+        blob_expiration_seconds,
+        requested_digest=None,
+        recheck_storage=False,
+    ):
         """
         Commits the blob upload into a blob and sets an expiration before that blob will be GCed.
+
+        If `recheck_storage` is a storage engine (or True for the configured store) and this
+        creates the first storage row for the SHA-256, the CAS object's existence is re-checked
+        inside the transaction (BlobStorageMissingException, 503, if GC deleted it). The blob
+        uploader always passes its storage engine after finalizing storage.
+
+        Publication (storage row, placement, repository link, and BlobUpload deletion) runs in one
+        transaction that commits while the BLOB_DELETE lock is held (PROJQUAY-10117). Callers must
+        not wrap this in an outer transaction, or the lock would be released before the commit.
         """
         with db_disallow_replica_use():
             upload_record = model.blob.get_blob_upload_by_uuid(blob_upload.upload_id)
@@ -1292,19 +1321,18 @@ class OCIModel(RegistryDataInterface):
 
             repository_id = upload_record.repository_id
 
-            # Create the blob and temporarily tag it.
             location_obj = model.storage.get_image_location_for_name(blob_upload.location_name)
-            blob_record = model.blob.store_blob_record_and_temp_link_in_repo(
+            blob_record = model.blob.publish_blob(
                 repository_id,
                 blob_digest_str,
                 location_obj.id,
                 blob_upload.byte_count,
                 blob_expiration_seconds,
-                blob_upload.uncompressed_byte_count,
+                uncompressed_byte_count=blob_upload.uncompressed_byte_count,
+                requested_digest=requested_digest,
+                blob_upload_id=upload_record.id,
+                recheck_storage=recheck_storage,
             )
-
-            # Delete the blob upload.
-            upload_record.delete_instance()
             return Blob.for_image_storage(
                 blob_record, storage_path=model.storage.get_layer_path(blob_record)
             )

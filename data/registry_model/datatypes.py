@@ -702,6 +702,8 @@ class BlobUpload(
             "storage_metadata",
             "piece_sha_state",
             "piece_hashes",
+            "requested_digest_algorithm",
+            "requested_digest_state",
         ],
     )
 ):
@@ -722,6 +724,8 @@ class BlobUpload(
             storage_metadata=blob_upload.storage_metadata,
             piece_sha_state=blob_upload.piece_sha_state,
             piece_hashes=blob_upload.piece_hashes,
+            requested_digest_algorithm=blob_upload.requested_digest_algorithm,
+            requested_digest_state=blob_upload.requested_digest_state,
         )
 
 

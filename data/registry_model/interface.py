@@ -340,9 +340,17 @@ class RegistryDataInterface(object):
         """
 
     @abstractmethod
-    def create_blob_upload(self, repository_ref, upload_id, location_name, storage_metadata):
+    def create_blob_upload(
+        self,
+        repository_ref,
+        upload_id,
+        location_name,
+        storage_metadata,
+        requested_digest_algorithm=None,
+    ):
         """
-        Creates a new blob upload and returns a reference.
+        Creates a new blob upload and returns a reference. If `requested_digest_algorithm` is
+        sha384 or sha512, the upload also maintains resumable hash state for that algorithm.
 
         If the blob upload could not be created, returns None.
         """
@@ -363,9 +371,11 @@ class RegistryDataInterface(object):
         byte_count,
         chunk_count,
         sha_state,
+        requested_digest_state=None,
     ):
         """
-        Updates the fields of the blob upload to match those given.
+        Updates the fields of the blob upload to match those given. `requested_digest_state` is
+        the hinted algorithm's hash state, or None if the upload is not (or no longer) tracking it.
 
         Returns the updated blob upload or None if the record does not exists.
         """
@@ -377,9 +387,19 @@ class RegistryDataInterface(object):
         """
 
     @abstractmethod
-    def commit_blob_upload(self, blob_upload, blob_digest_str, blob_expiration_seconds):
+    def commit_blob_upload(
+        self,
+        blob_upload,
+        blob_digest_str,
+        blob_expiration_seconds,
+        requested_digest=None,
+        recheck_storage=False,
+    ):
         """
         Commits the blob upload into a blob and sets an expiration before that blob will be GCed.
+
+        `blob_digest_str` is the internal SHA-256; `requested_digest` is the verified sha384/sha512
+        client-visible digest, or None for a SHA-256 identity.
         """
 
     @abstractmethod

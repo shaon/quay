@@ -14,15 +14,18 @@ from data import database
 from data.model import namespacequota
 from data.registry_model import registry_model
 from data.registry_model.blobuploader import (
+    BlobIntegrityException,
     BlobRangeMismatchException,
     BlobTooLargeException,
     BlobUploadException,
     BlobUploadSettings,
+    RequestedDigestMismatchException,
     complete_when_uploaded,
     create_blob_upload,
     retrieve_blob_upload_manager,
 )
 from digest import digest_tools
+from digest.allowlist import DigestCheck, check_digest, is_algorithm_allowed
 from endpoints.api import log_unauthorized
 from endpoints.decorators import (
     anon_allowed,
@@ -39,10 +42,12 @@ from endpoints.v2.errors import (
     BlobUnknown,
     BlobUploadInvalid,
     BlobUploadUnknown,
+    DigestInvalid,
     InvalidRequest,
     LayerTooLarge,
     NameUnknown,
     QuotaExceeded,
+    UnknownError,
     Unsupported,
 )
 from util.cache import cache_control
@@ -294,15 +299,31 @@ def start_blob_upload(namespace_name, repo_name):
             )
             raise QuotaExceeded
 
+    # Validate the optional `digest-algorithm` hint and any `digest` or `mount` digest before
+    # opening an upload (PROJQUAY-10117): a bad value is rejected with 400 DIGEST_INVALID here.
+    requested_digest_algorithm = _requested_digest_algorithm_hint()
+    digest = request.args.get("digest", None)
+    if digest is not None:
+        digest_check = _check_write_digest(digest)
+        if digest_check == DigestCheck.ALLOWED:
+            # Path A: hash the requested algorithm as the bytes arrive.
+            requested_digest_algorithm = digest_tools.digest_algorithm(digest)
+
     # Check for mounting of a blob from another repository.
     mount_blob_digest = request.args.get("mount", None)
     if mount_blob_digest is not None:
+        _check_write_digest(mount_blob_digest)
         response = _try_to_mount_blob(repository_ref, mount_blob_digest)
         if response is not None:
             return response
 
     # Begin the blob upload process.
-    blob_uploader = create_blob_upload(repository_ref, storage, _upload_settings())
+    blob_uploader = create_blob_upload(
+        repository_ref,
+        storage,
+        _upload_settings(),
+        requested_digest_algorithm=requested_digest_algorithm,
+    )
     if blob_uploader is None:
         logger.debug("Could not create a blob upload for `%s/%s`", namespace_name, repo_name)
         raise InvalidRequest(message="Unable to start blob upload for unknown repository")
@@ -310,7 +331,6 @@ def start_blob_upload(namespace_name, repo_name):
     # Check if the blob will be uploaded now or in followup calls. If the `digest` is given, then
     # the upload will occur as a monolithic chunk in this call. Otherwise, we return a redirect
     # for the client to upload the chunks as distinct operations.
-    digest = request.args.get("digest", None)
     if digest is None:
         # Short-circuit because the user will send the blob data in another request.
         return Response(
@@ -431,6 +451,7 @@ def monolithic_upload_or_last_chunk(namespace_name, repo_name, upload_uuid):
     digest = request.args.get("digest", None)
     if digest is None:
         raise BlobUploadInvalid(detail={"reason": "Missing digest arg on monolithic upload"})
+    _check_write_digest(digest)
 
     # Find the upload.
     repository_ref = registry_model.lookup_repository(namespace_name, repo_name)
@@ -562,6 +583,33 @@ def _start_offset_and_length(range_header):
     return start_offset, length
 
 
+def _check_write_digest(digest):
+    """
+    Applies the allowlist to a digest named by a write (upload `digest`, `mount`). A SHA-256
+    digest keeps today's handling; any other algorithm must be strict and allowed, or the request
+    fails with 400 DIGEST_INVALID.
+    """
+    result = check_digest(digest, app.config)
+    if result == DigestCheck.REJECTED:
+        raise DigestInvalid(detail={"digest": digest})
+    return result
+
+
+def _requested_digest_algorithm_hint():
+    """
+    Returns the hinted sha384/sha512 algorithm from the `digest-algorithm` parameter, or None for
+    no hint or a sha256 hint. Raises 400 DIGEST_INVALID for an unsupported or disallowed hint.
+    """
+    hint = request.args.get("digest-algorithm", None)
+    if hint is None:
+        return None
+    if not is_algorithm_allowed(hint, app.config):
+        raise DigestInvalid(detail={"digest-algorithm": hint})
+    if hint == digest_tools.SHA256:
+        return None
+    return hint
+
+
 def _upload_settings():
     """
     Returns the settings for instantiating a blob upload manager.
@@ -602,6 +650,10 @@ def _upload_chunk(blob_uploader, commit_digest=None):
         _abort_range_not_satisfiable(
             blob_uploader.blob_upload.byte_count, blob_uploader.blob_upload_id
         )
+    except RequestedDigestMismatchException:
+        raise DigestInvalid()
+    except BlobIntegrityException:
+        raise UnknownError()
     except BlobUploadException:
         logger.exception("Exception when uploading blob to %s", blob_uploader.blob_upload_id)
         raise BlobUploadInvalid()

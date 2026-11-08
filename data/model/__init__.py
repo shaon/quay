@@ -17,6 +17,13 @@ class BlobDoesNotExist(DataModelException):
     pass
 
 
+class BlobStorageMissingException(DataModelException):
+    """
+    The CAS object for a blob disappeared before publication committed (GC deleted it while no
+    row referenced it). The client should retry.
+    """
+
+
 class InvalidBlobUpload(DataModelException):
     pass
 
