@@ -58,6 +58,34 @@ def is_algorithm_allowed(algorithm, config):
     )
 
 
+def manifest_referenced_digests(parsed_manifest):
+    """
+    Returns the digests a parsed manifest references: blobs (layers and config), child manifests
+    of a list, and the subject, if any.
+    """
+    referenced = [str(d) for d in (parsed_manifest.blob_digests or [])]
+    if parsed_manifest.is_manifest_list:
+        for child in parsed_manifest.manifest_dict.get("manifests", []):
+            if isinstance(child, dict) and "digest" in child:
+                referenced.append(str(child["digest"]))
+
+    subject = getattr(parsed_manifest, "subject", None)
+    if subject is not None:
+        referenced.append(str(subject.digest))
+    return referenced
+
+
+def first_rejected_manifest_reference(parsed_manifest, config):
+    """
+    Returns the first digest referenced by the manifest (blob, child manifest or subject) that is
+    an unsupported, disallowed or malformed non-SHA-256 digest, or None.
+    """
+    for digest_str in manifest_referenced_digests(parsed_manifest):
+        if is_digest_rejected(digest_str, config):
+            return digest_str
+    return None
+
+
 def is_stored_digest_allowed(digest_str, config):
     """
     Returns True if a digest recorded in the database (always normalized) may be served under the

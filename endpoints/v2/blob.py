@@ -37,7 +37,13 @@ from endpoints.decorators import (
     parse_repository_name,
 )
 from endpoints.metrics import image_pulled_bytes
-from endpoints.v2 import get_input_stream, require_repo_read, require_repo_write, v2_bp
+from endpoints.v2 import (
+    get_input_stream,
+    reject_non_sha256_for_mirror,
+    require_repo_read,
+    require_repo_write,
+    v2_bp,
+)
 from endpoints.v2.errors import (
     BlobUnknown,
     BlobUploadInvalid,
@@ -318,6 +324,11 @@ def start_blob_upload(namespace_name, repo_name):
 
     # Check for mounting of a blob from another repository.
     mount_blob_digest = request.args.get("mount", None)
+    reject_non_sha256_for_mirror(
+        repository_ref,
+        [digest, mount_blob_digest, request.args.get("digest-algorithm")],
+        DigestInvalid,
+    )
     if mount_blob_digest is not None:
         _check_write_digest(mount_blob_digest)
         response = _try_to_mount_blob(repository_ref, mount_blob_digest)
@@ -470,6 +481,8 @@ def monolithic_upload_or_last_chunk(namespace_name, repo_name, upload_uuid):
     )
     if uploader is None:
         raise BlobUploadUnknown()
+
+    reject_non_sha256_for_mirror(repository_ref, [digest], DigestInvalid)
 
     if app.config.get("FEATURE_QUOTA_MANAGEMENT", False) and app.config.get(
         "FEATURE_VERIFY_QUOTA", True

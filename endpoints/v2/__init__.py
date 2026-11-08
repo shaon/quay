@@ -22,6 +22,7 @@ from data.model import (
     PushesDisabledException,
     QuotaExceededException,
 )
+from data.database import RepositoryState
 from data.readreplica import ReadOnlyModeException
 from data.registry_model import registry_model
 from endpoints.decorators import anon_allowed, route_show_if
@@ -92,6 +93,36 @@ def handle_blob_storage_missing(error):
     return _format_error_response(
         TemporarilyUnavailable(message="The blob is no longer in storage. Please retry the push.")
     )
+
+
+def is_mirror_repository(repository_ref):
+    return repository_ref is not None and repository_ref.state in (
+        RepositoryState.MIRROR,
+        RepositoryState.ORG_MIRROR,
+    )
+
+
+def reject_non_sha256_for_mirror(repository_ref, digests, error_class):
+    """
+    Repository mirroring supports SHA-256 images only (PROJQUAY-10117). Writes into a mirrored
+    repository naming any other digest algorithm fail with a reason stating so, which skopeo
+    surfaces as the per-tag sync failure.
+    """
+    if not is_mirror_repository(repository_ref):
+        return
+
+    for digest in digests:
+        if digest is None:
+            continue
+        digest = str(digest)
+        algorithm = digest.split(":", 1)[0] if ":" in digest else digest
+        if algorithm != "sha256":
+            raise error_class(
+                detail={
+                    "message": "digest algorithm %s is not supported for mirroring" % algorithm,
+                    "digest": digest,
+                }
+            )
 
 
 def _format_error_response(error: V2RegistryException) -> Response:

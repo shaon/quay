@@ -166,6 +166,33 @@ org_mirror_repo_sync_duration_seconds = Histogram(
 TAG_ROLLBACK_PAGE_SIZE = app.config.get("REPO_MIRROR_TAG_ROLLBACK_PAGE_SIZE", 100)
 
 
+MIRROR_UNSUPPORTED_DIGEST_REASON = "digest_algorithm_unsupported"
+_UNSUPPORTED_DIGEST_PATTERN = re.compile(
+    r"not supported for mirroring|unsupported digest algorithm|\bsha(384|512)\b", re.IGNORECASE
+)
+
+
+def is_unsupported_digest_algorithm_error(error_message):
+    """
+    Returns True if skopeo or Quay output shows the image uses a digest algorithm other than
+    SHA-256, which mirroring does not support.
+    """
+    return bool(_UNSUPPORTED_DIGEST_PATTERN.search(str(error_message or "")))
+
+
+def _tag_failure_message(src_image, result):
+    """
+    Message for a per-tag sync failure, stating when the failure is because the image uses a
+    digest algorithm other than SHA-256.
+    """
+    if is_unsupported_digest_algorithm_error("%s\n%s" % (result.stdout, result.stderr)):
+        return (
+            "Source '%s' failed to sync: its digest algorithm is not supported for mirroring "
+            "(only sha256 images can be mirrored)" % src_image
+        )
+    return "Source '%s' failed to sync" % src_image
+
+
 def _map_failure_to_reason(error_message):
     """
     Map error messages to standardized failure reasons for metrics.
@@ -173,6 +200,9 @@ def _map_failure_to_reason(error_message):
     """
     error_lower = str(error_message).lower()
 
+    # Mirroring supports SHA-256 images only (PROJQUAY-10117).
+    if is_unsupported_digest_algorithm_error(error_lower):
+        return MIRROR_UNSUPPORTED_DIGEST_REASON
     if "auth" in error_lower or "unauthorized" in error_lower or "forbidden" in error_lower:
         return "auth_failed"
     elif "timeout" in error_lower or "timed out" in error_lower:
@@ -497,7 +527,7 @@ def perform_mirror(skopeo: SkopeoMirror, mirror: RepoMirrorConfig):
                     mirror,
                     "repo_mirror_sync_tag_failed",
                     "finish",
-                    "Source '%s' failed to sync" % src_image,
+                    _tag_failure_message(src_image, result),
                     tag=tag,
                     stdout=result.stdout,
                     stderr=result.stderr,
@@ -1755,6 +1785,13 @@ def perform_org_mirror_repo(skopeo: SkopeoMirror, org_mirror_repo: OrgMirrorRepo
                 overall_status = OrgMirrorRepoStatus.FAIL
                 failed_tags.append(tag)
                 tag_errors[tag] = result.stderr or ""
+                if is_unsupported_digest_algorithm_error(
+                    "%s\n%s" % (result.stdout, result.stderr)
+                ):
+                    tag_errors[tag] = (
+                        "digest algorithm is not supported for mirroring (only sha256 images "
+                        "can be mirrored): %s" % (result.stderr or result.stdout or "")
+                    )
                 logger.info("Org mirror: Source '%s' failed to sync.", src_image)
             else:
                 logger.info("Org mirror: Source '%s' successful sync.", src_image)

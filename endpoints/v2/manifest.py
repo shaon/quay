@@ -22,7 +22,13 @@ from data.model.oci.manifest import CreateManifestException
 from data.model.oci.tag import RetargetTagException
 from data.registry_model import registry_model
 from digest import digest_tools
-from digest.allowlist import DigestCheck, check_digest, is_stored_digest_allowed
+from digest.allowlist import (
+    DigestCheck,
+    check_digest,
+    first_rejected_manifest_reference,
+    is_stored_digest_allowed,
+    manifest_referenced_digests,
+)
 from endpoints.api import (
     log_unauthorized_delete,
     log_unauthorized_pull,
@@ -37,7 +43,13 @@ from endpoints.decorators import (
     parse_repository_name,
 )
 from endpoints.metrics import image_pulls, image_pushes
-from endpoints.v2 import require_repo_read, require_repo_write, v2_bp
+from endpoints.v2 import (
+    is_mirror_repository,
+    reject_non_sha256_for_mirror,
+    require_repo_read,
+    require_repo_write,
+    v2_bp,
+)
 from endpoints.v2.errors import (
     DigestInvalid,
     ManifestInvalid,
@@ -329,14 +341,21 @@ def _doesnt_accept_schema_v1():
 @check_pushes_disabled
 def write_manifest_by_tagname(namespace_name, repo_name, manifest_ref):
     # A push by tag hashes the manifest with DEFAULT_MANIFEST_HASH_ALGORITHM; schema 1 stays
-    # SHA-256.
+    # SHA-256. A mirrored manifest keeps its upstream (SHA-256) digest, so tag pushes into a
+    # mirrored repository always use SHA-256.
+    repository_ref = registry_model.lookup_repository(
+        namespace_name, repo_name, model_cache=model_cache
+    )
+    mirrored = is_mirror_repository(repository_ref)
     parsed = _parse_manifest(
         request.content_type,
         request.data,
-        digest_algorithm=default_manifest_hash_algorithm(app.config),
+        digest_algorithm=(
+            digest_tools.SHA256 if mirrored else default_manifest_hash_algorithm(app.config)
+        ),
         schema1_uses_sha256=True,
     )
-    _check_manifest_references(parsed)
+    _check_manifest_references(parsed, repository_ref)
 
     return _write_manifest_and_log(namespace_name, repo_name, manifest_ref, parsed)
 
@@ -366,6 +385,11 @@ def write_manifest_by_digest(namespace_name, repo_name, manifest_ref):
         image_pushes.labels("v2", 400, "").inc()
         raise DigestInvalid(detail={"digest": manifest_ref})
 
+    repository_ref = registry_model.lookup_repository(
+        namespace_name, repo_name, model_cache=model_cache
+    )
+    reject_non_sha256_for_mirror(repository_ref, [manifest_ref], DigestInvalid)
+
     tag_names = _requested_tags()
 
     # A push by digest hashes the manifest with the algorithm named in the address.
@@ -378,7 +402,7 @@ def write_manifest_by_digest(namespace_name, repo_name, manifest_ref):
         image_pushes.labels("v2", 400, "").inc()
         raise ManifestInvalid(detail={"message": "manifest digest mismatch"})
 
-    _check_manifest_references(parsed)
+    _check_manifest_references(parsed, repository_ref)
 
     if tag_names:
         return _write_manifest_with_tags_and_log(namespace_name, repo_name, tag_names, parsed)
@@ -455,37 +479,24 @@ def _requested_tags():
     return list(dict.fromkeys(tag_names))
 
 
-def _check_manifest_references(parsed):
+def _check_manifest_references(parsed, repository_ref=None):
     """
     Rejects a manifest that references a blob or child manifest by an unsupported, disallowed or
     malformed non-SHA-256 digest, or whose `subject` does (400 MANIFEST_INVALID). An allowed
-    subject that does not exist yet is accepted.
+    subject that does not exist yet is accepted. A mirrored repository accepts SHA-256 only.
     """
-    referenced = []
     try:
-        referenced.extend(str(d) for d in (parsed.blob_digests or []))
+        rejected = first_rejected_manifest_reference(parsed, app.config)
+        referenced = manifest_referenced_digests(parsed)
     except ManifestException as me:
         raise ManifestInvalid(detail={"message": str(me)})
 
-    if parsed.is_manifest_list:
-        for child in parsed.manifest_dict.get("manifests", []):
-            if isinstance(child, dict) and "digest" in child:
-                referenced.append(str(child["digest"]))
+    reject_non_sha256_for_mirror(repository_ref, referenced, ManifestInvalid)
 
-    for digest in referenced:
-        if check_digest(digest, app.config) == DigestCheck.REJECTED:
-            image_pushes.labels("v2", 400, "").inc()
-            raise ManifestInvalid(
-                detail={"message": "manifest references a disallowed digest `%s`" % digest}
-            )
-
-    subject = getattr(parsed, "subject", None)
-    if subject is not None and check_digest(str(subject.digest), app.config) == (
-        DigestCheck.REJECTED
-    ):
+    if rejected is not None:
         image_pushes.labels("v2", 400, "").inc()
         raise ManifestInvalid(
-            detail={"message": "manifest subject has a disallowed digest `%s`" % subject.digest}
+            detail={"message": "manifest references a disallowed digest `%s`" % rejected}
         )
 
 

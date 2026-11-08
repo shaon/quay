@@ -138,6 +138,25 @@ def registry_server_executor(app):
         set_tag_immutable(repo_ref.id, tag_name, True)
         return "OK"
 
+    def setup_mirror_repository(repo_name):
+        # Creates a repository in MIRROR state and returns its mirror robot's credentials.
+        from data.database import RepositoryState
+        from data.model.test.test_repo_mirroring import create_mirror_repo_robot
+        from data.model.user import retrieve_robot_token
+
+        mirror, repo = create_mirror_repo_robot(["latest"], repo_name=repo_name)
+        repo.state = RepositoryState.MIRROR
+        repo.save()
+        model.permission.set_user_repo_permission(
+            mirror.internal_robot.username, "mirror", repo_name, "write"
+        )
+        return jsonify(
+            {
+                "username": mirror.internal_robot.username,
+                "password": retrieve_robot_token(mirror.internal_robot),
+            }
+        )
+
     def put_cas_object(digest, content_hex):
         # Writes bytes at a blob's CAS path with no ImageStorage row (an orphaned object).
         storage.put_content(["local_us"], storage.blob_path(digest), bytes.fromhex(content_hex))
@@ -194,6 +213,7 @@ def registry_server_executor(app):
     executor.register("make_tag_immutable", make_tag_immutable)
     executor.register("hold_blob_lock", hold_blob_lock)
     executor.register("put_cas_object", put_cas_object)
+    executor.register("setup_mirror_repository", setup_mirror_repository)
     executor.register("release_blob_lock", release_blob_lock)
     return executor
 

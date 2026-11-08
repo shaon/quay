@@ -4870,3 +4870,72 @@ def test_requested_digest_api_v1_gated_by_allowlist(
             headers={"Content-Type": "application/json"},
         )
         assert response.status_code in (200, 201)
+
+
+# ---------------------------------------------------------------------------------------------
+# PROJQUAY-10117 Proposal 1: mirroring supports SHA-256 images only.
+# ---------------------------------------------------------------------------------------------
+
+
+def test_requested_digest_mirror_repository_rejects_non_sha256(
+    v22_protocol, liveserver_session, liveserver, registry_server_executor, default_manifest_sha512
+):
+    """Writes into a mirrored repository naming another algorithm fail with a reason stating it
+    is not supported for mirroring; a mirrored manifest pushed by tag keeps its SHA-256 digest
+    even when DEFAULT_MANIFEST_HASH_ALGORITHM is sha512."""
+    executor = registry_server_executor.on(liveserver)
+    creds = executor.setup_mirror_repository("pqcmirror").json()
+    repo_name = "mirror/pqcmirror"
+    token, _ = v22_protocol.auth(
+        liveserver_session,
+        (creds["username"], creds["password"]),
+        "mirror",
+        "pqcmirror",
+        scopes=["repository:%s:push,pull" % repo_name],
+    )
+    headers = {"Authorization": "Bearer " + token}
+
+    data = layer_bytes_for_contents(b"mirror sha512 layer")
+    for path in ("A", "C"):
+        response = _upload(
+            v22_protocol, liveserver_session, headers, repo_name, data,
+            _alg_digest("sha512", data), path, expected=400,
+        )
+        assert _error_code(response) == "DIGEST_INVALID"
+        assert "not supported for mirroring" in response.json()["errors"][0]["detail"]["message"]
+
+    response = v22_protocol.conduct(
+        liveserver_session,
+        "POST",
+        "/v2/%s/blobs/uploads/" % repo_name,
+        params={"digest-algorithm": "sha512"},
+        expected_status=400,
+        headers=headers,
+    )
+    assert "not supported for mirroring" in response.json()["errors"][0]["detail"]["message"]
+
+    config, layer = _push_image_blobs(
+        v22_protocol, liveserver_session, headers, repo_name, "sha256", "mirror"
+    )
+    manifest_bytes = _image_manifest_bytes(config, [layer])
+    response = _put_manifest(
+        v22_protocol, liveserver_session, headers, repo_name, "latest", manifest_bytes,
+        OCI_MANIFEST_TYPE,
+    )
+    assert response.headers["Docker-Content-Digest"] == _alg_digest("sha256", manifest_bytes)
+
+    response = _put_manifest(
+        v22_protocol, liveserver_session, headers, repo_name,
+        _alg_digest("sha512", manifest_bytes), manifest_bytes, OCI_MANIFEST_TYPE, expected=400,
+    )
+    assert "not supported for mirroring" in response.json()["errors"][0]["detail"]["message"]
+
+    referencing = _image_manifest_bytes(
+        config, [{"digest": "sha512:" + "a" * 128, "size": 10}]
+    )
+    response = _put_manifest(
+        v22_protocol, liveserver_session, headers, repo_name, "other", referencing,
+        OCI_MANIFEST_TYPE, expected=400,
+    )
+    assert _error_code(response) == "MANIFEST_INVALID"
+    assert "not supported for mirroring" in response.json()["errors"][0]["detail"]["message"]
