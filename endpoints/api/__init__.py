@@ -36,6 +36,7 @@ from data import model as data_model
 from data.database import RepositoryState, User
 from data.logs_model import logs_model
 from digest import digest_tools
+from digest.allowlist import is_digest_rejected
 from endpoints.csrf import csrf_protect
 from endpoints.decorators import (
     check_anon_protection,
@@ -243,6 +244,28 @@ def parse_args(kwarg_name="parsed_args"):
         return wrapper
 
     return inner
+
+
+def check_manifest_digest_allowed(digest):
+    """
+    Raises NotFound if `digest` names an unsupported, disallowed or malformed non-SHA-256 digest.
+    The allowlist gates `/api/v1` like `/v2` (PROJQUAY-10117); listings are unaffected.
+    """
+    if digest is not None and is_digest_rejected(str(digest), app.config):
+        raise NotFound()
+
+
+def require_allowed_manifestref(func):
+    """
+    Returns 404 for a resource addressed by a disallowed `manifestref` digest.
+    """
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        check_manifest_digest_allowed(kwargs.get("manifestref"))
+        return func(*args, **kwargs)
+
+    return wrapper
 
 
 def parse_repository_name(func):

@@ -27,6 +27,7 @@ from endpoints.api import (
     parse_args,
     path_param,
     query_param,
+    require_allowed_manifestref,
     require_repo_read,
     require_repo_write,
     resource,
@@ -149,6 +150,7 @@ class RepositoryManifest(RepositoryParamResource):
         type=truthy_bool,
         default=False,
     )
+    @require_allowed_manifestref
     def get(self, namespace_name, repository_name, manifestref, parsed_args):
         repo_ref = registry_model.lookup_repository(namespace_name, repository_name)
         if repo_ref is None:
@@ -220,6 +222,7 @@ class RepositoryManifestLabels(RepositoryParamResource):
         type=str,
         default=None,
     )
+    @require_allowed_manifestref
     def get(self, namespace_name, repository_name, manifestref, parsed_args):
         repo_ref = registry_model.lookup_repository(namespace_name, repository_name)
         if repo_ref is None:
@@ -240,6 +243,7 @@ class RepositoryManifestLabels(RepositoryParamResource):
     @disallow_for_non_normal_repositories
     @disallow_for_user_namespace
     @validate_json_request("AddLabel")
+    @require_allowed_manifestref
     def post(self, namespace_name, repository_name, manifestref):
         """
         Adds a new label into the tag manifest.
@@ -314,6 +318,7 @@ class ManageRepositoryManifestLabel(RepositoryParamResource):
 
     @require_repo_read(allow_for_superuser=True, allow_for_global_readonly_superuser=True)
     @nickname("getManifestLabel")
+    @require_allowed_manifestref
     def get(self, namespace_name, repository_name, manifestref, labelid):
         """
         Retrieves the label with the specific ID under the manifest.
@@ -336,6 +341,7 @@ class ManageRepositoryManifestLabel(RepositoryParamResource):
     @nickname("deleteManifestLabel")
     @disallow_for_non_normal_repositories
     @disallow_for_user_namespace
+    @require_allowed_manifestref
     def delete(self, namespace_name, repository_name, manifestref, labelid):
         """
         Deletes an existing label from a manifest.
@@ -380,6 +386,7 @@ class RepositoryManifestPullStatistics(RepositoryParamResource):
 
     @require_repo_read(allow_for_superuser=True, allow_for_global_readonly_superuser=True)
     @nickname("getManifestPullStatistics")
+    @require_allowed_manifestref
     def get(self, namespace_name, repository_name, manifestref):
         """
         Get pull statistics for a specific manifest.

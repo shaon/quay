@@ -71,6 +71,10 @@ BLOB_CONTENT_TYPE = "application/octet-stream"
 @cache_control(max_age=31436000)
 @inject_registry_model()
 def check_blob_exists(namespace_name, repo_name, digest, registry_model):
+    # The allowlist applies to every response, including cached ones (PROJQUAY-10117).
+    if check_digest(digest, app.config) == DigestCheck.REJECTED:
+        raise BlobUnknown()
+
     # Find the blob.
     blob = registry_model.get_cached_repo_blob(model_cache, namespace_name, repo_name, digest)
     if blob is None:
@@ -109,6 +113,9 @@ def check_blob_exists(namespace_name, repo_name, digest, registry_model):
 @cache_control(max_age=31536000)
 @inject_registry_model()
 def download_blob(namespace_name, repo_name, digest, registry_model):
+    if check_digest(digest, app.config) == DigestCheck.REJECTED:
+        raise BlobUnknown()
+
     # try returning blob from cache
     blob = registry_model.get_cached_repo_blob(model_cache, namespace_name, repo_name, digest)
     if blob is None:

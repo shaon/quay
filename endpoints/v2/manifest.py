@@ -22,7 +22,7 @@ from data.model.oci.manifest import CreateManifestException
 from data.model.oci.tag import RetargetTagException
 from data.registry_model import registry_model
 from digest import digest_tools
-from digest.allowlist import DigestCheck, check_digest
+from digest.allowlist import DigestCheck, check_digest, is_stored_digest_allowed
 from endpoints.api import (
     log_unauthorized_delete,
     log_unauthorized_pull,
@@ -120,6 +120,11 @@ def fetch_manifest_by_tagname(namespace_name, repo_name, manifest_ref, registry_
         image_pulls.labels("v2", "tag", 400).inc()
         raise ManifestInvalid()
 
+    # For tag requests the allowlist applies to the resolved manifest digest (PROJQUAY-10117).
+    if not is_stored_digest_allowed(manifest.digest, app.config):
+        image_pulls.labels("v2", "tag", 404).inc()
+        raise ManifestUnknown()
+
     try:
         manifest_bytes, manifest_digest, manifest_media_type = _rewrite_schema_if_necessary(
             namespace_name, repo_name, manifest_ref, manifest, registry_model
@@ -128,7 +133,7 @@ def fetch_manifest_by_tagname(namespace_name, repo_name, manifest_ref, registry_
         image_pulls.labels("v2", "tag", 404).inc()
         raise ManifestUnknown(str(e))
 
-    if manifest_bytes is None:
+    if manifest_bytes is None or not is_stored_digest_allowed(manifest_digest, app.config):
         image_pulls.labels("v2", "tag", 404).inc()
         raise ManifestUnknown()
 
@@ -184,6 +189,11 @@ def fetch_manifest_by_digest(namespace_name, repo_name, manifest_ref, registry_m
     except RepositoryDoesNotExist as e:
         image_pulls.labels("v2", "manifest", 404).inc()
         raise NameUnknown("repository not found")
+
+    # The allowlist applies to every response, including cached ones (PROJQUAY-10117).
+    if check_digest(manifest_ref, app.config) == DigestCheck.REJECTED:
+        image_pulls.labels("v2", "manifest", 404).inc()
+        raise ManifestUnknown()
 
     try:
         manifest = registry_model.lookup_cached_manifest_by_digest(

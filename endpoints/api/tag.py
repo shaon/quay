@@ -28,6 +28,7 @@ from endpoints.api import (
 )
 from endpoints.api import abort as custom_abort
 from endpoints.api import (
+    check_manifest_digest_allowed,
     disallow_for_non_normal_repositories,
     disallow_for_user_namespace,
     format_date,
@@ -337,6 +338,7 @@ class RepositoryTag(RepositoryParamResource):
             manifest_digest = None
 
             manifest_digest = request.get_json()["manifest_digest"]
+            check_manifest_digest_allowed(manifest_digest)
             manifest = registry_model.lookup_manifest_by_digest(
                 repo_ref, manifest_digest, require_available=True
             )
@@ -449,6 +451,8 @@ class RestoreTag(RepositoryParamResource):
         if manifest_digest is None:
             raise InvalidRequest("Missing manifest_digest")
 
+        check_manifest_digest_allowed(manifest_digest)
+
         # Data for logging the reversion/restoration.
         username = get_authenticated_user().username
         log_data = {
@@ -530,6 +534,7 @@ class TagTimeMachineDelete(RepositoryParamResource):
         manifest_digest = request.get_json().get("manifest_digest", None)
         if not alive and manifest_digest is None:
             raise InvalidRequest("manifest_digest required when is_alive set to false")
+        check_manifest_digest_allowed(manifest_digest)
 
         manifest_ref = None
         if alive:

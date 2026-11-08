@@ -4713,3 +4713,160 @@ def test_requested_digest_no_schema1_conversion(
         "application/vnd.docker.distribution.manifest.v1+prettyjws", expected=404,
     )
     assert _error_code(response) == "MANIFEST_UNKNOWN"
+
+
+# ---------------------------------------------------------------------------------------------
+# PROJQUAY-10117 Proposal 1: configurable digest algorithms (pull and /api/v1 gating).
+# ---------------------------------------------------------------------------------------------
+
+
+def _push_requested_image(protocol, session, headers, repo_name, algorithm, label, tag):
+    config, layer = _push_image_blobs(protocol, session, headers, repo_name, algorithm, label)
+    manifest_bytes = _image_manifest_bytes(config, [layer])
+    digest = _alg_digest(algorithm, manifest_bytes)
+    _put_manifest(
+        protocol, session, headers, repo_name, digest, manifest_bytes, OCI_MANIFEST_TYPE,
+        params={"tag": [tag]},
+    )
+    return digest, manifest_bytes, layer
+
+
+@pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
+def test_requested_digest_pulls_gated_by_allowlist(
+    algorithm, v22_protocol, liveserver_session, liveserver, registry_server_executor,
+    app_reloader,
+):
+    """Reads by a disallowed algorithm return 404 BLOB_UNKNOWN / MANIFEST_UNKNOWN, including for
+    content published while it was allowed and for tags resolving to such a manifest; enabling
+    the algorithm again restores access."""
+    executor = registry_server_executor.on(liveserver)
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+
+    with ConfigChange("ALLOWED_HASH_ALGORITHMS", ALL_HASH_ALGORITHMS, executor, liveserver):
+        digest, manifest_bytes, layer = _push_requested_image(
+            v22_protocol, liveserver_session, headers, repo_name, algorithm, "gated", "gated"
+        )
+        # Warm any caches while allowed.
+        _assert_blob_served(
+            v22_protocol, liveserver_session, headers, repo_name, layer["bytes"], layer["digest"]
+        )
+        _get_manifest(v22_protocol, liveserver_session, headers, repo_name, digest, OCI_MANIFEST_TYPE)
+        _get_manifest(v22_protocol, liveserver_session, headers, repo_name, "gated", OCI_MANIFEST_TYPE)
+
+    with ConfigChange("ALLOWED_HASH_ALGORITHMS", ["sha256"], executor, liveserver):
+        for method in ("GET", "HEAD"):
+            response = v22_protocol.conduct(
+                liveserver_session,
+                method,
+                "/v2/%s/blobs/%s" % (repo_name, layer["digest"]),
+                expected_status=404,
+                headers=headers,
+            )
+            if method == "GET":
+                assert _error_code(response) == "BLOB_UNKNOWN"
+
+            response = _get_manifest(
+                v22_protocol, liveserver_session, headers, repo_name, digest,
+                OCI_MANIFEST_TYPE, expected=404, method=method,
+            )
+            if method == "GET":
+                assert _error_code(response) == "MANIFEST_UNKNOWN"
+
+            response = _get_manifest(
+                v22_protocol, liveserver_session, headers, repo_name, "gated",
+                OCI_MANIFEST_TYPE, expected=404, method=method,
+            )
+            if method == "GET":
+                assert _error_code(response) == "MANIFEST_UNKNOWN"
+
+        # Listings still show the tag.
+        tags = v22_protocol.conduct(
+            liveserver_session, "GET", "/v2/%s/tags/list" % repo_name, headers=headers
+        ).json()
+        assert "gated" in tags["tags"]
+
+    with ConfigChange("ALLOWED_HASH_ALGORITHMS", ALL_HASH_ALGORITHMS, executor, liveserver):
+        pulled = _get_manifest(
+            v22_protocol, liveserver_session, headers, repo_name, "gated", OCI_MANIFEST_TYPE
+        )
+        assert pulled.content == manifest_bytes
+        assert pulled.headers["Docker-Content-Digest"] == digest
+
+
+@pytest.mark.parametrize(
+    "bad_ref", ["sha512:" + "A" * 128, "sha384:" + "a" * 95, "md5:" + "a" * 32, "sha1:" + "a" * 40]
+)
+def test_requested_digest_malformed_reads(
+    bad_ref, v22_protocol, liveserver_session, all_hash_algorithms
+):
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    for method in ("GET", "HEAD"):
+        v22_protocol.conduct(
+            liveserver_session, method, "/v2/%s/blobs/%s" % (repo_name, bad_ref),
+            expected_status=404, headers=headers,
+        )
+        _get_manifest(
+            v22_protocol, liveserver_session, headers, repo_name, bad_ref, OCI_MANIFEST_TYPE,
+            expected=404, method=method,
+        )
+
+
+@pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
+def test_requested_digest_api_v1_gated_by_allowlist(
+    algorithm, v22_protocol, liveserver_session, liveserver, registry_server_executor,
+    api_caller, app_reloader,
+):
+    """`/api/v1` endpoints addressed by a disallowed digest return 404; listings still show
+    existing SHA-384/512 manifests and their digests."""
+    executor = registry_server_executor.on(liveserver)
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    api_caller.conduct_auth("devtable", "password")
+    base = "/api/v1/repository/%s" % repo_name
+
+    with ConfigChange("ALLOWED_HASH_ALGORITHMS", ALL_HASH_ALGORITHMS, executor, liveserver):
+        digest, _, _ = _push_requested_image(
+            v22_protocol, liveserver_session, headers, repo_name, algorithm, "api", "api"
+        )
+        other_digest, _, _ = _push_requested_image(
+            v22_protocol, liveserver_session, headers, repo_name, "sha256", "api-other", "other"
+        )
+        assert api_caller.get("%s/manifest/%s" % (base, digest)).status_code == 200
+        assert api_caller.get("%s/manifest/%s/labels" % (base, digest)).status_code == 200
+
+    with ConfigChange("ALLOWED_HASH_ALGORITHMS", ["sha256"], executor, liveserver):
+        assert api_caller.get("%s/manifest/%s" % (base, digest)).status_code == 404
+        assert api_caller.get("%s/manifest/%s/labels" % (base, digest)).status_code == 404
+        response = api_caller.post(
+            "%s/manifest/%s/labels" % (base, digest),
+            data=_json.dumps({"key": "k", "value": "v", "media_type": "text/plain"}),
+            headers={"Content-Type": "application/json"},
+        )
+        assert response.status_code == 404
+        assert api_caller.get("%s/manifest/%s/security" % (base, digest)).status_code == 404
+
+        # Moving a tag to, or restoring a tag at, a disallowed digest is not found.
+        response = api_caller.put(
+            "%s/tag/other" % base,
+            data=_json.dumps({"manifest_digest": digest}),
+            headers={"Content-Type": "application/json"},
+        )
+        assert response.status_code == 404
+        response = api_caller.post(
+            "%s/tag/api/restore" % base,
+            data=_json.dumps({"manifest_digest": digest}),
+            headers={"Content-Type": "application/json"},
+        )
+        assert response.status_code == 404
+
+        # Listings still show the SHA-384/512 manifest and digest.
+        listing = api_caller.get("%s/tag/" % base).json()
+        assert {t["name"]: t["manifest_digest"] for t in listing["tags"]}["api"] == digest
+
+        # SHA-256 manifests are unaffected (positive control for the same endpoints).
+        assert api_caller.get("%s/manifest/%s" % (base, other_digest)).status_code == 200
+        response = api_caller.put(
+            "%s/tag/moved" % base,
+            data=_json.dumps({"manifest_digest": other_digest}),
+            headers={"Content-Type": "application/json"},
+        )
+        assert response.status_code in (200, 201)

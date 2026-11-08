@@ -18,6 +18,7 @@ from endpoints.api import (
     parse_args,
     path_param,
     query_param,
+    require_allowed_manifestref,
     require_repo_read,
     resource,
     show_if,
@@ -98,6 +99,7 @@ class RepositoryManifestSecurity(RepositoryParamResource):
     @query_param(
         "vulnerabilities", "Include vulnerabilities informations", type=truthy_bool, default=False
     )
+    @require_allowed_manifestref
     def get(self, namespace, repository, manifestref, parsed_args):
         repo_ref = registry_model.lookup_repository(namespace, repository)
         if repo_ref is None:
