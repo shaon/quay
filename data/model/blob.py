@@ -80,17 +80,142 @@ def _find_requested_row(blob_digest, requested_digest):
     )
 
 
+def get_stored_requested_blob(requested_digest):
+    """
+    Returns the lowest-ID row with this requested sha384/sha512 digest that has stored bytes
+    (a SHA-256 and a placement), or None. Used by the proxy cache to link existing content.
+    """
+    return (
+        ImageStorage.select()
+        .join(ImageStoragePlacement)
+        .where(
+            ImageStorage.requested_content_checksum == requested_digest,
+            ImageStorage.content_checksum.is_null(False),
+        )
+        .order_by(ImageStorage.id)
+        .first()
+    )
+
+
+def _repository_placeholder(repository_id, requested_digest):
+    """
+    Returns this repository's unfilled SHA-384/512 proxy-cache placeholder for the digest: a row
+    with the requested digest, a NULL content_checksum, linked to the repository.
+    """
+    from data.database import ManifestBlob
+
+    return (
+        ImageStorage.select()
+        .join(ManifestBlob)
+        .where(
+            ManifestBlob.repository == repository_id,
+            ImageStorage.requested_content_checksum == requested_digest,
+            ImageStorage.content_checksum.is_null(True),
+        )
+        .order_by(ImageStorage.id)
+        .first()
+    )
+
+
+def get_or_create_requested_placeholder(repository_id, requested_digest, image_size):
+    """
+    Returns this repository's placeholder for a SHA-384/512 descriptor, creating one with the
+    requested digest and size, no SHA-256 and no placement. Placeholders are never shared between
+    repositories; the caller links the row through ManifestBlob.
+    """
+    assert storage_model.is_requested_identity(requested_digest)
+    existing = _repository_placeholder(repository_id, requested_digest)
+    if existing is not None:
+        return existing
+
+    return ImageStorage.create(
+        content_checksum=None,
+        requested_content_checksum=requested_digest,
+        image_size=image_size,
+    )
+
+
+def _repoint_placeholder_links(repository_id, placeholder, storage):
+    """
+    Repoints this repository's manifest links and quota charge from a filled-elsewhere placeholder
+    to `storage`, the existing row with the same SHA-256 and requested digest.
+    """
+    from data.database import ManifestBlob
+    from data.model.quota import QuotaOperation, update_quota
+
+    links = list(
+        ManifestBlob.select().where(
+            ManifestBlob.repository == repository_id, ManifestBlob.blob == placeholder.id
+        )
+    )
+    for link in links:
+        update_quota(
+            repository_id,
+            link.manifest_id,
+            {placeholder.id: placeholder.image_size},
+            QuotaOperation.SUBTRACT,
+        )
+        already_linked = (
+            ManifestBlob.select()
+            .where(
+                ManifestBlob.repository == repository_id,
+                ManifestBlob.manifest == link.manifest_id,
+                ManifestBlob.blob == storage.id,
+            )
+            .exists()
+        )
+        if already_linked:
+            link.delete_instance()
+        else:
+            ManifestBlob.update(blob=storage.id).where(ManifestBlob.id == link.id).execute()
+            update_quota(
+                repository_id,
+                link.manifest_id,
+                {storage.id: storage.image_size},
+                QuotaOperation.ADD,
+            )
+
+
 def _select_or_create_requested_row(
-    blob_digest, requested_digest, byte_count, uncompressed_byte_count
+    blob_digest, requested_digest, byte_count, uncompressed_byte_count, repository_id=None
 ):
     """
     Selects or creates the single row for (blob_digest, requested_digest). The partial unique
     index allows at most one; a publisher that loses a concurrent race reuses the winner's row.
+
+    If the repository has an unfilled proxy-cache placeholder for the requested digest, it is
+    either repointed to the existing row or filled in with the SHA-256 (the only case in which
+    content_checksum is ever updated).
     """
     storage = _find_requested_row(blob_digest, requested_digest)
+    placeholder = (
+        _repository_placeholder(repository_id, requested_digest)
+        if repository_id is not None
+        else None
+    )
+
     if storage is not None:
         _update_storage_sizes(storage, byte_count, uncompressed_byte_count)
+        if placeholder is not None:
+            _repoint_placeholder_links(repository_id, placeholder, storage)
         return storage
+
+    if placeholder is not None:
+        try:
+            with db.atomic():
+                placeholder.content_checksum = blob_digest
+                placeholder.image_size = byte_count
+                if uncompressed_byte_count is not None:
+                    placeholder.uncompressed_size = uncompressed_byte_count
+                placeholder.save()
+            return placeholder
+        except IntegrityError:
+            # Another publisher created the (SHA-256, requested digest) row concurrently.
+            storage = _find_requested_row(blob_digest, requested_digest)
+            if storage is None:
+                raise
+            _repoint_placeholder_links(repository_id, placeholder, storage)
+            return storage
 
     if not blob_lock_may_create():
         raise LockAcquireTimeout(
@@ -156,7 +281,11 @@ def _publish_blob(
                 )
         else:
             storage = _select_or_create_requested_row(
-                blob_digest, requested_digest, byte_count, uncompressed_byte_count
+                blob_digest,
+                requested_digest,
+                byte_count,
+                uncompressed_byte_count,
+                repository_id=repository_id,
             )
 
         if first_row and recheck_storage and storage.cas_path:

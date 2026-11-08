@@ -251,6 +251,20 @@ def _is_storage_orphaned(candidate_id):
         )
 
         if not has_placement:
+            # An unlinked, unfilled SHA-384/512 proxy-cache placeholder (requested digest, no
+            # SHA-256 yet) has no bytes to remove and is deleted (PROJQUAY-10117). SHA-256
+            # placeholders keep today's behavior.
+            if (
+                ImageStorage.select()
+                .where(
+                    ImageStorage.id == candidate_id,
+                    ImageStorage.content_checksum.is_null(True),
+                    ImageStorage.requested_content_checksum.is_null(False),
+                )
+                .exists()
+            ):
+                return True
+
             # Placeholder blobs will be GCed later in a future cycle or the download worker will download it
             logger.debug("Skipping GC of placeholder blob %s (no placement yet)", candidate_id)
             return False

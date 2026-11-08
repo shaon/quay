@@ -31,6 +31,7 @@ from data.model import (
     namespacequota,
     oci,
 )
+from data.model import blob as blob_model
 from data.model.oci.manifest import is_child_manifest
 from data.model.proxy_cache import get_proxy_cache_config_for_org
 from data.model.quota import (
@@ -45,6 +46,7 @@ from data.model.storage import (
     get_layer_path,
     get_or_create_blob_with_lock,
     identity_clause,
+    is_requested_identity,
     repository_selection_order,
     with_blob_lock_or_fallback,
 )
@@ -59,6 +61,8 @@ from data.registry_model.blobuploader import (
 )
 from data.registry_model.datatypes import Manifest, RepositoryReference, Tag
 from data.registry_model.registry_oci_model import OCIModel
+from digest import digest_tools
+from digest.allowlist import first_rejected_manifest_reference, is_digest_rejected
 from image.docker.schema1 import (
     DOCKER_SCHEMA1_MANIFEST_CONTENT_TYPE,
     DOCKER_SCHEMA1_SIGNED_MANIFEST_CONTENT_TYPE,
@@ -72,6 +76,7 @@ from image.oci import OCI_IMAGE_INDEX_CONTENT_TYPE, OCI_IMAGE_MANIFEST_CONTENT_T
 from image.shared import ManifestException
 from image.shared.interfaces import ManifestInterface
 from image.shared.schemas import parse_manifest_from_bytes
+from image.shared.schemautil import manifest_digest_algorithm
 from proxy import REGISTRY_URLS, Proxy, UpstreamAuthError, UpstreamRegistryError
 from util.bytes import Bytes
 from util.names import conflicts_with_build_route
@@ -802,7 +807,16 @@ class ProxyModel(OCIModel):
             maximum_blob_size=app.config["MAXIMUM_LAYER_SIZE"],
             committed_blob_expiration=expiration,
         )
-        uploader = create_blob_upload(repo_ref, storage, settings)
+        # Fill through the normal upload path with the digest known (blob upload path A).
+        algorithm = digest_tools.digest_algorithm(str(digest))
+        uploader = create_blob_upload(
+            repo_ref,
+            storage,
+            settings,
+            requested_digest_algorithm=(
+                algorithm if algorithm in (digest_tools.SHA384, digest_tools.SHA512) else None
+            ),
+        )
         with self._proxy.get_blob(digest) as resp:
             start_offset = 0
             length = int(resp.headers.get("content-length", -1))
@@ -843,7 +857,31 @@ class ProxyModel(OCIModel):
             update_quota(repo_id, manifest_id, {blob.id: blob.image_size}, QuotaOperation.ADD)
         return blob, newly_created
 
+    def _create_requested_blob(self, digest: str, size: int, manifest_id: int, repo_id: int):
+        """
+        SHA-384/512 descriptor (PROJQUAY-10117): link an existing row with this requested digest
+        and stored bytes, downloading nothing; otherwise link this repository's placeholder (a row
+        with the requested digest and size, a NULL content_checksum and no placement), creating it
+        if needed. Placeholders are never shared between repositories. No lock is needed because
+        no bytes exist yet.
+        """
+        blob = blob_model.get_stored_requested_blob(digest)
+        if blob is None:
+            blob = blob_model.get_or_create_requested_placeholder(repo_id, digest, size)
+
+        newly_created = False
+        try:
+            ManifestBlob.get(manifest_id=manifest_id, blob=blob, repository_id=repo_id)
+        except ManifestBlob.DoesNotExist:
+            ManifestBlob.create(manifest_id=manifest_id, blob=blob, repository_id=repo_id)
+            newly_created = True
+            update_quota(repo_id, manifest_id, {blob.id: blob.image_size}, QuotaOperation.ADD)
+        return blob, newly_created
+
     def _create_blob(self, digest: str, size: int, manifest_id: int, repo_id: int):
+        if is_requested_identity(digest):
+            return self._create_requested_blob(str(digest), size, manifest_id, repo_id)
+
         return with_blob_lock_or_fallback(
             digest,
             self._create_blob_in_storage,
@@ -941,10 +979,30 @@ class ProxyModel(OCIModel):
 
         # TODO: do we need the compatibility check from v2._parse_manifest?
         mbytes = Bytes.for_string_or_unicode(raw_manifest)
-        manifest = parse_manifest_from_bytes(mbytes, content_type, sparse_manifest_support=True)
+        try:
+            # A manifest pulled by digest keeps that digest's algorithm (PROJQUAY-10117).
+            manifest = parse_manifest_from_bytes(
+                mbytes,
+                content_type,
+                sparse_manifest_support=True,
+                digest_algorithm=manifest_digest_algorithm(manifest_ref),
+            )
+        except ManifestException as me:
+            raise ManifestDoesNotExist(str(me))
+
         valid = self._validate_schema1_manifest(upstream_namespace, upstream_repo_name, manifest)
         if not valid:
             raise ManifestDoesNotExist("invalid schema 1 manifest")
+
+        # Never cache an upstream manifest that uses a disallowed algorithm for itself or any of
+        # its descriptors; the pull returns 404 MANIFEST_UNKNOWN.
+        if ":" in str(manifest_ref) and is_digest_rejected(str(manifest_ref), app.config):
+            raise ManifestDoesNotExist("manifest digest algorithm is not allowed")
+        rejected = first_rejected_manifest_reference(manifest, app.config)
+        if rejected is not None:
+            raise ManifestDoesNotExist(
+                "upstream manifest references disallowed digest `%s`" % rejected
+            )
         return manifest
 
     def _validate_schema1_manifest(
