@@ -52,3 +52,91 @@ def test_parse_fail(bad_digest):
 )
 def test_paths(digest, path):
     assert content_path(digest) == path
+
+
+# PROJQUAY-10117: strict parsing and algorithm-generic hashing.
+
+import hashlib
+
+from digest.digest_tools import (
+    compute_digest,
+    compute_digest_from_generator,
+    digest_algorithm,
+    digest_from_hasher,
+    is_strict_digest,
+    new_hasher,
+    normalize_digest,
+    parse_strict_digest,
+    sha256_digest,
+)
+
+_SHA256_HEX = "a" * 64
+_SHA384_HEX = "b" * 96
+_SHA512_HEX = "c" * 128
+
+
+@pytest.mark.parametrize(
+    "digest",
+    ["sha256:" + _SHA256_HEX, "sha384:" + _SHA384_HEX, "sha512:" + _SHA512_HEX],
+)
+def test_parse_strict_good(digest):
+    parsed = parse_strict_digest(digest)
+    assert str(parsed) == digest
+    assert normalize_digest(digest) == digest
+    assert is_strict_digest(digest)
+
+
+@pytest.mark.parametrize(
+    "digest",
+    [
+        "sha256:" + _SHA256_HEX.upper(),
+        "SHA256:" + _SHA256_HEX,
+        "sha512:" + _SHA512_HEX[:-1],
+        "sha512:" + _SHA512_HEX + "c",
+        "sha384:" + _SHA256_HEX,
+        "sha256:" + _SHA512_HEX,
+        "sha1:" + "a" * 40,
+        "md5:abc",
+        "sha512:" + "g" * 128,
+        "sha512" + _SHA512_HEX,
+        "sha512:",
+        "",
+        None,
+        " sha256:" + _SHA256_HEX,
+        "sha256:" + _SHA256_HEX + "\n",
+    ],
+)
+def test_parse_strict_bad(digest):
+    with pytest.raises(InvalidDigestException):
+        parse_strict_digest(digest)
+    assert not is_strict_digest(digest)
+
+
+@pytest.mark.parametrize("algorithm", ["sha256", "sha384", "sha512"])
+def test_compute_digest(algorithm):
+    content = b"hello world"
+    expected = "%s:%s" % (algorithm, hashlib.new(algorithm, content).hexdigest())
+    assert compute_digest(content, algorithm) == expected
+    assert compute_digest_from_generator(iter([b"hello", b" ", b"world"]), algorithm) == expected
+    hasher = new_hasher(algorithm)
+    hasher.update(content)
+    assert digest_from_hasher(hasher) == expected
+    assert is_strict_digest(expected)
+
+
+def test_compute_digest_default_matches_sha256_digest():
+    assert compute_digest(b"abc") == sha256_digest(b"abc")
+
+
+@pytest.mark.parametrize("algorithm", ["md5", "sha1", "sha224", "SHA512"])
+def test_new_hasher_unsupported(algorithm):
+    with pytest.raises(InvalidDigestException):
+        new_hasher(algorithm)
+
+
+@pytest.mark.parametrize(
+    "digest, expected",
+    [("sha512:abc", "sha512"), ("tarsum.v1+sha256:1", "tarsum.v1+sha256"), ("nocolon", None)],
+)
+def test_digest_algorithm(digest, expected):
+    assert digest_algorithm(digest) == expected

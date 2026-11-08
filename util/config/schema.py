@@ -826,6 +826,21 @@ CONFIG_SCHEMA = {
             "description": "Whether immutable tags can have expiration dates set. When False (default), setting expiration on immutable tags is blocked, and tags with expiration cannot be made immutable.",
             "x-example": False,
         },
+        "ALLOWED_HASH_ALGORITHMS": {
+            "type": "array",
+            "description": "Client-visible digest algorithms accepted for blob and manifest reads and writes. Must include `sha256`, which cannot be disabled. Internal blob storage always uses SHA-256. Every process sharing a database must use the same value. Defaults to `[sha256]`.",
+            "items": {"type": "string", "enum": ["sha256", "sha384", "sha512"]},
+            "minItems": 1,
+            "uniqueItems": True,
+            "contains": {"const": "sha256"},
+            "x-example": ["sha256", "sha384", "sha512"],
+        },
+        "DEFAULT_MANIFEST_HASH_ALGORITHM": {
+            "type": "string",
+            "description": "Digest algorithm for manifests pushed by tag only. Must be listed in `ALLOWED_HASH_ALGORITHMS`. A push by digest uses the algorithm in the address. Defaults to `sha256`.",
+            "enum": ["sha256", "sha384", "sha512"],
+            "x-example": "sha256",
+        },
         "DEFAULT_TAG_EXPIRATION": {
             "type": "string",
             "description": "The default, configurable tag expiration time for time machine. Defaults to `2w`.",

@@ -62,6 +62,7 @@ CLIENT_WHITELIST = [
     "DISABLE_ANGULAR_UI",
     "ROBOTS_DISALLOW",
     "FEATURE_IMMUTABLE_TAGS_CAN_EXPIRE",
+    "ALLOWED_HASH_ALGORITHMS",
 ]
 
 
@@ -704,6 +705,13 @@ class DefaultConfig(ImmutableConfig):
 
     # Feature Flag: If enabled, non-superusers can setup team syncing.
     FEATURE_NONSUPERUSER_TEAM_SYNCING_SETUP = False
+
+    # Client-visible digest algorithms accepted for reads and writes (PROJQUAY-10117). sha256 is
+    # always allowed; sha384 and sha512 are optional. Internal blob storage stays SHA-256.
+    ALLOWED_HASH_ALGORITHMS = ["sha256"]
+
+    # Digest algorithm for manifests pushed by tag only. Must be listed in ALLOWED_HASH_ALGORITHMS.
+    DEFAULT_MANIFEST_HASH_ALGORITHM = "sha256"
 
     # The default configurable tag expiration time for time machine.
     DEFAULT_TAG_EXPIRATION = "2w"

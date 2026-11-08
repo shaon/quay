@@ -56,3 +56,7 @@ class TestFrontendVisibleConfig:
                 frontend_visible_config({"SECRET_KEY": "bad"})
             finally:
                 CLIENT_WHITELIST.pop()
+
+    def test_allowed_hash_algorithms_is_visible(self):
+        result = frontend_visible_config({"ALLOWED_HASH_ALGORITHMS": ["sha256", "sha512"]})
+        assert result["ALLOWED_HASH_ALGORITHMS"] == ["sha256", "sha512"]

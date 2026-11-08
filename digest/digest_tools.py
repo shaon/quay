@@ -3,6 +3,16 @@ import os.path
 import re
 
 DIGEST_PATTERN = r"([A-Za-z0-9_+.-]+):([A-Fa-f0-9]+)"
+
+# Client-visible digest algorithms Quay can verify, and the exact lowercase hex length of each.
+# SHA-256 is always the internal (CAS) storage algorithm.
+SHA256 = "sha256"
+SHA384 = "sha384"
+SHA512 = "sha512"
+SUPPORTED_DIGEST_ALGORITHMS = (SHA256, SHA384, SHA512)
+DIGEST_HEX_LENGTHS = {SHA256: 64, SHA384: 96, SHA512: 128}
+_STRICT_DIGEST_REGEX = re.compile(r"(sha256|sha384|sha512):([a-f0-9]+)")
+
 REPLACE_WITH_PATH = re.compile(r"[+.]")
 REPLACE_DOUBLE_SLASHES = re.compile(r"/+")
 
@@ -45,6 +55,91 @@ class Digest(object):
     @property
     def hash_bytes(self):
         return self._hash_bytes
+
+
+def parse_strict_digest(digest):
+    """
+    Parses a client-visible digest in strict, normalized form.
+
+    The algorithm must be one of SUPPORTED_DIGEST_ALGORITHMS and the hex part must be lowercase and
+    exactly as long as that algorithm's output. Raises InvalidDigestException otherwise.
+    """
+    if not isinstance(digest, str):
+        raise InvalidDigestException("Not a valid digest: %s" % (digest,))
+
+    match = _STRICT_DIGEST_REGEX.fullmatch(digest)
+    if match is None:
+        raise InvalidDigestException("Not a valid digest: %s" % digest)
+
+    algorithm, hex_part = match.group(1), match.group(2)
+    if len(hex_part) != DIGEST_HEX_LENGTHS[algorithm]:
+        raise InvalidDigestException("Not a valid digest: %s" % digest)
+
+    return Digest(algorithm, hex_part)
+
+
+def normalize_digest(digest):
+    """
+    Returns the normalized string form of a strict digest, or raises InvalidDigestException.
+    """
+    return str(parse_strict_digest(digest))
+
+
+def is_strict_digest(digest):
+    """
+    Returns True if the digest is in strict, normalized form.
+    """
+    try:
+        parse_strict_digest(digest)
+        return True
+    except InvalidDigestException:
+        return False
+
+
+def digest_algorithm(digest):
+    """
+    Returns the algorithm prefix of a digest string (everything before the first colon), or None
+    if there is no colon. Does not validate the digest.
+    """
+    if not isinstance(digest, str) or ":" not in digest:
+        return None
+    return digest.split(":", 1)[0]
+
+
+def new_hasher(algorithm):
+    """
+    Returns a new hashlib object for a supported client-visible digest algorithm.
+    """
+    if algorithm not in SUPPORTED_DIGEST_ALGORITHMS:
+        raise InvalidDigestException("Unsupported digest algorithm: %s" % algorithm)
+    return hashlib.new(algorithm)
+
+
+def digest_from_hasher(hash_obj):
+    """
+    Returns the digest string for a hashlib-compatible object, using its `name` as the algorithm.
+    """
+    return "{0}:{1}".format(hash_obj.name, hash_obj.hexdigest())
+
+
+def compute_digest(content, algorithm=SHA256):
+    """
+    Returns the digest of the content bytes under the given algorithm.
+    """
+    assert isinstance(content, bytes)
+    hasher = new_hasher(algorithm)
+    hasher.update(content)
+    return digest_from_hasher(hasher)
+
+
+def compute_digest_from_generator(content_generator, algorithm=SHA256):
+    """
+    Reads all of the data from the iterator and returns its digest under the given algorithm.
+    """
+    hasher = new_hasher(algorithm)
+    for chunk in content_generator:
+        hasher.update(chunk)
+    return digest_from_hasher(hasher)
 
 
 def content_path(digest):

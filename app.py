@@ -52,6 +52,7 @@ from storage.upstreamproxy import UpstreamProxy
 from util import get_app_url
 from util.config import URLSchemeAndHostname
 from util.config.configutil import generate_secret_key
+from util.config.hash_algorithms import validate_hash_algorithm_config
 from util.greenlet_tracing import enable_tracing
 from util.ipresolver import IPResolver
 from util.label_validator import LabelValidator
@@ -145,6 +146,7 @@ def apply_storage_replication_config(config):
 
 
 apply_storage_replication_config(app.config)
+validate_hash_algorithm_config(app.config)
 
 # Generate a secret key if none was specified.
 if app.config["SECRET_KEY"] is None:
