@@ -156,3 +156,90 @@ def test_storage_replication_copy_didnot_copy(
     # Ensure the storage location count remains 1.
     locations = model.storage.get_storage_locations(cas_storage.uuid)
     assert len(locations) == 1
+
+
+# PROJQUAY-10117: stored-bytes verification at the destination before copying.
+
+
+def _requested_row(content, location_name="local_us", image_size=None):
+    sha256 = "sha256:" + hashlib.sha256(content).hexdigest()
+    sha512 = "sha512:" + hashlib.sha512(content).hexdigest()
+    row = database.ImageStorage.create(
+        cas_path=True,
+        content_checksum=sha256,
+        requested_content_checksum=sha512,
+        image_size=len(content) if image_size is None else image_size,
+    )
+    database.ImageStoragePlacement.create(
+        storage=row, location=database.ImageStorageLocation.get(name=location_name)
+    )
+    return row
+
+
+def test_replication_reuses_verified_object_without_copy(
+    storage_user, storage_paths, replication_worker, storage, app
+):
+    content = b"geo content shared by two rows"
+    row = _requested_row(content)
+    path = storage_paths.blob_path(row.content_checksum)
+    storage.put_content(["local_us"], path, content)
+    # Another row's replication already stored the same CAS object in the EU region.
+    storage.put_content(["local_eu"], path, content)
+
+    copies = []
+    real_copy = storage.copy_between
+    storage.copy_between = lambda *args: copies.append(args) or real_copy(*args)
+
+    replication_worker.replicate_storage(storage_user, row.uuid, storage)
+
+    assert copies == []
+    assert set(model.storage.get_storage_locations(row.uuid)) == {"local_us", "local_eu"}
+
+
+@pytest.mark.parametrize("damage", ["size", "bytes"])
+def test_replication_copies_when_existing_object_fails_verification(
+    damage, storage_user, storage_paths, replication_worker, storage, app
+):
+    content = b"geo content that must be copied"
+    row = _requested_row(content)
+    path = storage_paths.blob_path(row.content_checksum)
+    storage.put_content(["local_us"], path, content)
+    bad = content + b"!" if damage == "size" else bytes([content[0] ^ 1]) + content[1:]
+    storage.put_content(["local_eu"], path, bad)
+
+    copies = []
+    real_copy = storage.copy_between
+    storage.copy_between = lambda *args: copies.append(args) or real_copy(*args)
+
+    replication_worker.replicate_storage(storage_user, row.uuid, storage)
+
+    assert len(copies) == 1
+    assert storage.get_content(["local_eu"], path) == content
+    assert set(model.storage.get_storage_locations(row.uuid)) == {"local_us", "local_eu"}
+
+
+def test_replication_skips_read_when_cas_row_already_placed(
+    storage_user, storage_paths, replication_worker, storage, app
+):
+    content = b"geo content placed for the sha256 row"
+    row = _requested_row(content)
+    path = storage_paths.blob_path(row.content_checksum)
+    storage.put_content(["local_us"], path, content)
+    storage.put_content(["local_eu"], path, content)
+
+    # The SHA-256 row for the same bytes is already placed in the EU region.
+    sha256_row = database.ImageStorage.create(
+        cas_path=True, content_checksum=row.content_checksum, image_size=len(content)
+    )
+    database.ImageStoragePlacement.create(
+        storage=sha256_row, location=database.ImageStorageLocation.get(name="local_eu")
+    )
+
+    reads = []
+    real_read = storage.stream_read
+    storage.stream_read = lambda *args, **kw: reads.append(args) or real_read(*args, **kw)
+
+    replication_worker.replicate_storage(storage_user, row.uuid, storage)
+
+    assert reads == []
+    assert set(model.storage.get_storage_locations(row.uuid)) == {"local_us", "local_eu"}

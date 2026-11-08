@@ -6,6 +6,7 @@ from app import app, image_replication_queue
 from app import storage as app_storage
 from data import model
 from data.database import CloseForLongOperation
+from data.registry_model.blobuploader import verify_stored_blob
 from util.log import logfile_path
 from workers.gunicorn_worker import GunicornWorker
 from workers.queueworker import (
@@ -66,6 +67,51 @@ class StorageReplicationWorker(QueueWorker):
         return False
 
     @with_exponential_backoff(backoff_multiplier=4, max_backoff=30, max_retries=3)
+    def _existing_object_verifies(self, partial_storage, location, path, storage):
+        """
+        Returns True if a CAS object already at `location` passes tiered stored-bytes
+        verification against the row's SHA-256 and recorded size. Any failure means copy as today.
+        """
+        if not partial_storage.cas_path or not partial_storage.content_checksum:
+            return False
+
+        try:
+            with CloseForLongOperation(app.config):
+                if not storage.exists([location], path):
+                    return False
+        except IOError:
+            return False
+
+        class _NotVerified(Exception):
+            pass
+
+        def on_missing():
+            raise _NotVerified()
+
+        def on_failure(reason, message, *args):
+            logger.warning(
+                "Existing object at %s failed verification (%s): " + message,
+                location,
+                reason,
+                *args,
+            )
+            raise _NotVerified()
+
+        try:
+            verify_stored_blob(
+                storage,
+                location,
+                path,
+                partial_storage.content_checksum,
+                partial_storage.image_size,
+                app.config,
+                on_missing=on_missing,
+                on_failure=on_failure,
+            )
+        except (_NotVerified, IOError):
+            return False
+        return True
+
     def replicate_storage(self, namespace, storage_uuid, storage, backoff_check=True):
         # Lookup the namespace and its associated regions.
         if not namespace:
@@ -117,6 +163,18 @@ class StorageReplicationWorker(QueueWorker):
 
         # For each missing location, copy over the storage.
         for location in locations_missing:
+            # A CAS object may already be at the destination (for example, stored for another row
+            # with the same SHA-256). If it passes stored-bytes verification against this row's
+            # recorded size, record the placement and copy nothing (PROJQUAY-10117).
+            if self._existing_object_verifies(partial_storage, location, path_to_copy, storage):
+                model.storage.add_storage_placement(partial_storage, location)
+                logger.debug(
+                    "Reused verified object for storage %s at location %s; no copy needed",
+                    partial_storage.uuid,
+                    location,
+                )
+                continue
+
             logger.debug(
                 "Starting copy of storage %s to location %s from %s",
                 partial_storage.uuid,
