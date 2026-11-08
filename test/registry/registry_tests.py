@@ -4036,3 +4036,680 @@ def test_requested_digest_mount_links_exact_identity(
             v22_protocol, liveserver_session, target_headers, target_repo,
             _alg_digest("sha256", data),
         )
+
+
+# ---------------------------------------------------------------------------------------------
+# PROJQUAY-10117 Proposal 1: configurable digest algorithms (manifests).
+# ---------------------------------------------------------------------------------------------
+
+import json as _json
+
+OCI_MANIFEST_TYPE = "application/vnd.oci.image.manifest.v1+json"
+OCI_INDEX_TYPE = "application/vnd.oci.image.index.v1+json"
+OCI_CONFIG_TYPE = "application/vnd.oci.image.config.v1+json"
+OCI_LAYER_TYPE = "application/vnd.oci.image.layer.v1.tar+gzip"
+DOCKER_V2_MANIFEST_TYPE = "application/vnd.docker.distribution.manifest.v2+json"
+DOCKER_V2_CONFIG_TYPE = "application/vnd.docker.container.image.v1+json"
+DOCKER_V2_LAYER_TYPE = "application/vnd.docker.image.rootfs.diff.tar.gzip"
+
+
+def _push_test_blob(protocol, session, headers, repo_name, algorithm, data):
+    digest = _alg_digest(algorithm, data)
+    _upload(protocol, session, headers, repo_name, data, digest, "A")
+    return {"digest": digest, "size": len(data)}
+
+
+def _config_bytes(label):
+    return _json.dumps(
+        {
+            "architecture": "amd64",
+            "os": "linux",
+            "config": {"Labels": {"test": label}},
+            "rootfs": {"type": "layers", "diff_ids": []},
+            "history": [{"created_by": "test"}],
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _image_manifest_bytes(config, layers, subject=None, docker=False):
+    manifest = {
+        "schemaVersion": 2,
+        "mediaType": DOCKER_V2_MANIFEST_TYPE if docker else OCI_MANIFEST_TYPE,
+        "config": {
+            "mediaType": DOCKER_V2_CONFIG_TYPE if docker else OCI_CONFIG_TYPE,
+            "digest": config["digest"],
+            "size": config["size"],
+        },
+        "layers": [
+            {
+                "mediaType": DOCKER_V2_LAYER_TYPE if docker else OCI_LAYER_TYPE,
+                "digest": layer["digest"],
+                "size": layer["size"],
+            }
+            for layer in layers
+        ],
+    }
+    if subject is not None:
+        manifest["subject"] = subject
+    return _json.dumps(manifest, sort_keys=True).encode("utf-8")
+
+
+def _index_bytes(children):
+    return _json.dumps(
+        {
+            "schemaVersion": 2,
+            "mediaType": OCI_INDEX_TYPE,
+            "manifests": [
+                {
+                    "mediaType": OCI_MANIFEST_TYPE,
+                    "digest": child["digest"],
+                    "size": child["size"],
+                    "platform": {"architecture": arch, "os": "linux"},
+                }
+                for arch, child in children
+            ],
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _push_image_blobs(protocol, session, headers, repo_name, algorithm, label):
+    config = _push_test_blob(
+        protocol, session, headers, repo_name, algorithm, _config_bytes(label)
+    )
+    layer_data = layer_bytes_for_contents(("layer %s %s" % (label, algorithm)).encode("ascii"))
+    layer = _push_test_blob(protocol, session, headers, repo_name, algorithm, layer_data)
+    layer["bytes"] = layer_data
+    return config, layer
+
+
+def _put_manifest(
+    protocol, session, headers, repo_name, ref, manifest_bytes, media_type, expected=201,
+    params=None,
+):
+    put_headers = dict(headers)
+    put_headers["Content-Type"] = media_type
+    return protocol.conduct(
+        session,
+        "PUT",
+        "/v2/%s/manifests/%s" % (repo_name, ref),
+        data=manifest_bytes,
+        params=params,
+        expected_status=expected,
+        headers=put_headers,
+    )
+
+
+def _get_manifest(protocol, session, headers, repo_name, ref, media_type, expected=200, method="GET"):
+    get_headers = dict(headers)
+    get_headers["Accept"] = media_type
+    return protocol.conduct(
+        session,
+        method,
+        "/v2/%s/manifests/%s" % (repo_name, ref),
+        expected_status=expected,
+        headers=get_headers,
+    )
+
+
+@pytest.fixture()
+def default_manifest_sha512(liveserver, registry_server_executor, all_hash_algorithms):
+    with ConfigChange(
+        "DEFAULT_MANIFEST_HASH_ALGORITHM",
+        "sha512",
+        registry_server_executor.on(liveserver),
+        liveserver,
+    ):
+        yield
+
+
+@pytest.mark.parametrize("algorithm", ALL_HASH_ALGORITHMS)
+@pytest.mark.parametrize("docker", [False, True])
+def test_requested_digest_manifest_push_by_digest(
+    algorithm, docker, v22_protocol, liveserver_session, all_hash_algorithms
+):
+    """Manifest path A: push by digest verifies the address algorithm, returns the requested
+    digest, creates no client-visible tag, and is pullable by digest with exact bytes."""
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    config, layer = _push_image_blobs(
+        v22_protocol, liveserver_session, headers, repo_name, algorithm, "by-digest"
+    )
+    media_type = DOCKER_V2_MANIFEST_TYPE if docker else OCI_MANIFEST_TYPE
+    manifest_bytes = _image_manifest_bytes(config, [layer], docker=docker)
+    digest = _alg_digest(algorithm, manifest_bytes)
+
+    response = _put_manifest(
+        v22_protocol, liveserver_session, headers, repo_name, digest, manifest_bytes, media_type
+    )
+    assert response.headers["Docker-Content-Digest"] == digest
+    assert response.headers["Location"].endswith("/v2/%s/manifests/%s" % (repo_name, digest))
+    assert "OCI-Tag" not in response.headers
+
+    for method in ("GET", "HEAD"):
+        pulled = _get_manifest(
+            v22_protocol, liveserver_session, headers, repo_name, digest, media_type,
+            method=method,
+        )
+        assert pulled.headers["Docker-Content-Digest"] == digest
+        if method == "GET":
+            assert pulled.content == manifest_bytes
+
+    tags = v22_protocol.conduct(
+        liveserver_session, "GET", "/v2/%s/tags/list" % repo_name, headers=headers
+    ).json()
+    assert not tags.get("tags")
+
+    if algorithm != "sha256":
+        # No implicit SHA-256 manifest row.
+        _get_manifest(
+            v22_protocol, liveserver_session, headers, repo_name,
+            _alg_digest("sha256", manifest_bytes), media_type, expected=404,
+        )
+
+
+@pytest.mark.parametrize("algorithm", ALL_HASH_ALGORITHMS)
+def test_requested_digest_manifest_push_by_tag_uses_default(
+    algorithm, v22_protocol, liveserver_session, all_hash_algorithms
+):
+    """Manifest path B: a push by tag hashes with DEFAULT_MANIFEST_HASH_ALGORITHM (sha256), even
+    when its blob descriptors use another algorithm."""
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    config, layer = _push_image_blobs(
+        v22_protocol, liveserver_session, headers, repo_name, algorithm, "by-tag"
+    )
+    manifest_bytes = _image_manifest_bytes(config, [layer])
+    response = _put_manifest(
+        v22_protocol, liveserver_session, headers, repo_name, "latest", manifest_bytes,
+        OCI_MANIFEST_TYPE,
+    )
+    expected = _alg_digest("sha256", manifest_bytes)
+    assert response.headers["Docker-Content-Digest"] == expected
+
+    pulled = _get_manifest(
+        v22_protocol, liveserver_session, headers, repo_name, "latest", OCI_MANIFEST_TYPE
+    )
+    assert pulled.content == manifest_bytes
+    assert pulled.headers["Docker-Content-Digest"] == expected
+    # Layers resolve by their own (requested) digests.
+    _assert_blob_served(
+        v22_protocol, liveserver_session, headers, repo_name, layer["bytes"], layer["digest"]
+    )
+
+
+def test_requested_digest_manifest_push_by_tag_with_sha512_default(
+    v22_protocol, liveserver_session, default_manifest_sha512
+):
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    config, layer = _push_image_blobs(
+        v22_protocol, liveserver_session, headers, repo_name, "sha256", "default512"
+    )
+    manifest_bytes = _image_manifest_bytes(config, [layer])
+    response = _put_manifest(
+        v22_protocol, liveserver_session, headers, repo_name, "latest", manifest_bytes,
+        OCI_MANIFEST_TYPE,
+    )
+    digest = _alg_digest("sha512", manifest_bytes)
+    assert response.headers["Docker-Content-Digest"] == digest
+    _get_manifest(v22_protocol, liveserver_session, headers, repo_name, digest, OCI_MANIFEST_TYPE)
+    _get_manifest(
+        v22_protocol, liveserver_session, headers, repo_name,
+        _alg_digest("sha256", manifest_bytes), OCI_MANIFEST_TYPE, expected=404,
+    )
+
+
+@pytest.mark.parametrize("algorithm", ALL_HASH_ALGORITHMS)
+def test_requested_digest_manifest_push_by_digest_with_tags(
+    algorithm, v22_protocol, liveserver_session, all_hash_algorithms
+):
+    """Manifest path C: push by digest with repeated `tag` parameters assigns every tag and
+    returns an OCI-Tag header for each."""
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    config, layer = _push_image_blobs(
+        v22_protocol, liveserver_session, headers, repo_name, algorithm, "with-tags"
+    )
+    manifest_bytes = _image_manifest_bytes(config, [layer])
+    digest = _alg_digest(algorithm, manifest_bytes)
+    tags = ["latest", "1.0", "1"]
+
+    response = _put_manifest(
+        v22_protocol, liveserver_session, headers, repo_name, digest, manifest_bytes,
+        OCI_MANIFEST_TYPE, params={"tag": tags},
+    )
+    assert response.headers["Docker-Content-Digest"] == digest
+    oci_tags = [t.strip() for value in response.raw.headers.getlist("OCI-Tag") for t in value.split(",")]
+    assert oci_tags == tags
+
+    for tag in tags:
+        pulled = _get_manifest(
+            v22_protocol, liveserver_session, headers, repo_name, tag, OCI_MANIFEST_TYPE
+        )
+        assert pulled.headers["Docker-Content-Digest"] == digest
+        assert pulled.content == manifest_bytes
+
+
+def test_requested_digest_tag_param_at_default_allowlist(
+    v22_protocol, liveserver_session, app_reloader
+):
+    """`?tag=` works for SHA-256 with the default allowlist."""
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    config, layer = _push_image_blobs(
+        v22_protocol, liveserver_session, headers, repo_name, "sha256", "default-tags"
+    )
+    manifest_bytes = _image_manifest_bytes(config, [layer])
+    digest = _alg_digest("sha256", manifest_bytes)
+    response = _put_manifest(
+        v22_protocol, liveserver_session, headers, repo_name, digest, manifest_bytes,
+        OCI_MANIFEST_TYPE, params={"tag": ["a", "b"]},
+    )
+    assert response.raw.headers.getlist("OCI-Tag") == ["a", "b"]
+    _get_manifest(v22_protocol, liveserver_session, headers, repo_name, "b", OCI_MANIFEST_TYPE)
+
+
+def test_requested_digest_too_many_tags(v22_protocol, liveserver_session, all_hash_algorithms):
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    config, layer = _push_image_blobs(
+        v22_protocol, liveserver_session, headers, repo_name, "sha512", "toomany"
+    )
+    manifest_bytes = _image_manifest_bytes(config, [layer])
+    digest = _alg_digest("sha512", manifest_bytes)
+    _put_manifest(
+        v22_protocol, liveserver_session, headers, repo_name, digest, manifest_bytes,
+        OCI_MANIFEST_TYPE, params={"tag": ["t%d" % i for i in range(11)]}, expected=414,
+    )
+    # Nothing committed.
+    _get_manifest(
+        v22_protocol, liveserver_session, headers, repo_name, digest, OCI_MANIFEST_TYPE,
+        expected=404,
+    )
+    _get_manifest(
+        v22_protocol, liveserver_session, headers, repo_name, "t0", OCI_MANIFEST_TYPE,
+        expected=404,
+    )
+
+    # Exactly 10 is accepted.
+    _put_manifest(
+        v22_protocol, liveserver_session, headers, repo_name, digest, manifest_bytes,
+        OCI_MANIFEST_TYPE, params={"tag": ["t%d" % i for i in range(10)]},
+    )
+
+
+@pytest.mark.parametrize("bad_tag", ["-leadingdash", "has space", "x" * 129, ".dot", ""])
+def test_requested_digest_invalid_tag_name(
+    bad_tag, v22_protocol, liveserver_session, all_hash_algorithms
+):
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    config, layer = _push_image_blobs(
+        v22_protocol, liveserver_session, headers, repo_name, "sha512", "badtag"
+    )
+    manifest_bytes = _image_manifest_bytes(config, [layer])
+    digest = _alg_digest("sha512", manifest_bytes)
+    response = _put_manifest(
+        v22_protocol, liveserver_session, headers, repo_name, digest, manifest_bytes,
+        OCI_MANIFEST_TYPE, params={"tag": ["good", bad_tag]}, expected=400,
+    )
+    assert _error_code(response) == "TAG_INVALID"
+    _get_manifest(
+        v22_protocol, liveserver_session, headers, repo_name, "good", OCI_MANIFEST_TYPE,
+        expected=404,
+    )
+
+
+def test_requested_digest_immutable_tag_is_all_or_nothing(
+    v22_protocol, liveserver_session, liveserver, registry_server_executor, all_hash_algorithms
+):
+    """A `?tag=` push naming an immutable tag returns 409 TAG_IMMUTABLE and commits nothing:
+    no manifest row and no other tag."""
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    config, layer = _push_image_blobs(
+        v22_protocol, liveserver_session, headers, repo_name, "sha256", "immutable-base"
+    )
+    base_bytes = _image_manifest_bytes(config, [layer])
+    _put_manifest(
+        v22_protocol, liveserver_session, headers, repo_name, "locked", base_bytes,
+        OCI_MANIFEST_TYPE,
+    )
+    executor = registry_server_executor.on(liveserver)
+    with FeatureFlagValue("IMMUTABLE_TAGS", True, executor):
+        assert executor.make_tag_immutable("devtable", "newrepo", "locked").status_code == 200
+
+        config2, layer2 = _push_image_blobs(
+            v22_protocol, liveserver_session, headers, repo_name, "sha512", "immutable-new"
+        )
+        manifest_bytes = _image_manifest_bytes(config2, [layer2])
+        digest = _alg_digest("sha512", manifest_bytes)
+        response = _put_manifest(
+            v22_protocol, liveserver_session, headers, repo_name, digest, manifest_bytes,
+            OCI_MANIFEST_TYPE, params={"tag": ["fresh", "locked"]}, expected=409,
+        )
+        assert _error_code(response) == "TAG_IMMUTABLE"
+
+    _get_manifest(
+        v22_protocol, liveserver_session, headers, repo_name, "fresh", OCI_MANIFEST_TYPE,
+        expected=404,
+    )
+    _get_manifest(
+        v22_protocol, liveserver_session, headers, repo_name, digest, OCI_MANIFEST_TYPE,
+        expected=404,
+    )
+    locked = _get_manifest(
+        v22_protocol, liveserver_session, headers, repo_name, "locked", OCI_MANIFEST_TYPE
+    )
+    assert locked.content == base_bytes
+
+
+@pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
+def test_requested_digest_manifest_put_disallowed_digest(
+    algorithm, v22_protocol, liveserver_session, app_reloader
+):
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    config, layer = _push_image_blobs(
+        v22_protocol, liveserver_session, headers, repo_name, "sha256", "disallowed-manifest"
+    )
+    manifest_bytes = _image_manifest_bytes(config, [layer])
+    response = _put_manifest(
+        v22_protocol, liveserver_session, headers, repo_name,
+        _alg_digest(algorithm, manifest_bytes), manifest_bytes, OCI_MANIFEST_TYPE, expected=400,
+    )
+    assert _error_code(response) == "DIGEST_INVALID"
+
+
+@pytest.mark.parametrize(
+    "bad_ref", ["sha512:" + "A" * 128, "sha384:" + "a" * 95, "md5:" + "a" * 32, "sha1:" + "a" * 40]
+)
+def test_requested_digest_manifest_put_malformed_digest(
+    bad_ref, v22_protocol, liveserver_session, all_hash_algorithms
+):
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    response = _put_manifest(
+        v22_protocol, liveserver_session, headers, repo_name, bad_ref, b"{}",
+        OCI_MANIFEST_TYPE, expected=400,
+    )
+    assert _error_code(response) == "DIGEST_INVALID"
+
+
+def test_requested_digest_manifest_digest_mismatch(
+    v22_protocol, liveserver_session, all_hash_algorithms
+):
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    config, layer = _push_image_blobs(
+        v22_protocol, liveserver_session, headers, repo_name, "sha512", "mismatch"
+    )
+    manifest_bytes = _image_manifest_bytes(config, [layer])
+    wrong = _alg_digest("sha512", manifest_bytes + b" ")
+    response = _put_manifest(
+        v22_protocol, liveserver_session, headers, repo_name, wrong, manifest_bytes,
+        OCI_MANIFEST_TYPE, expected=400,
+    )
+    assert _error_code(response) == "MANIFEST_INVALID"
+
+
+def test_requested_digest_schema1_push_by_non_sha256_digest(
+    v22_protocol, liveserver_session, all_hash_algorithms
+):
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    schema1 = _json.dumps({"schemaVersion": 1, "name": repo_name, "tag": "latest"}).encode()
+    response = _put_manifest(
+        v22_protocol, liveserver_session, headers, repo_name, _alg_digest("sha512", schema1),
+        schema1, "application/vnd.docker.distribution.manifest.v1+prettyjws", expected=400,
+    )
+    assert _error_code(response) == "MANIFEST_INVALID"
+
+
+def test_requested_digest_manifest_references_unknown_blob(
+    v22_protocol, liveserver_session, all_hash_algorithms
+):
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    config, layer = _push_image_blobs(
+        v22_protocol, liveserver_session, headers, repo_name, "sha512", "unknown-ref"
+    )
+    # The layer's SHA-256 identity was never published in this repository.
+    sha256_of_layer = _alg_digest("sha256", layer["bytes"])
+    manifest_bytes = _image_manifest_bytes(
+        config, [{"digest": sha256_of_layer, "size": layer["size"]}]
+    )
+    response = _put_manifest(
+        v22_protocol, liveserver_session, headers, repo_name,
+        _alg_digest("sha512", manifest_bytes), manifest_bytes, OCI_MANIFEST_TYPE, expected=400,
+    )
+    assert _error_code(response) == "MANIFEST_INVALID"
+
+
+def test_requested_digest_manifest_references_disallowed_blob(
+    v22_protocol, liveserver_session, liveserver, registry_server_executor, app_reloader
+):
+    """A manifest referencing a blob by a now-disallowed algorithm is rejected with 400
+    MANIFEST_INVALID, even though the blob was published while allowed."""
+    executor = registry_server_executor.on(liveserver)
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    with ConfigChange("ALLOWED_HASH_ALGORITHMS", ALL_HASH_ALGORITHMS, executor, liveserver):
+        config, layer = _push_image_blobs(
+            v22_protocol, liveserver_session, headers, repo_name, "sha512", "disabled-later"
+        )
+
+    manifest_bytes = _image_manifest_bytes(config, [layer])
+    response = _put_manifest(
+        v22_protocol, liveserver_session, headers, repo_name, "latest", manifest_bytes,
+        OCI_MANIFEST_TYPE, expected=400,
+    )
+    assert _error_code(response) == "MANIFEST_INVALID"
+
+
+@pytest.mark.parametrize(
+    "subject_digest, expected",
+    [
+        ("sha512:" + "c" * 128, 201),  # allowed, does not exist yet
+        ("sha384:" + "b" * 96, 201),
+        ("sha512:" + "C" * 128, 400),  # malformed
+        ("md5:" + "a" * 32, 400),  # unsupported
+    ],
+)
+def test_requested_digest_manifest_subject(
+    subject_digest, expected, v22_protocol, liveserver_session, all_hash_algorithms
+):
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    config, layer = _push_image_blobs(
+        v22_protocol, liveserver_session, headers, repo_name, "sha512", "subject"
+    )
+    subject = {"mediaType": OCI_MANIFEST_TYPE, "digest": subject_digest, "size": 10}
+    manifest_bytes = _image_manifest_bytes(config, [layer], subject=subject)
+    response = _put_manifest(
+        v22_protocol, liveserver_session, headers, repo_name,
+        _alg_digest("sha512", manifest_bytes), manifest_bytes, OCI_MANIFEST_TYPE,
+        expected=expected,
+    )
+    if expected == 400:
+        assert _error_code(response) == "MANIFEST_INVALID"
+
+
+def test_requested_digest_subject_disallowed_at_default_allowlist(
+    v22_protocol, liveserver_session, app_reloader
+):
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    config, layer = _push_image_blobs(
+        v22_protocol, liveserver_session, headers, repo_name, "sha256", "subject-default"
+    )
+    subject = {"mediaType": OCI_MANIFEST_TYPE, "digest": "sha512:" + "c" * 128, "size": 10}
+    manifest_bytes = _image_manifest_bytes(config, [layer], subject=subject)
+    response = _put_manifest(
+        v22_protocol, liveserver_session, headers, repo_name,
+        _alg_digest("sha256", manifest_bytes), manifest_bytes, OCI_MANIFEST_TYPE, expected=400,
+    )
+    assert _error_code(response) == "MANIFEST_INVALID"
+
+
+def test_requested_digest_index_with_mixed_children(
+    v22_protocol, liveserver_session, all_hash_algorithms
+):
+    """An OCI index pushed by SHA-512 digest links SHA-512 and SHA-256 child manifests."""
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    children = []
+    for arch, algorithm in (("amd64", "sha512"), ("arm64", "sha256")):
+        config, layer = _push_image_blobs(
+            v22_protocol, liveserver_session, headers, repo_name, algorithm, "index-" + arch
+        )
+        child_bytes = _image_manifest_bytes(config, [layer])
+        child_digest = _alg_digest(algorithm, child_bytes)
+        _put_manifest(
+            v22_protocol, liveserver_session, headers, repo_name, child_digest, child_bytes,
+            OCI_MANIFEST_TYPE,
+        )
+        children.append((arch, {"digest": child_digest, "size": len(child_bytes)}))
+
+    index = _index_bytes(children)
+    digest = _alg_digest("sha512", index)
+    response = _put_manifest(
+        v22_protocol, liveserver_session, headers, repo_name, digest, index, OCI_INDEX_TYPE,
+        params={"tag": ["multi"]},
+    )
+    assert response.headers["Docker-Content-Digest"] == digest
+    pulled = _get_manifest(
+        v22_protocol, liveserver_session, headers, repo_name, "multi", OCI_INDEX_TYPE
+    )
+    assert pulled.content == index
+    for _, child in children:
+        _get_manifest(
+            v22_protocol, liveserver_session, headers, repo_name, child["digest"],
+            OCI_MANIFEST_TYPE,
+        )
+
+
+def test_requested_digest_index_with_disallowed_child(
+    v22_protocol, liveserver_session, app_reloader
+):
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    index = _index_bytes([("amd64", {"digest": "sha512:" + "d" * 128, "size": 10})])
+    response = _put_manifest(
+        v22_protocol, liveserver_session, headers, repo_name, _alg_digest("sha256", index),
+        index, OCI_INDEX_TYPE, expected=400,
+    )
+    assert _error_code(response) == "MANIFEST_INVALID"
+
+
+@pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
+def test_requested_digest_referrers(
+    algorithm, v22_protocol, liveserver_session, all_hash_algorithms
+):
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    config, layer = _push_image_blobs(
+        v22_protocol, liveserver_session, headers, repo_name, algorithm, "referrers-subject"
+    )
+    subject_bytes = _image_manifest_bytes(config, [layer])
+    subject_digest = _alg_digest(algorithm, subject_bytes)
+    _put_manifest(
+        v22_protocol, liveserver_session, headers, repo_name, subject_digest, subject_bytes,
+        OCI_MANIFEST_TYPE, params={"tag": ["subject"]},
+    )
+
+    config2, layer2 = _push_image_blobs(
+        v22_protocol, liveserver_session, headers, repo_name, algorithm, "referrer"
+    )
+    referrer_bytes = _image_manifest_bytes(
+        config2,
+        [layer2],
+        subject={
+            "mediaType": OCI_MANIFEST_TYPE,
+            "digest": subject_digest,
+            "size": len(subject_bytes),
+        },
+    )
+    referrer_digest = _alg_digest(algorithm, referrer_bytes)
+    _put_manifest(
+        v22_protocol, liveserver_session, headers, repo_name, referrer_digest, referrer_bytes,
+        OCI_MANIFEST_TYPE,
+    )
+
+    response = v22_protocol.conduct(
+        liveserver_session,
+        "GET",
+        "/v2/%s/referrers/%s" % (repo_name, subject_digest),
+        headers=headers,
+    )
+    assert [m["digest"] for m in response.json()["manifests"]] == [referrer_digest]
+
+
+@pytest.mark.parametrize(
+    "subject, fixture_allows",
+    [
+        ("sha512:" + "c" * 128, False),  # disallowed at the default allowlist
+        ("sha512:" + "C" * 128, True),  # malformed
+        ("md5:" + "a" * 32, True),  # unsupported
+        ("sha512:" + "e" * 128, True),  # allowed but unknown
+    ],
+)
+def test_requested_digest_referrers_rejections(
+    subject, fixture_allows, v22_protocol, liveserver_session, liveserver,
+    registry_server_executor, app_reloader,
+):
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session, repo="simple")
+    executor = registry_server_executor.on(liveserver)
+    allowed = ALL_HASH_ALGORITHMS if fixture_allows else ["sha256"]
+    with ConfigChange("ALLOWED_HASH_ALGORITHMS", allowed, executor, liveserver):
+        response = v22_protocol.conduct(
+            liveserver_session,
+            "GET",
+            "/v2/%s/referrers/%s" % (repo_name, subject),
+            expected_status=400,
+            headers=headers,
+        )
+    assert _error_code(response) == "MANIFEST_INVALID"
+
+
+@pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
+def test_requested_digest_manifest_delete_disallowed(
+    algorithm, v22_protocol, liveserver_session, liveserver, registry_server_executor,
+    app_reloader,
+):
+    """A manifest DELETE by a disallowed digest returns 404 MANIFEST_UNKNOWN, even if the
+    manifest exists."""
+    executor = registry_server_executor.on(liveserver)
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    with ConfigChange("ALLOWED_HASH_ALGORITHMS", ALL_HASH_ALGORITHMS, executor, liveserver):
+        config, layer = _push_image_blobs(
+            v22_protocol, liveserver_session, headers, repo_name, algorithm, "delete"
+        )
+        manifest_bytes = _image_manifest_bytes(config, [layer])
+        digest = _alg_digest(algorithm, manifest_bytes)
+        _put_manifest(
+            v22_protocol, liveserver_session, headers, repo_name, digest, manifest_bytes,
+            OCI_MANIFEST_TYPE, params={"tag": ["keep"]},
+        )
+
+    response = v22_protocol.conduct(
+        liveserver_session,
+        "DELETE",
+        "/v2/%s/manifests/%s" % (repo_name, digest),
+        expected_status=404,
+        headers=headers,
+    )
+    assert _error_code(response) == "MANIFEST_UNKNOWN"
+
+    with ConfigChange("ALLOWED_HASH_ALGORITHMS", ALL_HASH_ALGORITHMS, executor, liveserver):
+        v22_protocol.conduct(
+            liveserver_session,
+            "DELETE",
+            "/v2/%s/manifests/%s" % (repo_name, digest),
+            expected_status=202,
+            headers=headers,
+        )
+
+
+@pytest.mark.parametrize("algorithm", ["sha384", "sha512"])
+def test_requested_digest_no_schema1_conversion(
+    algorithm, v22_protocol, liveserver_session, all_hash_algorithms
+):
+    """A tag pull that would need schema 1 conversion of non-SHA-256 content returns 404."""
+    headers, repo_name = _push_headers(v22_protocol, liveserver_session)
+    config, layer = _push_image_blobs(
+        v22_protocol, liveserver_session, headers, repo_name, algorithm, "schema1"
+    )
+    manifest_bytes = _image_manifest_bytes(config, [layer], docker=True)
+    _put_manifest(
+        v22_protocol, liveserver_session, headers, repo_name, "latest", manifest_bytes,
+        DOCKER_V2_MANIFEST_TYPE,
+    )
+    response = _get_manifest(
+        v22_protocol, liveserver_session, headers, repo_name, "latest",
+        "application/vnd.docker.distribution.manifest.v1+prettyjws", expected=404,
+    )
+    assert _error_code(response) == "MANIFEST_UNKNOWN"

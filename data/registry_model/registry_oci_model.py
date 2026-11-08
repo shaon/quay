@@ -18,7 +18,13 @@ from data.database import (
     db_disallow_replica_use,
     db_transaction,
 )
-from data.model import DataModelException, QuotaExceededException, namespacequota, oci
+from data.model import (
+    DataModelException,
+    ImmutableTagException,
+    QuotaExceededException,
+    namespacequota,
+    oci,
+)
 from data.model.oci.retriever import RepositoryContentRetriever
 from data.readreplica import ReadOnlyModeException
 from data.registry_model.datatype import FromDictionaryException
@@ -51,6 +57,10 @@ from util.bytes import Bytes
 from util.timedeltastring import convert_to_timedelta
 
 logger = logging.getLogger(__name__)
+
+
+class _AbortTagging(Exception):
+    """Raised inside create_manifest_and_retarget_tags to roll back all tag changes."""
 
 
 class OCIModel(RegistryDataInterface):
@@ -219,6 +229,11 @@ class OCIModel(RegistryDataInterface):
         tags = oci.tag.list_alive_tags(repository_ref._db_id)
         tags_map = {}
         for tag in tags:
+            # Manifests addressed by a non-SHA-256 digest are never served through the v1
+            # protocol (PROJQUAY-10117).
+            if not tag.manifest.digest.startswith("sha256:"):
+                continue
+
             root_id = Manifest.for_manifest(
                 tag.manifest, self._legacy_image_id_handler
             ).legacy_image_root_id
@@ -561,6 +576,79 @@ class OCIModel(RegistryDataInterface):
                 artifact_type=artifact_type,
             )
             model_cache.invalidate(filtered_key)
+
+    def create_manifest_and_retarget_tags(
+        self,
+        repository_ref,
+        manifest_interface_instance,
+        tag_names,
+        storage,
+        raise_on_error=False,
+        verify_quota=False,
+        model_cache=None,
+    ):
+        """
+        Creates (or reuses) a manifest and points every tag in `tag_names` at it, all in one
+        transaction (PROJQUAY-10117 `?tag=`): if any tag assignment fails, none of the manifest or
+        tag changes commit.
+
+        Returns (manifest, [tags]) or (None, None) on error, unless raise_on_error is set, in
+        which case the underlying exception is raised.
+        """
+        assert tag_names
+
+        # Reject an immutable tag before writing anything, so nothing is created even where the
+        # enclosing transaction is not a real one. The transaction below still rolls back any
+        # later failure.
+        if features.IMMUTABLE_TAGS:
+            for tag_name in tag_names:
+                existing_tag = oci.tag.get_tag(repository_ref._db_id, tag_name)
+                if existing_tag is not None and existing_tag.immutable:
+                    if raise_on_error:
+                        raise ImmutableTagException(tag_name, "overwrite", repository_ref._db_id)
+                    return (None, None)
+
+        try:
+            return self._create_manifest_and_retarget_tags(
+                repository_ref,
+                manifest_interface_instance,
+                tag_names,
+                storage,
+                raise_on_error,
+                verify_quota,
+                model_cache,
+            )
+        except _AbortTagging:
+            return (None, None)
+
+    def _create_manifest_and_retarget_tags(
+        self,
+        repository_ref,
+        manifest_interface_instance,
+        tag_names,
+        storage,
+        raise_on_error,
+        verify_quota,
+        model_cache,
+    ):
+        with db_disallow_replica_use():
+            with db_transaction():
+                manifest = None
+                tags = []
+                for tag_name in tag_names:
+                    manifest, tag = self.create_manifest_and_retarget_tag(
+                        repository_ref,
+                        manifest_interface_instance,
+                        tag_name,
+                        storage,
+                        raise_on_error=raise_on_error,
+                        verify_quota=verify_quota,
+                        model_cache=model_cache,
+                    )
+                    if manifest is None or tag is None:
+                        raise _AbortTagging()
+                    tags.append(tag)
+                return manifest, tags
 
     def create_manifest_and_retarget_tag(
         self,

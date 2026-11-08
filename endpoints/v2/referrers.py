@@ -1,11 +1,12 @@
 from flask import Response, request
 
 import features
-from app import model_cache
+from app import app, model_cache
 from auth.registry_jwt_auth import process_registry_jwt_auth
 from data.model import ManifestDoesNotExist, RepositoryDoesNotExist
 from data.registry_model import registry_model
 from digest import digest_tools
+from digest.allowlist import DigestCheck, check_digest
 from endpoints.decorators import (
     anon_protect,
     check_readonly,
@@ -34,6 +35,11 @@ MANIFEST_REFERRERS_ROUTE = BASE_REFERRERS_ROUTE.format(digest_tools.DIGEST_PATTE
 @anon_protect
 @inject_registry_model()
 def list_manifest_referrers(namespace_name, repo_name, manifest_ref, registry_model):
+    # An unsupported, disallowed or malformed non-SHA-256 subject digest is rejected like an
+    # unknown subject (PROJQUAY-10117).
+    if check_digest(manifest_ref, app.config) == DigestCheck.REJECTED:
+        raise ManifestInvalid("manifest digest is not allowed")
+
     try:
         repository_ref = registry_model.lookup_repository(
             namespace_name, repo_name, raise_on_error=True, manifest_ref=manifest_ref

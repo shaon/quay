@@ -83,3 +83,10 @@ def test_allowed_hash_algorithms_frontend_visible():
     visible = frontend_visible_config(config)
     assert visible["ALLOWED_HASH_ALGORITHMS"] == ["sha256", "sha512"]
     assert "DEFAULT_MANIFEST_HASH_ALGORITHM" not in visible
+
+
+def test_none_means_default():
+    config = {"ALLOWED_HASH_ALGORITHMS": None, "DEFAULT_MANIFEST_HASH_ALGORITHM": None}
+    validate_hash_algorithm_config(config)
+    assert allowed_hash_algorithms(config) == frozenset(["sha256"])
+    assert default_manifest_hash_algorithm(config) == "sha256"

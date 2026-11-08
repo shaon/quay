@@ -22,6 +22,8 @@ def validate_hash_algorithm_config(config):
     DEFAULT_MANIFEST_HASH_ALGORITHM is invalid.
     """
     allowed = config.get("ALLOWED_HASH_ALGORITHMS", DEFAULT_ALLOWED_HASH_ALGORITHMS)
+    if allowed is None:
+        allowed = DEFAULT_ALLOWED_HASH_ALGORITHMS
     if not isinstance(allowed, (list, tuple)) or not allowed:
         raise InvalidHashAlgorithmConfig("ALLOWED_HASH_ALGORITHMS must be a non-empty list")
 
@@ -37,7 +39,10 @@ def validate_hash_algorithm_config(config):
             "ALLOWED_HASH_ALGORITHMS must include sha256; it cannot be disabled"
         )
 
-    default = config.get("DEFAULT_MANIFEST_HASH_ALGORITHM", DEFAULT_MANIFEST_HASH_ALGORITHM)
+    default = (
+        config.get("DEFAULT_MANIFEST_HASH_ALGORITHM", DEFAULT_MANIFEST_HASH_ALGORITHM)
+        or DEFAULT_MANIFEST_HASH_ALGORITHM
+    )
     if default not in SUPPORTED_DIGEST_ALGORITHMS:
         raise InvalidHashAlgorithmConfig(
             "DEFAULT_MANIFEST_HASH_ALGORITHM %r is not a supported algorithm" % (default,)
@@ -53,8 +58,8 @@ def allowed_hash_algorithms(config):
     """
     Returns the frozenset of allowed client-visible digest algorithms.
     """
-    return frozenset(config.get("ALLOWED_HASH_ALGORITHMS", DEFAULT_ALLOWED_HASH_ALGORITHMS))
+    return frozenset(config.get("ALLOWED_HASH_ALGORITHMS") or DEFAULT_ALLOWED_HASH_ALGORITHMS)
 
 
 def default_manifest_hash_algorithm(config):
-    return config.get("DEFAULT_MANIFEST_HASH_ALGORITHM", DEFAULT_MANIFEST_HASH_ALGORITHM)
+    return config.get("DEFAULT_MANIFEST_HASH_ALGORITHM") or DEFAULT_MANIFEST_HASH_ALGORITHM

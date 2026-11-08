@@ -1,7 +1,10 @@
 import logging
+import re
 from functools import wraps
 
-from flask import Response, request, url_for
+from flask import Response
+from flask import abort as flask_abort
+from flask import request, url_for
 
 import features
 from app import app, model_cache, pullmetrics, storage
@@ -19,6 +22,7 @@ from data.model.oci.manifest import CreateManifestException
 from data.model.oci.tag import RetargetTagException
 from data.registry_model import registry_model
 from digest import digest_tools
+from digest.allowlist import DigestCheck, check_digest
 from endpoints.api import (
     log_unauthorized_delete,
     log_unauthorized_pull,
@@ -35,6 +39,7 @@ from endpoints.decorators import (
 from endpoints.metrics import image_pulls, image_pushes
 from endpoints.v2 import require_repo_read, require_repo_write, v2_bp
 from endpoints.v2.errors import (
+    DigestInvalid,
     ManifestInvalid,
     ManifestUnknown,
     NameInvalid,
@@ -42,6 +47,7 @@ from endpoints.v2.errors import (
     QuotaExceeded,
     TagExpired,
     TagImmutable,
+    TagInvalid,
 )
 from image.docker.schema1 import (
     DOCKER_SCHEMA1_CONTENT_TYPES,
@@ -52,9 +58,11 @@ from image.docker.schema2 import DOCKER_SCHEMA2_CONTENT_TYPES
 from image.oci import OCI_CONTENT_TYPES
 from image.shared import ManifestException
 from image.shared.schemas import parse_manifest_from_bytes
+from image.shared.schemautil import manifest_digest_algorithm
 from notifications import spawn_notification
 from util.audit import track_and_log
 from util.bytes import Bytes
+from util.config.hash_algorithms import default_manifest_hash_algorithm
 from util.names import VALID_TAG_PATTERN
 from util.registry.replication import queue_replication_batch
 
@@ -63,6 +71,10 @@ logger = logging.getLogger(__name__)
 BASE_MANIFEST_ROUTE = '/<repopath:repository>/manifests/<regex("{0}"):manifest_ref>'
 MANIFEST_DIGEST_ROUTE = BASE_MANIFEST_ROUTE.format(digest_tools.DIGEST_PATTERN)
 MANIFEST_TAGNAME_ROUTE = BASE_MANIFEST_ROUTE.format(VALID_TAG_PATTERN)
+
+# Maximum number of `tag` query parameters on a manifest push by digest (PROJQUAY-10117).
+MAX_TAGS_PER_MANIFEST_PUSH = 10
+VALID_TAG_REGEX = re.compile(VALID_TAG_PATTERN)
 
 
 @v2_bp.route(MANIFEST_TAGNAME_ROUTE, methods=["GET"])
@@ -306,7 +318,15 @@ def _doesnt_accept_schema_v1():
 @check_readonly
 @check_pushes_disabled
 def write_manifest_by_tagname(namespace_name, repo_name, manifest_ref):
-    parsed = _parse_manifest(request.content_type, request.data)
+    # A push by tag hashes the manifest with DEFAULT_MANIFEST_HASH_ALGORITHM; schema 1 stays
+    # SHA-256.
+    parsed = _parse_manifest(
+        request.content_type,
+        request.data,
+        digest_algorithm=default_manifest_hash_algorithm(app.config),
+        schema1_uses_sha256=True,
+    )
+    _check_manifest_references(parsed)
 
     return _write_manifest_and_log(namespace_name, repo_name, manifest_ref, parsed)
 
@@ -332,10 +352,26 @@ def _enqueue_blobs_for_replication(manifest, storage, namespace_name):
 @check_readonly
 @check_pushes_disabled
 def write_manifest_by_digest(namespace_name, repo_name, manifest_ref):
-    parsed = _parse_manifest(request.content_type, request.data)
+    if check_digest(manifest_ref, app.config) == DigestCheck.REJECTED:
+        image_pushes.labels("v2", 400, "").inc()
+        raise DigestInvalid(detail={"digest": manifest_ref})
+
+    tag_names = _requested_tags()
+
+    # A push by digest hashes the manifest with the algorithm named in the address.
+    parsed = _parse_manifest(
+        request.content_type,
+        request.data,
+        digest_algorithm=manifest_digest_algorithm(manifest_ref),
+    )
     if parsed.digest != manifest_ref:
         image_pushes.labels("v2", 400, "").inc()
         raise ManifestInvalid(detail={"message": "manifest digest mismatch"})
+
+    _check_manifest_references(parsed)
+
+    if tag_names:
+        return _write_manifest_with_tags_and_log(namespace_name, repo_name, tag_names, parsed)
 
     if parsed.schema_version != 2:
         return _write_manifest_and_log(namespace_name, repo_name, parsed.tag, parsed)
@@ -384,16 +420,84 @@ def write_manifest_by_digest(namespace_name, repo_name, manifest_ref):
     )
 
 
-def _parse_manifest(content_type, request_data):
+def _requested_tags():
+    """
+    Returns the `tag` query parameters of a manifest push by digest, validated: more than
+    MAX_TAGS_PER_MANIFEST_PUSH returns 414, an invalid tag name returns 400 TAG_INVALID.
+    """
+    tag_names = request.args.getlist("tag")
+    if len(tag_names) > MAX_TAGS_PER_MANIFEST_PUSH:
+        image_pushes.labels("v2", 414, "").inc()
+        flask_abort(
+            Response(
+                "Request-URI Too Long: at most %s tag parameters are supported"
+                % MAX_TAGS_PER_MANIFEST_PUSH,
+                status=414,
+            )
+        )
+
+    for tag_name in tag_names:
+        if not VALID_TAG_REGEX.fullmatch(tag_name):
+            image_pushes.labels("v2", 400, "").inc()
+            raise TagInvalid(detail={"message": "invalid tag name `%s`" % tag_name})
+
+    # Keep the first occurrence of each tag, in request order.
+    return list(dict.fromkeys(tag_names))
+
+
+def _check_manifest_references(parsed):
+    """
+    Rejects a manifest that references a blob or child manifest by an unsupported, disallowed or
+    malformed non-SHA-256 digest, or whose `subject` does (400 MANIFEST_INVALID). An allowed
+    subject that does not exist yet is accepted.
+    """
+    referenced = []
+    try:
+        referenced.extend(str(d) for d in (parsed.blob_digests or []))
+    except ManifestException as me:
+        raise ManifestInvalid(detail={"message": str(me)})
+
+    if parsed.is_manifest_list:
+        for child in parsed.manifest_dict.get("manifests", []):
+            if isinstance(child, dict) and "digest" in child:
+                referenced.append(str(child["digest"]))
+
+    for digest in referenced:
+        if check_digest(digest, app.config) == DigestCheck.REJECTED:
+            image_pushes.labels("v2", 400, "").inc()
+            raise ManifestInvalid(
+                detail={"message": "manifest references a disallowed digest `%s`" % digest}
+            )
+
+    subject = getattr(parsed, "subject", None)
+    if subject is not None and check_digest(str(subject.digest), app.config) == (
+        DigestCheck.REJECTED
+    ):
+        image_pushes.labels("v2", 400, "").inc()
+        raise ManifestInvalid(
+            detail={"message": "manifest subject has a disallowed digest `%s`" % subject.digest}
+        )
+
+
+def _parse_manifest(
+    content_type,
+    request_data,
+    digest_algorithm=digest_tools.SHA256,
+    schema1_uses_sha256=False,
+):
     content_type = content_type or DOCKER_SCHEMA1_MANIFEST_CONTENT_TYPE
     if content_type == "application/json":
         # For back-compat.
         content_type = DOCKER_SCHEMA1_MANIFEST_CONTENT_TYPE
 
+    if schema1_uses_sha256 and content_type in DOCKER_SCHEMA1_CONTENT_TYPES:
+        digest_algorithm = digest_tools.SHA256
+
     try:
         return parse_manifest_from_bytes(
             Bytes.for_string_or_unicode(request_data),
             content_type,
+            digest_algorithm=digest_algorithm,
         )
     except ManifestException as me:
         logger.exception("failed to parse manifest when writing by tagname")
@@ -416,6 +520,9 @@ def delete_manifest_by_digest(namespace_name, repo_name, manifest_ref):
     Note: there is no equivalent method for deleting by tag name because it is
     forbidden by the spec.
     """
+    if check_digest(manifest_ref, app.config) == DigestCheck.REJECTED:
+        raise ManifestUnknown()
+
     with db_disallow_replica_use():
         repository_ref = registry_model.lookup_repository(
             namespace_name, repo_name, model_cache=model_cache
@@ -503,6 +610,67 @@ def _write_manifest_and_log(namespace_name, repo_name, tag_name, manifest_impl):
                 ),
             },
         )
+
+
+def _write_manifest_with_tags_and_log(namespace_name, repo_name, tag_names, manifest_impl):
+    """
+    Push by digest with `?tag=` (PROJQUAY-10117): creates or reuses the manifest and assigns every
+    requested tag in one transaction. Each accepted tag is reported in an `OCI-Tag` header.
+    """
+    _validate_schema1_manifest(namespace_name, repo_name, manifest_impl)
+    with db_disallow_replica_use():
+        repository_ref = registry_model.lookup_repository(
+            namespace_name, repo_name, model_cache=model_cache
+        )
+        if repository_ref is None:
+            raise NameUnknown("repository not found")
+
+        try:
+            manifest, tags = registry_model.create_manifest_and_retarget_tags(
+                repository_ref,
+                manifest_impl,
+                tag_names,
+                storage,
+                raise_on_error=True,
+                verify_quota=app.config.get("FEATURE_QUOTA_MANAGEMENT", False)
+                and app.config.get("FEATURE_VERIFY_QUOTA", True),
+                model_cache=model_cache,
+            )
+        except CreateManifestException as cme:
+            raise ManifestInvalid(detail={"message": str(cme)})
+        except RetargetTagException as rte:
+            raise ManifestInvalid(detail={"message": str(rte)})
+        except ImmutableTagException as ite:
+            raise TagImmutable(detail={"message": f"tag '{ite.tag_name}' is immutable"}) from ite
+        except QuotaExceededException:
+            raise QuotaExceeded()
+
+        if manifest is None:
+            raise ManifestInvalid()
+
+        if features.STORAGE_REPLICATION:
+            _enqueue_blobs_for_replication(manifest, storage, namespace_name)
+
+        for tag_name in tag_names:
+            track_and_log(
+                "push_repo", repository_ref, tag=tag_name, mediaType=manifest.media_type
+            )
+        spawn_notification(repository_ref, "repo_push", {"updated_tags": list(tag_names)})
+        image_pushes.labels("v2", 201, manifest.media_type).inc()
+
+        headers = [
+            ("Docker-Content-Digest", manifest.digest),
+            (
+                "Location",
+                url_for(
+                    "v2.fetch_manifest_by_digest",
+                    repository="%s/%s" % (namespace_name, repo_name),
+                    manifest_ref=manifest.digest,
+                ),
+            ),
+        ]
+        headers.extend(("OCI-Tag", tag_name) for tag_name in tag_names)
+        return Response("OK", status=201, headers=headers)
 
 
 def _write_manifest(

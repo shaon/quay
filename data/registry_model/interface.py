@@ -83,6 +83,22 @@ class RegistryDataInterface(object):
         """
 
     @abstractmethod
+    def create_manifest_and_retarget_tags(
+        self,
+        repository_ref,
+        manifest_interface_instance,
+        tag_names,
+        storage,
+        raise_on_error=False,
+        verify_quota=False,
+        model_cache=None,
+    ):
+        """
+        Creates a manifest and points every tag in `tag_names` at it in one transaction; if any
+        tag assignment fails, nothing commits. Returns (manifest, [tags]) or (None, None).
+        """
+
+    @abstractmethod
     def create_manifest_and_retarget_tag(
         self,
         repository_ref,
