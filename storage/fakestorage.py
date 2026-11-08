@@ -66,6 +66,11 @@ class FakeStorage(BaseStorageV2):
     def remove(self, path):
         self._fake_storage_map.pop(path, None)
 
+    def get_size(self, path):
+        if path not in self._fake_storage_map:
+            return None
+        return len(self._fake_storage_map[path].getvalue())
+
     def exists(self, path):
         if self._fake_storage_map.get("all_files_exist", None):
             return True

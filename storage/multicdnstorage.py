@@ -231,6 +231,9 @@ class MultiCDNStorage(BaseStorageV2):
     def remove(self, path):
         return self.default_provider.remove(path)
 
+    def get_size(self, path):
+        return self.default_provider.get_size(path)
+
     def get_checksum(self, path):
         return self.default_provider.get_checksum(path)
 

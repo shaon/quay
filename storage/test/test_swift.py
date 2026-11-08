@@ -392,3 +392,17 @@ def test_get_direct_download_url(temp_url_key, expects_url):
     swift = FakeSwiftStorage(temp_url_key=temp_url_key, **base_args)
     swift.put_content("somepath", b"hello world!")
     assert (swift.get_direct_download_url("somepath") is not None) == expects_url
+
+
+def test_get_size():
+    swift = FakeSwiftStorage(**base_args)
+    assert swift.get_size("somepath") is None
+    swift.put_content("somepath", b"hello world!")
+    assert swift.get_size("somepath") == len(b"hello world!")
+
+
+def test_get_size_uses_content_length_header():
+    swift = FakeSwiftStorage(**base_args)
+    swift.put_content("somepath", b"hello world!")
+    with patch.object(swift, "_head_object", return_value={"content-length": "42"}):
+        assert swift.get_size("somepath") == 42

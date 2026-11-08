@@ -59,6 +59,12 @@ class LocalStorage(BaseStorageV2):
         path = self._init_path(path)
         return os.path.exists(path)
 
+    def get_size(self, path):
+        path = self._init_path(path)
+        if not os.path.isfile(path):
+            return None
+        return os.path.getsize(path)
+
     def remove(self, path):
         path = self._init_path(path)
         if os.path.isdir(path):

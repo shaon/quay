@@ -50,6 +50,7 @@ def fake_azure_storage(files=None):
                 "headers": (
                     {
                         "ETag": "foobar",
+                        "Content-Length": str(len(files[filename])),
                     }
                     if filename in files
                     else {"x-ms-error-code": "ResourceNotFound"}
@@ -264,3 +265,10 @@ def test_copy_to():
         ):
             s.copy_to(s2, "hello")
             assert s2.exists("hello")
+
+
+def test_get_size():
+    with fake_azure_storage() as s:
+        assert s.get_size("hello") is None
+        s.put_content("hello", b"hello world")
+        assert s.get_size("hello") == len(b"hello world")

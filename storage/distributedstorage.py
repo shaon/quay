@@ -107,6 +107,7 @@ class DistributedStorage(StoragePaths):
     stream_write = _location_aware(BaseStorage.stream_write, requires_write=True)
     exists = _location_aware(BaseStorage.exists)
     remove = _location_aware(BaseStorage.remove, requires_write=True)
+    get_size = _location_aware(BaseStorage.get_size)
     get_checksum = _location_aware(BaseStorage.get_checksum)
     get_supports_resumable_downloads = _location_aware(BaseStorage.get_supports_resumable_downloads)
     clean_partial_uploads = _location_aware(BaseStorage.clean_partial_uploads, requires_write=True)

@@ -205,6 +205,17 @@ class AzureStorage(BaseStorage):
 
         return True
 
+    def get_size(self, path):
+        blob_name = self._blob_name_from_path(path)
+
+        try:
+            return self._blob(blob_name).get_blob_properties().size
+        except ResourceNotFoundError:
+            return None
+        except AzureError:
+            logger.exception("Exception when trying to get size of path %s", path)
+            raise IOError("Exception when trying to get size of path")
+
     def remove(self, path):
         blob_name = self._blob_name_from_path(path)
         try:

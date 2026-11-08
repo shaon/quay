@@ -284,6 +284,15 @@ class SwiftStorage(BaseStorage):
     def exists(self, path):
         return bool(self._head_object(path))
 
+    def get_size(self, path):
+        headers = self._head_object(path)
+        if not headers:
+            return None
+        content_length = headers.get("content-length")
+        if content_length is None:
+            return super(SwiftStorage, self).get_size(path)
+        return int(content_length)
+
     def remove(self, path):
         # Retrieve the object so we can see if it is segmented. If so, we'll delete its segments after
         # removing the object.

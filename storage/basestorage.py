@@ -91,6 +91,16 @@ class BaseStorage(StoragePaths):
     def remove(self, path):
         raise NotImplementedError
 
+    def get_size(self, path):
+        """
+        Returns the size in bytes of the object at `path`, or None if it does not exist.
+
+        This default reads the whole object; engines override it with a metadata call.
+        """
+        if not self.exists(path):
+            return None
+        return sum(len(chunk) for chunk in self.stream_read(path))
+
     def get_checksum(self, path):
         raise NotImplementedError
 

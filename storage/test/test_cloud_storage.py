@@ -683,3 +683,9 @@ def test_cleanup_handles_already_aborted_mpu(storage_engine, mock_mpu_dates):
         with freeze_time(now + timedelta(hours=1)):
             deleted = storage_engine.clean_orphaned_multipart_uploads(timedelta(seconds=0))
             assert deleted == 1
+
+
+def test_get_size(storage_engine):
+    assert storage_engine.get_size("does/not/exist") is None
+    storage_engine.put_content("some/path", b"hello world")
+    assert storage_engine.get_size("some/path") == len(b"hello world")

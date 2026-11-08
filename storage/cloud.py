@@ -434,6 +434,18 @@ class _CloudStorage(BaseStorageV2):
             raise
         return True
 
+    def get_size(self, path):
+        self._initialize_cloud_conn()
+        path = self._init_path(path)
+        obj = self.get_cloud_bucket().Object(path)
+        try:
+            obj.load()
+        except botocore.exceptions.ClientError as s3r:
+            if s3r.response["Error"]["Code"] in _MISSING_KEY_ERROR_CODES:
+                return None
+            raise
+        return obj.content_length
+
     def remove(self, path):
         self._initialize_cloud_conn()
         path = self._init_path(path)
