@@ -137,6 +137,7 @@ websocket-client==1.7.0
 Werkzeug==3.1.9
 xhtml2pdf==0.2.19
 resumablesha256==1.0
+resumablehash @ git+https://github.com/shaon/resumablehash.git@fcefe56d54df33afe500cd0335b61caded415af5
 deprecation==2.1.0
 
 # Leverage wheels for faster builds

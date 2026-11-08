@@ -43,6 +43,7 @@ from data.fields import (
     FullIndexedCharField,
     FullIndexedTextField,
     JSONField,
+    ResumableRequestedDigestField,
     ResumableSHA1Field,
     ResumableSHA256Field,
 )
@@ -1314,13 +1315,49 @@ class EmailConfirmation(BaseModel):
     created = DateTimeField(default=datetime.now)
 
 
+# PROJQUAY-10117: non-NULL ImageStorage.requested_content_checksum values are always normalized
+# sha384:/sha512: digests. Keep in sync with migration c55c2ec82b92.
+IMAGESTORAGE_REQUESTED_CHECKSUM_CHECK_NAME = "imagestorage_requested_content_checksum_check"
+IMAGESTORAGE_REQUESTED_CHECKSUM_CHECK = (
+    "requested_content_checksum IS NULL"
+    " OR (substr(requested_content_checksum, 1, 7) = 'sha384:'"
+    " AND length(requested_content_checksum) = 103)"
+    " OR (substr(requested_content_checksum, 1, 7) = 'sha512:'"
+    " AND length(requested_content_checksum) = 135)"
+)
+IMAGESTORAGE_REQUESTED_CHECKSUM_INDEX_NAME = "imagestorage_requested_content_checksum_unique"
+IMAGESTORAGE_REQUESTED_CHECKSUM_INDEX_SQL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS {name} ON imagestorage "
+    "(requested_content_checksum, content_checksum) "
+    "WHERE requested_content_checksum IS NOT NULL"
+).format(name=IMAGESTORAGE_REQUESTED_CHECKSUM_INDEX_NAME)
+
+
 class ImageStorage(BaseModel):
     uuid = CharField(default=uuid_generator, index=True, unique=True)
     image_size = BigIntegerField(null=True)
     uncompressed_size = BigIntegerField(null=True)
     uploading = BooleanField(default=True, null=True)
     cas_path = BooleanField(default=True)
+    # Internal SHA-256 CAS key. NULL only for legacy v1 rows and SHA-384/512 proxy-cache
+    # placeholders whose bytes have not been downloaded yet.
     content_checksum = CharField(null=True, index=True)
+    # Client-visible sha384/sha512 identity (PROJQUAY-10117). NULL means a SHA-256 row whose
+    # identity is content_checksum. Uniqueness of (requested_content_checksum, content_checksum)
+    # for non-NULL values, and lookups by requested digest, use the partial unique index
+    # IMAGESTORAGE_REQUESTED_CHECKSUM_INDEX_NAME. Peewee cannot express partial indexes, so it is
+    # created by the migration and by initdb.initialize_database.
+    requested_content_checksum = CharField(null=True)
+
+    class Meta:
+        database = db
+        read_only_config = read_only_config
+        constraints = [
+            SQL(
+                "CONSTRAINT %s CHECK (%s)"
+                % (IMAGESTORAGE_REQUESTED_CHECKSUM_CHECK_NAME, IMAGESTORAGE_REQUESTED_CHECKSUM_CHECK)
+            )
+        ]
 
 
 class ImageStorageTransformation(BaseModel):
@@ -1747,6 +1784,10 @@ class BlobUpload(BaseModel):
     created = DateTimeField(default=datetime.now, index=True)
     piece_sha_state = ResumableSHA1Field(null=True)
     piece_hashes = Base64BinaryField(null=True)
+    # PROJQUAY-10117: hinted sha384/sha512 algorithm (NULL for no hint or a sha256 hint) and its
+    # resumable hash state, covering exactly the bytes received.
+    requested_digest_algorithm = CharField(null=True)
+    requested_digest_state = ResumableRequestedDigestField(null=True)
 
     class Meta:
         database = db

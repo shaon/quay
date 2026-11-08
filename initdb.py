@@ -21,6 +21,7 @@ from app import storage as store
 from app import tf
 from data import model
 from data.database import (
+    IMAGESTORAGE_REQUESTED_CHECKSUM_INDEX_SQL,
     AccessTokenKind,
     BuildTriggerService,
     DeletedNamespace,
@@ -418,6 +419,8 @@ def _create_seed_media_types():
 def initialize_database():
     db_encrypter.initialize(FieldEncrypter("QUAY_FIXTURE_ONLY-anothercrazykey!"))
     db.create_tables(all_models)
+    # Peewee cannot express partial indexes; create the PROJQUAY-10117 one explicitly.
+    db.execute_sql(IMAGESTORAGE_REQUESTED_CHECKSUM_INDEX_SQL)
 
     Role.create(name="admin")
     Role.create(name="write")

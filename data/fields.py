@@ -1,6 +1,7 @@
 import base64
 import io
 import json
+import logging
 import pickle
 import string
 from random import SystemRandom
@@ -10,6 +11,8 @@ from peewee import CharField, SmallIntegerField, TextField
 
 from data.text import prefix_search
 from util.bytes import Bytes
+
+logger = logging.getLogger(__name__)
 
 
 def random_string(length=16):
@@ -67,6 +70,61 @@ class ResumableSHA256Field(_ResumableSHAField):
 
 class ResumableSHA1Field(_ResumableSHAField):
     pass
+
+
+class _RequestedDigestUnpickler(pickle.Unpickler):
+    """
+    Restricted unpickler for BlobUpload.requested_digest_state (PROJQUAY-10117). Only allows the
+    resumable SHA-384 and SHA-512 hash classes from `resumablehash`. Deliberately separate from
+    _SafeUnpickler so the `sha_state` allowlist stays exactly `resumablesha256.sha256`
+    (CVE-2026-32590).
+    """
+
+    ALLOWED = frozenset({("resumablehash", "sha384"), ("resumablehash", "sha512")})
+
+    def find_class(self, module, name):
+        if (module, name) in self.ALLOWED:
+            return super().find_class(module, name)
+        raise pickle.UnpicklingError(f"Forbidden class: {module}.{name}")
+
+
+# resumablehash objects cannot be pickled with protocols 0 or 1.
+REQUESTED_DIGEST_PICKLE_PROTOCOL = 4
+
+
+class ResumableRequestedDigestField(TextField):
+    """
+    Stores the resumable hash state for the hinted (sha384/sha512) digest algorithm of a blob
+    upload.
+
+    Restoring never raises: state that cannot be loaded (forbidden class, corrupt or truncated
+    bytes, state rejected by resumablehash's own validation, or state saved on a different CPU
+    architecture) is returned as None. Callers must also check that the restored object's `name`
+    equals BlobUpload.requested_digest_algorithm, and treat any mismatch or None as invalid state,
+    falling back to rereading the upload.
+    """
+
+    def db_value(self, value):
+        if value is None:
+            return None
+        data = pickle.dumps(value, protocol=REQUESTED_DIGEST_PICKLE_PROTOCOL)
+        return base64.b64encode(data).decode("ascii")
+
+    def python_value(self, value):
+        if value is None:
+            return None
+        try:
+            data = base64.b64decode(value.encode("ascii"), validate=True)
+            hasher = _RequestedDigestUnpickler(io.BytesIO(data)).load()
+        except Exception as ex:
+            logger.warning("Discarding invalid requested digest hash state: %s", ex)
+            return None
+
+        hasher_type = type(hasher)
+        if (hasher_type.__module__, hasher_type.__name__) not in _RequestedDigestUnpickler.ALLOWED:
+            logger.warning("Discarding requested digest hash state of type %s", hasher_type)
+            return None
+        return hasher
 
 
 class JSONField(TextField):
