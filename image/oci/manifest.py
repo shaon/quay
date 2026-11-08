@@ -62,6 +62,7 @@ from image.oci.config import OCIConfig
 from image.oci.descriptor import get_descriptor_schema
 from image.shared import ManifestException
 from image.shared.interfaces import ManifestInterface
+from image.shared.schemautil import is_sha256_only
 from image.shared.types import ManifestImageLayer
 from util.bytes import Bytes
 
@@ -149,8 +150,9 @@ class OCIManifest(ManifestInterface):
 
         return METASCHEMA
 
-    def __init__(self, manifest_bytes, validate=False):
+    def __init__(self, manifest_bytes, validate=False, digest_algorithm=digest_tools.SHA256):
         assert isinstance(manifest_bytes, Bytes)
+        self._digest_algorithm = digest_algorithm
 
         self._payload = manifest_bytes
 
@@ -217,7 +219,10 @@ class OCIManifest(ManifestInterface):
 
     @property
     def digest(self):
-        return digest_tools.sha256_digest(self._payload.as_encoded_str())
+        """
+        The digest of the manifest under the algorithm it is addressed by (PROJQUAY-10117).
+        """
+        return digest_tools.compute_digest(self._payload.as_encoded_str(), self._digest_algorithm)
 
     @property
     def config(self):
@@ -464,7 +469,7 @@ class OCIManifest(ManifestInterface):
         )
 
     def get_schema1_manifest(self, namespace_name, repo_name, tag_name, content_retriever):
-        if self.has_remote_layer or not self.is_image_manifest:
+        if self.has_remote_layer or not self.is_image_manifest or not is_sha256_only(self):
             return None
 
         v1_builder = DockerSchema1ManifestBuilder(namespace_name, repo_name, tag_name)

@@ -8,6 +8,7 @@ import features
 from app import app
 from data.database import Manifest
 from image.shared.schemas import ManifestException, parse_manifest_from_bytes
+from image.shared.schemautil import manifest_digest_algorithm
 from util.bytes import Bytes
 from util.log import logfile_path
 from util.migrate.allocator import yield_random_entries
@@ -59,7 +60,10 @@ class ManifestSubjectBackfillWorker(Worker):
 
             try:
                 parsed = parse_manifest_from_bytes(
-                    manifest_bytes, manifest_row.media_type.name, validate=False
+                    manifest_bytes,
+                    manifest_row.media_type.name,
+                    validate=False,
+                    digest_algorithm=manifest_digest_algorithm(manifest_row.digest),
                 )
                 subject = parsed.subject
             except ManifestException as me:
@@ -117,7 +121,10 @@ class ManifestSubjectBackfillWorker(Worker):
 
             try:
                 parsed = parse_manifest_from_bytes(
-                    manifest_bytes, manifest_row.media_type.name, validate=False
+                    manifest_bytes,
+                    manifest_row.media_type.name,
+                    validate=False,
+                    digest_algorithm=manifest_digest_algorithm(manifest_row.digest),
                 )
                 artifact_type = parsed.artifact_type
             except ManifestException as me:

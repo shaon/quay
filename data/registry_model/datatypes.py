@@ -17,6 +17,7 @@ from image.oci.index import INDEX_DIGEST_KEY, INDEX_MANIFESTS_KEY, OCIIndex
 from image.oci.manifest import OCI_MANIFEST_ARTIFACT_TYPE_KEY
 from image.shared import ManifestException
 from image.shared.schemas import is_manifest_list_type, parse_manifest_from_bytes
+from image.shared.schemautil import manifest_digest_algorithm
 from util.bytes import Bytes
 
 
@@ -342,6 +343,7 @@ class Manifest(
             self.internal_manifest_bytes,
             self.media_type,
             validate=validate,
+            digest_algorithm=manifest_digest_algorithm(self.digest),
         )
 
     @property

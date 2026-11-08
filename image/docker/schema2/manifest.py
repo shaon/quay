@@ -19,6 +19,7 @@ from image.docker.schema2 import (
 from image.docker.schema2.config import DockerSchema2Config
 from image.shared import ManifestException
 from image.shared.interfaces import ManifestInterface
+from image.shared.schemautil import is_sha256_only
 from image.shared.types import ManifestImageLayer
 from util.bytes import Bytes
 
@@ -145,8 +146,9 @@ class DockerSchema2Manifest(ManifestInterface):
         ],
     }
 
-    def __init__(self, manifest_bytes, validate=False):
+    def __init__(self, manifest_bytes, validate=False, digest_algorithm=digest_tools.SHA256):
         assert isinstance(manifest_bytes, Bytes)
+        self._digest_algorithm = digest_algorithm
 
         self._payload = manifest_bytes
 
@@ -205,7 +207,7 @@ class DockerSchema2Manifest(ManifestInterface):
 
     @property
     def digest(self):
-        return digest_tools.sha256_digest(self._payload.as_encoded_str())
+        return digest_tools.compute_digest(self._payload.as_encoded_str(), self._digest_algorithm)
 
     @property
     def config(self):
@@ -389,7 +391,7 @@ class DockerSchema2Manifest(ManifestInterface):
         )
 
     def get_schema1_manifest(self, namespace_name, repo_name, tag_name, content_retriever):
-        if self.has_remote_layer:
+        if self.has_remote_layer or not is_sha256_only(self):
             return None
 
         v1_builder = DockerSchema1ManifestBuilder(namespace_name, repo_name, tag_name)

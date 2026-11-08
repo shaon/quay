@@ -182,8 +182,12 @@ class DockerSchema1Manifest(ManifestInterface):
         ],
     }
 
-    def __init__(self, manifest_bytes, validate=True):
+    def __init__(self, manifest_bytes, validate=True, digest_algorithm=digest_tools.SHA256):
         assert isinstance(manifest_bytes, Bytes)
+
+        # Docker schema 1 stays SHA-256 only (PROJQUAY-10117).
+        if digest_algorithm != digest_tools.SHA256:
+            raise MalformedSchema1Manifest("Docker schema 1 manifests only support sha256 digests")
 
         self._layers = None
         self._bytes = manifest_bytes

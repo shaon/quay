@@ -1,6 +1,7 @@
 import json
 import logging
 
+from digest import digest_tools
 from image.shared import ManifestException
 from image.shared.interfaces import ContentRetriever
 from util.bytes import Bytes
@@ -55,6 +56,32 @@ def to_canonical_json(value, ensure_ascii=True, indent=None):
         cls=_CustomEncoder,
         indent=indent,
     )
+
+
+def is_sha256_only(parsed_manifest):
+    """
+    Returns True if a parsed manifest's own digest, every blob digest, and (for lists) every
+    child manifest digest is SHA-256. Only such manifests may be converted to Docker schema 1 or
+    served through the v1 protocol (PROJQUAY-10117).
+    """
+    digests = [parsed_manifest.digest]
+    digests.extend(parsed_manifest.blob_digests or [])
+    if parsed_manifest.is_manifest_list:
+        for child in parsed_manifest.manifest_dict.get("manifests", []):
+            if isinstance(child, dict) and "digest" in child:
+                digests.append(child["digest"])
+    return all(str(d).startswith("sha256:") for d in digests)
+
+
+def manifest_digest_algorithm(digest):
+    """
+    Returns the algorithm to compute a manifest's digest with, given the digest it is addressed or
+    stored by: sha384/sha512 when the digest names one, otherwise sha256 (PROJQUAY-10117).
+    """
+    algorithm = digest_tools.digest_algorithm(str(digest)) if digest else None
+    if algorithm in (digest_tools.SHA384, digest_tools.SHA512):
+        return algorithm
+    return digest_tools.SHA256
 
 
 class LazyManifestLoader(object):
@@ -139,4 +166,5 @@ class LazyManifestLoader(object):
         return self._supported_types[content_type](
             Bytes.for_string_or_unicode(manifest_bytes),
             validate=False,
+            digest_algorithm=manifest_digest_algorithm(digest),
         )

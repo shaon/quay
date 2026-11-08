@@ -17,7 +17,7 @@ from image.docker.schema2 import (
 from image.docker.schema2.manifest import DockerSchema2Manifest
 from image.shared import ManifestException
 from image.shared.interfaces import ManifestListInterface
-from image.shared.schemautil import LazyManifestLoader
+from image.shared.schemautil import LazyManifestLoader, is_sha256_only
 from util.bytes import Bytes
 
 logger = logging.getLogger(__name__)
@@ -159,8 +159,9 @@ class DockerSchema2ManifestList(ManifestListInterface):
         ],
     }
 
-    def __init__(self, manifest_bytes, validate=False):
+    def __init__(self, manifest_bytes, validate=False, digest_algorithm=digest_tools.SHA256):
         assert isinstance(manifest_bytes, Bytes)
+        self._digest_algorithm = digest_algorithm
 
         self._layers = None
         self._manifest_bytes = manifest_bytes
@@ -191,7 +192,7 @@ class DockerSchema2ManifestList(ManifestListInterface):
         """
         The digest of the manifest, including type prefix.
         """
-        return digest_tools.sha256_digest(self._manifest_bytes.as_encoded_str())
+        return digest_tools.compute_digest(self._manifest_bytes.as_encoded_str(), self._digest_algorithm)
 
     @property
     def media_type(self):
@@ -351,6 +352,9 @@ class DockerSchema2ManifestList(ManifestListInterface):
 
         If none, returns None.
         """
+        if not is_sha256_only(self):
+            return None
+
         legacy_manifest = self._get_legacy_manifest(content_retriever)
         if legacy_manifest is None:
             return None

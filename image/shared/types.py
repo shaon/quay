@@ -272,8 +272,15 @@ class SparseManifestList(ManifestListInterface):
     expected to exist in Quay.
     """
 
-    def __init__(self, manifest_bytes: Bytes, media_type, validate=False):
+    def __init__(
+        self,
+        manifest_bytes: Bytes,
+        media_type,
+        validate=False,
+        digest_algorithm=digest_tools.SHA256,
+    ):
         assert isinstance(manifest_bytes, Bytes)
+        self._digest_algorithm = digest_algorithm
         self._payload = manifest_bytes
         self._media_type = media_type
         try:
@@ -293,7 +300,7 @@ class SparseManifestList(ManifestListInterface):
         """
         The digest of the manifest, including type prefix.
         """
-        return digest_tools.sha256_digest(self._payload.as_encoded_str())
+        return digest_tools.compute_digest(self._payload.as_encoded_str(), self._digest_algorithm)
 
     @property
     def media_type(self):
