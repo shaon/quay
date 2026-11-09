@@ -44,6 +44,14 @@ FEATURE_USERNAME_CONFIRMATION: true
 FEATURE_USER_CREATION: true
 FEATURE_USER_LOG_ACCESS: false
 FEATURE_PROXY_CACHE: true
+# PROJQUAY-10117: accept and serve sha384/sha512 client-visible digests (sha256 is always allowed).
+ALLOWED_HASH_ALGORITHMS:
+  - sha256
+  - sha384
+  - sha512
+# Lets the SHA-384/512 proxy-cache e2e cases use this Quay (localhost:8080) as the upstream.
+SSRF_ALLOWED_HOSTS:
+  - localhost
 GITHUB_LOGIN_CONFIG: {}
 GITHUB_TRIGGER_CONFIG: {}
 GITLAB_TRIGGER_KIND: {}
