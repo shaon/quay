@@ -21,6 +21,22 @@ import {ApiClient} from '../../utils/api';
 import {getV2Token} from '../../utils/api/auth';
 import {pushImage, orasAttach, isOrasAvailable} from '../../utils/container';
 import {API_URL} from '../../utils/config';
+import {
+  DIGEST_ALGORITHMS,
+  digestOf,
+  errorCode,
+  getBlob,
+  getManifest,
+  headerValues,
+  isAlgorithmAllowed,
+  newTestImage,
+  ociManifest,
+  pushImageByDigest,
+  putManifest,
+  uploadBlobChunked,
+  uploadBlobMonolithic,
+} from '../../utils/registry-digests';
+import type {APIRequestContext} from '@playwright/test';
 
 const DOCKER_MANIFEST_V2 =
   'application/vnd.docker.distribution.manifest.v2+json';
@@ -659,3 +675,263 @@ test.describe('V2 Auth POST', {tag: ['@api', '@v2']}, () => {
     }
   });
 });
+
+test.describe(
+  'V2 configurable digest algorithms',
+  {tag: ['@api', '@v2', '@PROJQUAY-10117', '@auth:Database']},
+  () => {
+    // Pushes and pulls use raw registry HTTP requests so digests are exact.
+    let username: string;
+    let password: string;
+    let orgName: string;
+    let repoName: string;
+    let repo: string;
+
+    test.beforeAll(async ({userContext, cachedQuayConfig}) => {
+      ({username, password} = getTestUsers(cachedQuayConfig).user);
+      const api = new ApiClient(userContext.request);
+      orgName = uniqueName('digestorg');
+      repoName = uniqueName('digestrepo');
+      repo = `${orgName}/${repoName}`;
+      await api.createOrganization(orgName, `${orgName}@example.com`);
+      await api.createRepository(orgName, repoName, 'public');
+    });
+
+    test.afterAll(async ({userContext}) => {
+      if (!orgName) return;
+      const api = new ApiClient(userContext.request);
+      try {
+        await api.deleteRepository(orgName, repoName);
+      } catch {
+        /* ignore cleanup errors */
+      }
+      try {
+        await api.deleteOrganization(orgName);
+      } catch {
+        /* ignore cleanup errors */
+      }
+    });
+
+    async function token(request: APIRequestContext): Promise<string> {
+      return getV2Token(
+        request,
+        API_URL,
+        username,
+        password,
+        `repository:${repo}:pull,push`,
+      );
+    }
+
+    for (const algorithm of DIGEST_ALGORITHMS) {
+      test(`push and pull an image by ${algorithm} digest`, async ({
+        request,
+        quayConfig,
+      }) => {
+        test.skip(
+          !isAlgorithmAllowed(quayConfig, algorithm),
+          `${algorithm} is not listed in ALLOWED_HASH_ALGORITHMS`,
+        );
+        const v2Token = await token(request);
+        const image = newTestImage(`walkthrough-${algorithm}`);
+
+        // 1. Start a chunked upload with a digest-algorithm hint.
+        const layerDigest = digestOf(algorithm, image.layer);
+        // 2. Finish it with the requested digest.
+        const finished = await uploadBlobChunked(
+          request,
+          repo,
+          v2Token,
+          image.layer,
+          layerDigest,
+          algorithm,
+        );
+        expect(finished.status()).toBe(201);
+        expect(finished.headers()['docker-content-digest']).toBe(layerDigest);
+        expect(finished.headers()['location']).toContain(
+          `/v2/${repo}/blobs/${layerDigest}`,
+        );
+
+        const configDigest = digestOf(algorithm, image.config);
+        const config = await uploadBlobMonolithic(
+          request,
+          repo,
+          v2Token,
+          image.config,
+          configDigest,
+        );
+        expect(config.status()).toBe(201);
+        expect(config.headers()['docker-content-digest']).toBe(configDigest);
+
+        // 3. Push the manifest by digest and assign a tag.
+        const manifest = ociManifest(
+          {digest: configDigest, size: image.config.length},
+          [{digest: layerDigest, size: image.layer.length}],
+        );
+        const manifestDigest = digestOf(algorithm, manifest);
+        const tag = `${algorithm}-latest`;
+        const pushed = await putManifest(
+          request,
+          repo,
+          v2Token,
+          manifestDigest,
+          manifest,
+          [tag],
+        );
+        expect(pushed.status()).toBe(201);
+        expect(pushed.headers()['docker-content-digest']).toBe(manifestDigest);
+        expect(pushed.headers()['location']).toContain(
+          `/v2/${repo}/manifests/${manifestDigest}`,
+        );
+        expect(headerValues(pushed, 'OCI-Tag')).toEqual([tag]);
+
+        // 4. Pull by digest: manifest and blobs.
+        const byDigest = await getManifest(
+          request,
+          repo,
+          v2Token,
+          manifestDigest,
+        );
+        expect(byDigest.status()).toBe(200);
+        expect(byDigest.headers()['docker-content-digest']).toBe(
+          manifestDigest,
+        );
+        expect(Buffer.compare(await byDigest.body(), manifest)).toBe(0);
+
+        const byTag = await getManifest(request, repo, v2Token, tag);
+        expect(byTag.status()).toBe(200);
+        expect(byTag.headers()['docker-content-digest']).toBe(manifestDigest);
+
+        const blob = await getBlob(request, repo, v2Token, layerDigest);
+        expect(blob.status()).toBe(200);
+        expect(blob.headers()['docker-content-digest']).toBe(layerDigest);
+        expect(Buffer.compare(await blob.body(), image.layer)).toBe(0);
+
+        if (algorithm !== 'sha256') {
+          // Never served under the internal SHA-256.
+          const internal = await getBlob(
+            request,
+            repo,
+            v2Token,
+            digestOf('sha256', image.layer),
+            'HEAD',
+          );
+          expect(internal.status()).toBe(404);
+        }
+      });
+
+      if (algorithm === 'sha256') continue;
+
+      test(`${algorithm} writes and reads are rejected when not allowed`, async ({
+        request,
+        quayConfig,
+      }) => {
+        test.skip(
+          isAlgorithmAllowed(quayConfig, algorithm),
+          `${algorithm} is allowed; rejection cases do not apply`,
+        );
+        const v2Token = await token(request);
+        const image = newTestImage(`rejected-${algorithm}`);
+        const layerDigest = digestOf(algorithm, image.layer);
+
+        const upload = await uploadBlobMonolithic(
+          request,
+          repo,
+          v2Token,
+          image.layer,
+          layerDigest,
+        );
+        expect(upload.status()).toBe(400);
+        expect(await errorCode(upload)).toBe('DIGEST_INVALID');
+
+        const hinted = await request.post(
+          `${API_URL}/v2/${repo}/blobs/uploads/?digest-algorithm=${algorithm}`,
+          {headers: {authorization: `Bearer ${v2Token}`}},
+        );
+        expect(hinted.status()).toBe(400);
+        expect(await errorCode(hinted)).toBe('DIGEST_INVALID');
+
+        const manifest = ociManifest({digest: layerDigest, size: 1}, []);
+        const put = await putManifest(
+          request,
+          repo,
+          v2Token,
+          digestOf(algorithm, manifest),
+          manifest,
+        );
+        expect(put.status()).toBe(400);
+        expect(await errorCode(put)).toBe('DIGEST_INVALID');
+
+        const blob = await getBlob(request, repo, v2Token, layerDigest);
+        expect(blob.status()).toBe(404);
+        const pulled = await getManifest(
+          request,
+          repo,
+          v2Token,
+          digestOf(algorithm, manifest),
+        );
+        expect(pulled.status()).toBe(404);
+      });
+    }
+
+    test('push by digest assigns repeated tag parameters', async ({
+      request,
+    }) => {
+      const v2Token = await token(request);
+      const image = newTestImage('multi-tag');
+      const tags = ['one', 'two', 'three'];
+      const pushed = await pushImageByDigest(
+        request,
+        repo,
+        v2Token,
+        'sha256',
+        image,
+        tags,
+      );
+      for (const tag of tags) {
+        const r = await getManifest(request, repo, v2Token, tag);
+        expect(r.status()).toBe(200);
+        expect(r.headers()['docker-content-digest']).toBe(
+          pushed.manifestDigest,
+        );
+      }
+
+      const tooMany = await putManifest(
+        request,
+        repo,
+        v2Token,
+        pushed.manifestDigest,
+        pushed.manifest,
+        Array.from({length: 11}, (_, i) => `t${i}`),
+      );
+      expect(tooMany.status()).toBe(414);
+
+      const invalid = await putManifest(
+        request,
+        repo,
+        v2Token,
+        pushed.manifestDigest,
+        pushed.manifest,
+        ['ok', '-bad'],
+      );
+      expect(invalid.status()).toBe(400);
+      expect(await errorCode(invalid)).toBe('TAG_INVALID');
+    });
+
+    test('malformed digests are rejected', async ({request}) => {
+      const v2Token = await token(request);
+      const malformed = `sha512:${'A'.repeat(128)}`;
+      const upload = await uploadBlobMonolithic(
+        request,
+        repo,
+        v2Token,
+        Buffer.from('x'),
+        malformed,
+      );
+      expect(upload.status()).toBe(400);
+      expect(await errorCode(upload)).toBe('DIGEST_INVALID');
+
+      const blob = await getBlob(request, repo, v2Token, malformed);
+      expect(blob.status()).toBe(404);
+    });
+  },
+);

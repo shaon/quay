@@ -8,6 +8,15 @@ import {ApiClient} from '../../utils/api';
 import {getV2Token} from '../../utils/api/auth';
 import {API_URL} from '../../utils/config';
 import {proxyOptionFromEnv} from '../../utils/proxy';
+import {
+  DigestAlgorithm,
+  digestOf,
+  getBlob,
+  getManifest,
+  isAlgorithmAllowed,
+  newTestImage,
+  pushImageByDigest,
+} from '../../utils/registry-digests';
 
 // Standalone APIRequestContexts don't inherit `use.proxy`; set it explicitly so
 // registry calls work when Quay is reachable only via a proxy. undefined locally.
@@ -194,6 +203,179 @@ test.describe(
         }
       } finally {
         await request.dispose();
+      }
+    });
+  },
+);
+
+test.describe(
+  'V2 proxy cache with SHA-384 and SHA-512 content',
+  {tag: ['@api', '@v2', '@PROJQUAY-10117', '@auth:Database']},
+  () => {
+    // The local Quay is its own upstream: no public registry serves SHA-512 images. The proxy
+    // organization's upstream is localhost:8080/<source org>, which needs `localhost` in
+    // SSRF_ALLOWED_HOSTS (set in local-dev/stack/config.yaml).
+    test.describe.configure({mode: 'serial'});
+
+    const USERNAME = TEST_USERS.user.username;
+    const PASSWORD = TEST_USERS.user.password;
+    const UPSTREAM_HOST =
+      process.env.PLAYWRIGHT_PQC_PROXY_UPSTREAM || 'localhost:8080';
+
+    let sourceOrg: string;
+    let proxyOrg: string;
+    let proxyConfigError: string | null = null;
+
+    test.beforeAll(async ({userContext}) => {
+      const api = new ApiClient(userContext.request);
+      sourceOrg = uniqueName('digestsrc');
+      proxyOrg = uniqueName('digestproxy');
+      await api.createOrganization(sourceOrg, `${sourceOrg}@example.com`);
+      await api.createOrganization(proxyOrg, `${proxyOrg}@example.com`);
+      try {
+        await api.createProxyCacheConfig(proxyOrg, {
+          upstream_registry: `${UPSTREAM_HOST}/${sourceOrg}`,
+          expiration_s: 3600,
+          insecure: true,
+        });
+      } catch (e) {
+        proxyConfigError = String(e);
+      }
+    });
+
+    test.afterAll(async ({userContext}) => {
+      const api = new ApiClient(userContext.request);
+      for (const org of [proxyOrg, sourceOrg]) {
+        if (!org) continue;
+        try {
+          await api.deleteOrganization(org);
+        } catch {
+          /* ignore cleanup errors */
+        }
+      }
+    });
+
+    for (const algorithm of ['sha384', 'sha512'] as DigestAlgorithm[]) {
+      test(`pull ${algorithm} content through the proxy cache`, async ({
+        request,
+        userContext,
+        quayConfig,
+      }) => {
+        test.skip(
+          !isAlgorithmAllowed(quayConfig, algorithm),
+          `${algorithm} is not listed in ALLOWED_HASH_ALGORITHMS`,
+        );
+        test.skip(
+          proxyConfigError !== null,
+          `proxy cache upstream ${UPSTREAM_HOST} rejected (add it to SSRF_ALLOWED_HOSTS): ${proxyConfigError}`,
+        );
+
+        // Publish the SHA-384/512 image in a public source repository.
+        const repoName = uniqueName(`img${algorithm}`);
+        await new ApiClient(userContext.request).createRepository(
+          sourceOrg,
+          repoName,
+          'public',
+        );
+        const sourceToken = await getV2Token(
+          request,
+          API_URL,
+          USERNAME,
+          PASSWORD,
+          `repository:${sourceOrg}/${repoName}:push,pull`,
+        );
+        const image = newTestImage(`proxy-${algorithm}`);
+        const pushed = await pushImageByDigest(
+          request,
+          `${sourceOrg}/${repoName}`,
+          sourceToken,
+          algorithm,
+          image,
+          ['latest'],
+        );
+
+        // Pull it through the proxy organization.
+        const proxyRepo = `${proxyOrg}/${repoName}`;
+        const proxyToken = await getV2Token(
+          request,
+          API_URL,
+          USERNAME,
+          PASSWORD,
+          `repository:${proxyRepo}:push,pull`,
+        );
+        const manifest = await getManifest(
+          request,
+          proxyRepo,
+          proxyToken,
+          pushed.manifestDigest,
+        );
+        expect(manifest.status()).toBe(200);
+        expect(manifest.headers()['docker-content-digest']).toBe(
+          pushed.manifestDigest,
+        );
+        expect(Buffer.compare(await manifest.body(), pushed.manifest)).toBe(0);
+
+        // HEAD returns the recorded size, GET returns the bytes under the requested digest.
+        const head = await getBlob(
+          request,
+          proxyRepo,
+          proxyToken,
+          pushed.layerDigest,
+          'HEAD',
+        );
+        expect(head.status()).toBe(200);
+        expect(parseInt(head.headers()['content-length'])).toBe(
+          image.layer.length,
+        );
+
+        const blob = await getBlob(
+          request,
+          proxyRepo,
+          proxyToken,
+          pushed.layerDigest,
+        );
+        expect(blob.status()).toBe(200);
+        expect(Buffer.compare(await blob.body(), image.layer)).toBe(0);
+
+        // Never served under the internal SHA-256 in the proxy repository.
+        const internal = await getBlob(
+          request,
+          proxyRepo,
+          proxyToken,
+          digestOf('sha256', image.layer),
+          'HEAD',
+        );
+        expect(internal.status()).toBe(404);
+      });
+    }
+
+    test('disallowed digests are not proxied', async ({
+      request,
+      quayConfig,
+    }) => {
+      const disallowed = (['sha384', 'sha512'] as DigestAlgorithm[]).filter(
+        (a) => !isAlgorithmAllowed(quayConfig, a),
+      );
+      test.skip(
+        disallowed.length === 0,
+        'every digest algorithm is allowed; rejection case does not apply',
+      );
+      const repo = `${proxyOrg}/${uniqueName('denied')}`;
+      const token = await getV2Token(
+        request,
+        API_URL,
+        USERNAME,
+        PASSWORD,
+        `repository:${repo}:pull`,
+      );
+      for (const algorithm of disallowed) {
+        const r = await getManifest(
+          request,
+          repo,
+          token,
+          digestOf(algorithm, Buffer.from('anything')),
+        );
+        expect(r.status()).toBe(404);
       }
     });
   },
