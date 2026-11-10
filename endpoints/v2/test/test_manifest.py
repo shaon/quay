@@ -3,6 +3,7 @@ import json
 import time
 from unittest.mock import Mock, patch
 
+import pytest
 from flask import url_for
 from playhouse.test_utils import count_queries
 
@@ -678,3 +679,97 @@ def test_manifest_deletion_doesnt_return_stale_results(client, app):
         # load response
         response_data = json.loads(rv.data)
         assert "latest" not in response_data["tags"]
+
+
+def _push_headers_for(repository):
+    user = model.user.get_user("devtable")
+    access = [
+        {
+            "type": "repository",
+            "name": repository,
+            "actions": ["pull", "push"],
+        }
+    ]
+
+    context, subject = build_context_and_subject(ValidatedAuthContext(user=user))
+    token = generate_bearer_token(
+        realapp.config["SERVER_HOSTNAME"], subject, context, access, 600, instance_keys
+    )
+    return {"Authorization": "Bearer %s" % token}
+
+
+def _oci_index_bytes(subject_digest=None):
+    index = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [],
+    }
+    if subject_digest is not None:
+        index["subject"] = {
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "size": 1234,
+            "digest": subject_digest,
+        }
+    return json.dumps(index).encode("utf-8")
+
+
+@pytest.mark.parametrize("by_digest", [True, False])
+@pytest.mark.parametrize("with_subject", [True, False])
+def test_write_manifest_returns_oci_subject_header(client, app, by_digest, with_subject):
+    subject_digest = "sha256:" + hashlib.sha256(b"subject").hexdigest()
+    manifest_bytes = _oci_index_bytes(subject_digest if with_subject else None)
+    manifest_digest = "sha256:" + hashlib.sha256(manifest_bytes).hexdigest()
+
+    if by_digest:
+        endpoint = "v2.write_manifest_by_digest"
+        manifest_ref = manifest_digest
+    else:
+        endpoint = "v2.write_manifest_by_tagname"
+        manifest_ref = "subjecttest"
+
+    url = url_for(endpoint, repository="devtable/simple", manifest_ref=manifest_ref)
+    headers = _push_headers_for("devtable/simple")
+    headers["Content-Type"] = "application/vnd.oci.image.index.v1+json"
+
+    rv = client.put(url, data=manifest_bytes, headers=headers)
+    assert rv.status_code == 201, rv.data
+    assert rv.headers["Docker-Content-Digest"] == manifest_digest
+
+    if with_subject:
+        assert rv.headers["OCI-Subject"] == subject_digest
+    else:
+        assert "OCI-Subject" not in rv.headers
+
+
+def test_manifest_delete_by_digest_hides_manifest_pushed_by_digest(client, app):
+    # Pushing by digest creates a hidden temporary tag; deleting the manifest must expire it too,
+    # otherwise the manifest remains fetchable by digest.
+    test_cache = InMemoryDataModelCache(TEST_CACHE_CONFIG)
+    with patch("endpoints.v2.manifest.model_cache", test_cache):
+        manifest_bytes = _oci_index_bytes()
+        manifest_digest = "sha256:" + hashlib.sha256(manifest_bytes).hexdigest()
+        headers = _push_headers_for("devtable/simple")
+        push_headers = dict(headers, **{"Content-Type": "application/vnd.oci.image.index.v1+json"})
+
+        for endpoint, manifest_ref in [
+            ("v2.write_manifest_by_digest", manifest_digest),
+            ("v2.write_manifest_by_tagname", "deletetest"),
+        ]:
+            url = url_for(endpoint, repository="devtable/simple", manifest_ref=manifest_ref)
+            rv = client.put(url, data=manifest_bytes, headers=push_headers)
+            assert rv.status_code == 201, rv.data
+
+        url = url_for(
+            "v2.fetch_manifest_by_digest",
+            repository="devtable/simple",
+            manifest_ref=manifest_digest,
+        )
+
+        # Populate the manifest cache before deleting.
+        assert client.head(url, headers=headers).status_code == 200
+
+        rv = client.delete(url, headers=headers)
+        assert rv.status_code == 202, rv.data
+
+        assert client.head(url, headers=headers).status_code == 404
+        assert client.get(url, headers=headers).status_code == 404

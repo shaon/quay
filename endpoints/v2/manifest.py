@@ -373,15 +373,26 @@ def write_manifest_by_digest(namespace_name, repo_name, manifest_ref):
     return Response(
         "OK",
         status=201,
-        headers={
-            "Docker-Content-Digest": manifest.digest,
-            "Location": url_for(
-                "v2.fetch_manifest_by_digest",
-                repository="%s/%s" % (namespace_name, repo_name),
-                manifest_ref=manifest.digest,
-            ),
-        },
+        headers=_manifest_write_headers(namespace_name, repo_name, manifest, parsed),
     )
+
+
+def _manifest_write_headers(namespace_name, repo_name, manifest, manifest_impl):
+    headers = {
+        "Docker-Content-Digest": manifest.digest,
+        "Location": url_for(
+            "v2.fetch_manifest_by_digest",
+            repository="%s/%s" % (namespace_name, repo_name),
+            manifest_ref=manifest.digest,
+        ),
+    }
+
+    # Per the OCI distribution spec, pushes of manifests with a subject must return OCI-Subject.
+    subject = manifest_impl.subject
+    if subject is not None:
+        headers["OCI-Subject"] = subject.digest
+
+    return headers
 
 
 def _parse_manifest(content_type, request_data):
@@ -494,14 +505,7 @@ def _write_manifest_and_log(namespace_name, repo_name, tag_name, manifest_impl):
         return Response(
             "OK",
             status=201,
-            headers={
-                "Docker-Content-Digest": manifest.digest,
-                "Location": url_for(
-                    "v2.fetch_manifest_by_digest",
-                    repository="%s/%s" % (namespace_name, repo_name),
-                    manifest_ref=manifest.digest,
-                ),
-            },
+            headers=_manifest_write_headers(namespace_name, repo_name, manifest, manifest_impl),
         )
 
 
